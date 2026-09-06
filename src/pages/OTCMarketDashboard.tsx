@@ -228,7 +228,8 @@ export default function TraderYodhaXEngine() {
     return priceStr.endsWith('000') || priceStr.endsWith('500') || priceStr.endsWith('0000') || priceStr.endsWith('5000');
   };
 
-  const drawZigZagOverlays = useCallback(() => {
+  // NEW: DRAW ZIGZAG & CANDLE NUMBERS OVERLAY
+  const drawOverlays = useCallback((candleRegions: { x: number; color: 'GREEN' | 'RED' }[] = []) => {
     if (!overlayCanvasRef.current || !videoRef.current) return;
     const canvas = overlayCanvasRef.current;
     const ctx = canvas.getContext('2d');
@@ -238,23 +239,42 @@ export default function TraderYodhaXEngine() {
     canvas.height = videoRef.current.clientHeight || 450;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+    // 1. Draw ZigZag Levels
     const levels = brainRef.current.zigzagLevels;
-    if (levels.length === 0) return;
+    if (levels.length > 0) {
+      levels.slice(-5).forEach((level) => {
+        const y = level.screenY || Math.floor(canvas.height * 0.4);
+        ctx.beginPath();
+        ctx.setLineDash([6, 6]);
+        ctx.strokeStyle = level.type === 'HIGH' ? '#f43f5e' : '#10b981';
+        ctx.lineWidth = 2;
+        ctx.moveTo(0, y);
+        ctx.lineTo(canvas.width, y);
+        ctx.stroke();
 
-    levels.slice(-5).forEach((level) => {
-      const y = level.screenY || Math.floor(canvas.height * 0.4);
-      ctx.beginPath();
-      ctx.setLineDash([6, 6]);
-      ctx.strokeStyle = level.type === 'HIGH' ? '#f43f5e' : '#10b981';
-      ctx.lineWidth = 2;
-      ctx.moveTo(0, y);
-      ctx.lineTo(canvas.width, y);
-      ctx.stroke();
+        ctx.fillStyle = level.type === 'HIGH' ? '#f43f5e' : '#10b981';
+        ctx.font = 'bold 12px monospace';
+        ctx.fillText(`ZIGZAG ${level.type}: ${level.price.toFixed(5)}`, 15, y - 5);
+      });
+    }
 
-      ctx.fillStyle = level.type === 'HIGH' ? '#f43f5e' : '#10b981';
-      ctx.font = 'bold 12px monospace';
-      ctx.fillText(`ZIGZAG ${level.type}: ${level.price.toFixed(5)}`, 15, y - 5);
-    });
+    // 2. NEW: Draw Candle Numbers (#1, #2, #3...) & Color Markers
+    if (candleRegions.length > 0) {
+      const stepX = canvas.width / 20;
+      candleRegions.forEach((candle, idx) => {
+        const posX = candle.x * stepX + (stepX / 4);
+        const posY = 35; // Top padding
+
+        // Candle Index Number
+        ctx.fillStyle = '#06b6d4'; // Cyan
+        ctx.font = 'bold 13px monospace';
+        ctx.fillText(`#${idx + 1}`, posX, posY);
+
+        // Color Indicator Marker Below Number
+        ctx.fillStyle = candle.color === 'GREEN' ? '#10b981' : '#f43f5e';
+        ctx.fillText(candle.color === 'GREEN' ? 'G' : 'R', posX + 2, posY + 15);
+      });
+    }
   }, []);
 
   const processZigZagLogic = useCallback((currentPrice: number) => {
@@ -295,9 +315,9 @@ export default function TraderYodhaXEngine() {
           screenY: Math.floor(Math.random() * 200) + 100
         });
       }
-      drawZigZagOverlays();
+      drawOverlays();
     }
-  }, [drawZigZagOverlays]);
+  }, [drawOverlays]);
 
   const detectMagicNumber = useCallback((currentPrice: number, currentColor: 'GREEN' | 'RED' | 'NEUTRAL', lastPrice: number, lastColor: 'GREEN' | 'RED' | 'NEUTRAL') => {
     if (lastColor === currentColor || currentColor === 'NEUTRAL' || lastColor === 'NEUTRAL') return;
@@ -470,9 +490,7 @@ export default function TraderYodhaXEngine() {
     };
   };
 
-  // ==================== NEW ADVANCED STRATEGY ENGINES ====================
-
-  // 1. Hidden SNR / Gap / Wick Retest Engine
+  // Strategy Module Functions
   const checkHiddenSNRAndWickRetest = (currentPrice: number, topWick: number, bottomWick: number, bodySize: number) => {
     const zigzag = brainRef.current.zigzagLevels.find(zl => Math.abs(zl.price - currentPrice) < 0.00025);
     const magicNum = brainRef.current.magicNumbers.find(mn => Math.abs(mn.priceLevel - currentPrice) < 0.00025);
@@ -487,14 +505,12 @@ export default function TraderYodhaXEngine() {
     return null;
   };
 
-  // 2. 7-Candle OTC Cycle & Box Breakout Engine
   const checkSevenCandleBreakout = (recentColors: ('GREEN' | 'RED' | 'NEUTRAL')[]) => {
     if (recentColors.length < 7) return null;
     const last7 = recentColors.slice(-7);
     const greenCount = last7.filter(c => c === 'GREEN').length;
     const redCount = last7.filter(c => c === 'RED').length;
 
-    // Consolidation Box Check (Balanced 7 Candles)
     if (Math.abs(greenCount - redCount) <= 2) {
       const seventhCandle = last7[6];
       if (seventhCandle === 'GREEN') {
@@ -506,7 +522,6 @@ export default function TraderYodhaXEngine() {
     return null;
   };
 
-  // 3. 2 Red + 1 Green Pullback & Alternating Pattern Engine
   const checkTwoRedOneGreenPattern = (recentColors: ('GREEN' | 'RED' | 'NEUTRAL')[]) => {
     if (recentColors.length < 3) return null;
     const len = recentColors.length;
@@ -514,12 +529,10 @@ export default function TraderYodhaXEngine() {
     const c2 = recentColors[len - 2];
     const c3 = recentColors[len - 1];
 
-    // 2 Red + 1 Green Pullback Strategy
     if (c1 === 'RED' && c2 === 'RED' && c3 === 'GREEN') {
       return { signal: 'PUT' as const, reason: '2 RED + 1 GREEN PULLBACK CONTINUATION' };
     }
 
-    // Alternating R-G-R-G Pattern Strategy
     if (len >= 4) {
       const c0 = recentColors[len - 4];
       if (c0 === 'RED' && c1 === 'GREEN' && c2 === 'RED' && c3 === 'GREEN') {
@@ -531,9 +544,7 @@ export default function TraderYodhaXEngine() {
     return null;
   };
 
-  // 4. OTC Trap Detection Algorithm
   const detectOTCTrap = (topWick: number, bottomWick: number, bodySize: number, matchedZigZag: ZigZagLevel | null) => {
-    // Detect Fake Breakout / Wick Trap
     if (matchedZigZag && matchedZigZag.occurrences >= 3) {
       if (matchedZigZag.type === 'HIGH' && topWick > bodySize * 2.0) {
         return { signal: 'PUT' as const, reason: 'OTC FAKE BREAKOUT TRAP DETECTED' };
@@ -544,8 +555,6 @@ export default function TraderYodhaXEngine() {
     }
     return null;
   };
-
-  // ========================================================================
 
   const startContinuousLearning = useCallback((mediaStream: MediaStream) => {
     const learnInterval = setInterval(async () => {
@@ -566,10 +575,13 @@ export default function TraderYodhaXEngine() {
         Math.max(1, targetROI.width), Math.max(1, targetROI.height)
       );
 
-      const { greenPixels, redPixels } = analyzePixelDistribution(
+      const { greenPixels, redPixels, candleRegions } = analyzePixelDistribution(
         croppedImageData.data, Math.max(1, targetROI.width), Math.max(1, targetROI.height)
       );
       
+      // Live Draw Candle Numbers Overlay on Canvas
+      drawOverlays(candleRegions);
+
       const currentColor = greenPixels > redPixels * 1.05 ? 'GREEN' : redPixels > greenPixels * 1.05 ? 'RED' : 'NEUTRAL';
       const currentPrice = await extractPriceLevelWithOCR(ctx);
       
@@ -579,7 +591,6 @@ export default function TraderYodhaXEngine() {
         lastPriceRef.current = currentPrice;
       }
 
-      // Track recent candle color sequence
       if (currentColor !== 'NEUTRAL' && lastColorRef.current !== currentColor) {
         recentCandleColorsRef.current.push(currentColor);
         if (recentCandleColorsRef.current.length > 10) recentCandleColorsRef.current.shift();
@@ -591,7 +602,7 @@ export default function TraderYodhaXEngine() {
     }, 500);
 
     continuousLearningRef.current = learnInterval;
-  }, [getScaledROI, processZigZagLogic, detectMagicNumber, trackTimeAlgorithm]);
+  }, [getScaledROI, processZigZagLogic, detectMagicNumber, trackTimeAlgorithm, drawOverlays]);
 
   const connectStream = async () => {
     try {
@@ -619,7 +630,7 @@ export default function TraderYodhaXEngine() {
     setStatusMessage("Engine paused.");
   };
 
-  // Instant OTC Fast Engine (Includes All Strategy Modules)
+  // Dynamic Scan & Self-Pattern Generation Logic
   const executeFastScan = async () => {
     if (!canvasRef.current || !videoRef.current) return;
     const ctx = canvasRef.current.getContext('2d', { willReadFrequently: true });
@@ -666,39 +677,29 @@ export default function TraderYodhaXEngine() {
 
     let proposedSignal: 'CALL' | 'PUT' = dominantColor === 'GREEN' ? 'CALL' : 'PUT';
     let confidence = 0.85;
-    let patternString = `Dominant: ${dominantColor}`;
+    let patternString = `Dominant: ${dominantColor} | Candles Tracked: ${analysisRes.candleRegions.length}`;
 
-    // --- APPLY ADVANCED STRATEGIES IN ORDER ---
-    
-    // 1. OTC Trap Detection
+    // Apply Advanced Strategies
     const otcTrap = detectOTCTrap(analysisRes.actualTopWickSize, analysisRes.actualBottomWickSize, analysisRes.actualBodySize, matchedZigZag);
     if (otcTrap) {
       proposedSignal = otcTrap.signal;
       patternString += ` | ${otcTrap.reason}`;
-    }
-    // 2. Hidden SNR / Wick Retest
-    else {
+    } else {
       const hiddenSNR = checkHiddenSNRAndWickRetest(currentPrice, analysisRes.actualTopWickSize, analysisRes.actualBottomWickSize, analysisRes.actualBodySize);
       if (hiddenSNR) {
         proposedSignal = hiddenSNR.signal;
         patternString += ` | ${hiddenSNR.reason}`;
-      }
-      // 3. 2 Red + 1 Green / Alternating Pattern
-      else {
+      } else {
         const pullBack = checkTwoRedOneGreenPattern(recentCandleColorsRef.current);
         if (pullBack) {
           proposedSignal = pullBack.signal;
           patternString += ` | ${pullBack.reason}`;
-        }
-        // 4. 7-Candle Cycle
-        else {
+        } else {
           const sevenCandle = checkSevenCandleBreakout(recentCandleColorsRef.current);
           if (sevenCandle) {
             proposedSignal = sevenCandle.signal;
             patternString += ` | ${sevenCandle.reason}`;
-          }
-          // 5. Default Wick Exhaustion / ZigZag
-          else {
+          } else {
             if (analysisRes.actualTopWickSize > analysisRes.actualBodySize * 1.8) {
               proposedSignal = 'PUT';
               patternString += ` | TOP WICK EXHAUSTION`;
@@ -746,23 +747,10 @@ export default function TraderYodhaXEngine() {
     setCurrentAnalysis(liveData);
     pendingSignalRef.current = { signal: proposedSignal, analysis: liveData };
     setIsScanning(false);
-    setStatusMessage(`Signal Prepared for Next 1-Min Candle! Lock time: 00:00`);
+    setStatusMessage(`Auto Pattern Built! Signal Ready for Next Candle | Entry: 00:00`);
   };
 
-  const triggerAnalysis = () => {
-    if (!isStreamActive || !videoRef.current) {
-      setStatusMessage("Error: Connect screen first!");
-      return;
-    }
-    setIsScanning(true);
-    setStatusMessage("Trader Yodha X Fast Scan: Analyzing OTC Candle Setup...");
-    setAiSignal('WAIT');
-    setTimeout(() => {
-      executeFastScan();
-    }, 1500);
-  };
-
-  // Candle Sync Loop for 00:00 Exact Second Lock
+  // AUTO SCAN LATCH & 46TH SECOND DEEP ANALYSIS LOOP
   useEffect(() => {
     const candleSync = setInterval(() => {
       const now = new Date();
@@ -771,15 +759,21 @@ export default function TraderYodhaXEngine() {
       const timeUntilNext = 60 - seconds - (milliseconds / 1000);
       setTimeUntilCandle(Math.ceil(timeUntilNext));
 
+      // 46th Second Deep Analysis Notification & Auto Build
+      if (isStreamActive && seconds === 46 && !isScanning) {
+        setStatusMessage("46th Second Deep Pattern Analysis Running...");
+      }
+
       // Auto trigger fast scan at :52 seconds
       if (isStreamActive && seconds === 52 && !isScanning && !pendingSignalRef.current) {
+        setIsScanning(true);
         executeFastScan();
       }
 
       // Execute Signal exactly at :00 entry
       if (pendingSignalRef.current && (seconds === 0 || seconds === 59) && milliseconds < 400) {
         setAiSignal(pendingSignalRef.current.signal);
-        setStatusMessage(`🚀 SIGNAL ACTIVE (${pendingSignalRef.current.signal}) | Entry: 00:00`);
+        setStatusMessage(`🚀 AUTO SIGNAL ACTIVE (${pendingSignalRef.current.signal}) | Entry: 00:00`);
         pendingSignalRef.current = null;
       }
     }, 100);
@@ -818,23 +812,6 @@ export default function TraderYodhaXEngine() {
     setStatusMessage(`Outcome logged [${result}]. System Win Rate: ${brain.winRate.toFixed(1)}%`);
     setAiSignal('WAIT');
     setCurrentAnalysis(null);
-  };
-
-  const clearBrain = async () => {
-    const password = prompt('Enter Master Password:');
-    if (password === 'YODDHAX_REBORN') {
-      brainRef.current = {
-        patterns: [],
-        magicNumbers: [],
-        timeAlgorithms: [],
-        zigzagLevels: [],
-        totalTrades: 0,
-        winRate: 0,
-        lastUpdated: Date.now()
-      };
-      await saveBrainToDB();
-      setStatusMessage("Trader Yodha X Memory Reset.");
-    }
   };
 
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -884,12 +861,12 @@ export default function TraderYodhaXEngine() {
       <header className="border-b border-slate-800 px-6 py-4">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-cyan-400 tracking-wider">TRADER YODHA X AI (OTC FAST ENGINE)</h1>
-            <p className="text-slate-500 text-sm">Candle-to-Candle Direct Signal Generator</p>
+            <h1 className="text-2xl font-bold text-cyan-400 tracking-wider">TRADER YODHA X AI (AUTO PATTERN ENGINE)</h1>
+            <p className="text-slate-500 text-sm">Real-time Candle Numbering & Auto Signal Generator</p>
           </div>
           <div className="flex items-center gap-3">
             <div className="text-right mr-4">
-              <div className="text-xs text-slate-500">Intelligence Nodes</div>
+              <div className="text-xs text-slate-500 font-mono">Intelligence Brain</div>
               <div className="text-sm font-mono text-emerald-400">
                 {brainStats.patterns} Patterns | Win Rate: {brainStats.winRate.toFixed(1)}%
               </div>
@@ -911,27 +888,13 @@ export default function TraderYodhaXEngine() {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="space-y-4">
             <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800 shadow-md">
-              <button
-                onClick={triggerAnalysis}
-                disabled={!isStreamActive || isScanning}
-                className={`w-full py-4 rounded-xl font-bold text-lg transition-all ${
-                  !isStreamActive || isScanning
-                    ? 'bg-slate-700 text-slate-500 cursor-not-allowed'
-                    : 'bg-cyan-600 hover:bg-cyan-500 text-white shadow-lg shadow-cyan-600/30'
-                }`}
-              >
-                {isScanning ? (
-                  <span className="flex items-center justify-center gap-2">
-                    <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                    Scanning OTC Candle...
-                  </span>
-                ) : (
-                  'INSTANT OTC SCAN'
-                )}
-              </button>
+              <div className="p-3 bg-cyan-950/60 border border-cyan-500/30 rounded-lg text-center">
+                <span className="text-xs font-mono text-cyan-400 uppercase tracking-widest block font-bold">Auto-Scan & Deep Analysis</span>
+                <span className="text-sm text-slate-300 font-bold mt-1 block">Active (No Button Press Required)</span>
+              </div>
               <div className="mt-4 flex items-center justify-between text-sm">
                 <span className="text-slate-500">Next Candle Entry In:</span>
-                <span className="font-mono text-xl text-amber-400">{timeUntilCandle}s</span>
+                <span className="font-mono text-xl text-amber-400 font-bold">{timeUntilCandle}s</span>
               </div>
             </div>
 
@@ -947,7 +910,7 @@ export default function TraderYodhaXEngine() {
 
             {currentAnalysis && (
               <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800 animate-fadeIn">
-                <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono font-bold">OTC Live Pattern</h3>
+                <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono font-bold">OTC Live Pattern Built</h3>
                 <div className="text-xs text-slate-300 space-y-2 font-mono">
                   <p className="break-all"><span className="text-slate-500">Logic:</span> {currentAnalysis.pattern}</p>
                 </div>
@@ -960,7 +923,7 @@ export default function TraderYodhaXEngine() {
               <div className="flex items-center justify-between mb-3">
                 <div className="flex items-center gap-2">
                   <div className={`w-2 h-2 rounded-full ${isStreamActive ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'}`} />
-                  <span className="text-xs font-bold text-slate-400">QUOTEX CHART STREAM</span>
+                  <span className="text-xs font-bold text-slate-400">QUOTEX CHART STREAM WITH CANDLE INDEXING</span>
                 </div>
                 {isStreamActive && (
                   <button
