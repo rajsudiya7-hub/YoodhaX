@@ -1,22 +1,53 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { createWorker } from 'tesseract.js';
 
-// Brain Memory Types - TRADER YODHA X AI Systems
+/* =========================================================
+   TRADER YODHA X — OTC 1-MIN MULTI FACTOR ENGINE
+   ========================================================= */
+
+type Direction = 'CALL' | 'PUT' | 'WAIT';
+type CandleColor = 'GREEN' | 'RED' | 'NEUTRAL';
+type Trend = 'UPTREND' | 'DOWNTREND' | 'RANGE' | 'UNKNOWN';
+type Structure =
+  | 'HH_HL'
+  | 'LH_LL'
+  | 'BOS_UP'
+  | 'BOS_DOWN'
+  | 'RANGE'
+  | 'UNKNOWN';
+
+interface Candle {
+  time: number;
+  minuteKey: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  color: CandleColor;
+  body: number;
+  upperWick: number;
+  lowerWick: number;
+}
+
 interface PatternMemory {
   id: string;
   pattern: string;
-  sequenceLength: number;
-  priceLevel: number;
-  priceRange: string;
-  bodySize: number;
-  topWickSize: number;
-  bottomWickSize: number;
+  signal: Direction;
   result: 'WIN' | 'LOSS';
   timestamp: number;
-  timeSync?: number;
-  timeKey24H: string;
-  minuteMarker: number;
+
+  priceLevel: number;
+  trend: Trend;
+  structure: Structure;
+
+  candlePattern: string;
+  priceAction: string;
+
+  score: number;
   confidence: number;
+
+  timeKey: string;
+  minute: number;
 }
 
 interface MagicNumber {
@@ -25,18 +56,28 @@ interface MagicNumber {
   priceRange: string;
   direction: 'GREEN_TO_RED' | 'RED_TO_GREEN';
   occurrences: number;
+  wins: number;
+  losses: number;
   successRate: number;
   lastSeen: number;
 }
 
 interface TimeAlgorithm {
-  timeKey24H: string;
-  minuteMarker: number;
-  secondMarker: number;
+  timeKey: string;
   direction: 'UP' | 'DOWN' | 'NEUTRAL';
-  frequency: number;
+  occurrences: number;
+  wins: number;
+  losses: number;
   successRate: number;
   lastOccurrences: number[];
+}
+
+interface SRLevel {
+  price: number;
+  type: 'SUPPORT' | 'RESISTANCE';
+  touches: number;
+  strength: number;
+  lastSeen: number;
 }
 
 interface ZigZagLevel {
@@ -44,35 +85,47 @@ interface ZigZagLevel {
   type: 'HIGH' | 'LOW';
   occurrences: number;
   timestamp: number;
-  screenY?: number;
 }
 
 interface BrainState {
   patterns: PatternMemory[];
   magicNumbers: MagicNumber[];
   timeAlgorithms: TimeAlgorithm[];
+  srLevels: SRLevel[];
   zigzagLevels: ZigZagLevel[];
+
   totalTrades: number;
+  wins: number;
+  losses: number;
   winRate: number;
+
   lastUpdated: number;
 }
 
 interface LiveAnalysis {
-  pattern: string;
-  sequence: string[];
-  dominantColor: 'GREEN' | 'RED' | 'NEUTRAL';
-  strength: number;
-  priceLevel: number;
-  isRoundNumber: boolean;
-  bodySize: number;
-  topWick: number;
-  bottomWick: number;
-  detectedMagicNumbers: MagicNumber[];
-  matchedZigZag: ZigZagLevel | null;
-  timeKey24H: string;
-  timestampSecond: number;
-  currentMinute: number;
-  timeSyncData: TimeAlgorithm | null;
+  signal: Direction;
+
+  score: number;
+  confidence: number;
+  quality: 'STRONG' | 'MEDIUM' | 'WEAK' | 'WAIT';
+
+  price: number;
+
+  trend: Trend;
+  structure: Structure;
+
+  candlePattern: string;
+  priceAction: string;
+
+  support: SRLevel | null;
+  resistance: SRLevel | null;
+
+  reasons: string[];
+
+  currentCandle: Candle | null;
+  previousCandles: Candle[];
+
+  timeKey: string;
 }
 
 interface CropRegion {
@@ -83,133 +136,238 @@ interface CropRegion {
 }
 
 const DB_NAME = 'TraderYodhaX_AI_Database';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = 'trader_yodha_x_brain_store';
 
+const MIN_CANDLES_FOR_ANALYSIS = 8;
+
 export default function TraderYodhaXEngine() {
+  /* =========================================================
+     UI STATE
+     ========================================================= */
+
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [isStreamActive, setIsStreamActive] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
-  const [aiSignal, setAiSignal] = useState<'WAIT' | 'CALL' | 'PUT'>('WAIT');
-  const [statusMessage, setStatusMessage] = useState("Trader Yodha X OTC Engine Ready. Connect Quotex Screen.");
-  const [brainStats, setBrainStats] = useState({ patterns: 0, magicNumbers: 0, timeSyncs: 0, zigzag: 0, winRate: 0 });
-  const [currentAnalysis, setCurrentAnalysis] = useState<LiveAnalysis | null>(null);
+
+  const [aiSignal, setAiSignal] = useState<Direction>('WAIT');
+
+  const [statusMessage, setStatusMessage] = useState(
+    'Trader Yodha X Multi-Factor OTC Engine Ready.'
+  );
+
+  const [ocrPriceText, setOcrPriceText] = useState('Searching...');
+  const [isRealRoundNumber, setIsRealRoundNumber] = useState(false);
+
   const [timeUntilCandle, setTimeUntilCandle] = useState(60);
 
-  // Real-time OCR & ROI Dynamic States
-  const [ocrPriceText, setOcrPriceText] = useState<string>("Searching...");
-  const [isRealRoundNumber, setIsRealRoundNumber] = useState<boolean>(false);
-  
-  const [roiBox, setRoiBox] = useState<CropRegion>({ x: 100, y: 50, width: 250, height: 250 });
-  const [isRoiLocked, setIsRoiLocked] = useState<boolean>(false);
+  const [roiBox, setRoiBox] = useState<CropRegion>({
+    x: 100,
+    y: 50,
+    width: 300,
+    height: 250,
+  });
 
-  const [isDragging, setIsDragging] = useState(false);
-  const [isResizing, setIsResizing] = useState(false);
-  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const [isRoiLocked, setIsRoiLocked] = useState(false);
+
+  const [currentAnalysis, setCurrentAnalysis] =
+    useState<LiveAnalysis | null>(null);
+
+  const [brainStats, setBrainStats] = useState({
+    patterns: 0,
+    sr: 0,
+    zigzag: 0,
+    timeSyncs: 0,
+    winRate: 0,
+    trades: 0,
+  });
+
+  /* =========================================================
+     REFS
+     ========================================================= */
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   const ocrCanvasRef = useRef<HTMLCanvasElement>(null);
   const videoContainerRef = useRef<HTMLDivElement>(null);
+
   const ocrWorkerRef = useRef<any>(null);
+
+  const continuousLearningRef = useRef<ReturnType<
+    typeof setInterval
+  > | null>(null);
+
+  const priceHistoryRef = useRef<
+    { price: number; time: number; color: CandleColor }[]
+  >([]);
+
+  const candleHistoryRef = useRef<Candle[]>([]);
+
+  const lastPriceRef = useRef(0);
+  const lastColorRef = useRef<CandleColor>('NEUTRAL');
+
+  const pendingSignalRef = useRef<{
+    signal: Direction;
+    analysis: LiveAnalysis;
+  } | null>(null);
 
   const brainRef = useRef<BrainState>({
     patterns: [],
     magicNumbers: [],
     timeAlgorithms: [],
+    srLevels: [],
     zigzagLevels: [],
+
     totalTrades: 0,
+    wins: 0,
+    losses: 0,
     winRate: 0,
-    lastUpdated: Date.now()
+
+    lastUpdated: Date.now(),
   });
-  
-  const pendingSignalRef = useRef<{ signal: 'CALL' | 'PUT'; analysis: LiveAnalysis } | null>(null);
-  const continuousLearningRef = useRef<NodeJS.Timeout | null>(null);
-  const lastPriceRef = useRef<number>(0);
-  const lastColorRef = useRef<'GREEN' | 'RED' | 'NEUTRAL'>('NEUTRAL');
-  const priceHistoryRef = useRef<{price: number, time: number}[]>([]);
+
+  /* =========================================================
+     STREAM
+     ========================================================= */
 
   useEffect(() => {
     if (isStreamActive && stream && videoRef.current) {
       videoRef.current.srcObject = stream;
     }
-  }, [isStreamActive, stream]);
+  }, [stream, isStreamActive]);
+
+  /* =========================================================
+     OCR
+     ========================================================= */
 
   useEffect(() => {
+    let mounted = true;
+
     const initOCR = async () => {
       try {
         const worker = await createWorker('eng');
+
+        if (!mounted) {
+          await worker.terminate();
+          return;
+        }
+
         ocrWorkerRef.current = worker;
-        setStatusMessage("Trader Yodha X Vision Engine Initialized.");
-      } catch (err) {
-        console.error("OCR Init Error:", err);
+
+        setStatusMessage(
+          'Vision + OCR engine initialized. Connect chart screen.'
+        );
+      } catch (error) {
+        console.error('OCR initialization error:', error);
+        setStatusMessage('OCR initialization failed.');
       }
     };
+
     initOCR();
 
     return () => {
-      if (ocrWorkerRef.current) ocrWorkerRef.current.terminate();
+      mounted = false;
+
+      if (ocrWorkerRef.current) {
+        ocrWorkerRef.current.terminate();
+        ocrWorkerRef.current = null;
+      }
     };
   }, []);
 
-  const updateBrainStats = useCallback(() => {
-    const brain = brainRef.current;
-    setBrainStats({
-      patterns: brain.patterns.length,
-      magicNumbers: brain.magicNumbers.length,
-      timeSyncs: brain.timeAlgorithms.length,
-      zigzag: brain.zigzagLevels?.length || 0,
-      winRate: brain.winRate
-    });
-  }, []);
+  /* =========================================================
+     DATABASE
+     ========================================================= */
 
   const initIndexedDB = useCallback((): Promise<IDBDatabase> => {
     return new Promise((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, DB_VERSION);
+
       request.onupgradeneeded = (event) => {
         const db = (event.target as IDBOpenDBRequest).result;
+
         if (!db.objectStoreNames.contains(STORE_NAME)) {
           db.createObjectStore(STORE_NAME);
         }
       };
-      request.onsuccess = (event) => resolve((event.target as IDBOpenDBRequest).result);
-      request.onerror = (event) => reject((event.target as IDBOpenDBRequest).error);
+
+      request.onsuccess = () => {
+        resolve(request.result);
+      };
+
+      request.onerror = () => {
+        reject(request.error);
+      };
+    });
+  }, []);
+
+  const updateBrainStats = useCallback(() => {
+    const brain = brainRef.current;
+
+    setBrainStats({
+      patterns: brain.patterns.length,
+      sr: brain.srLevels.length,
+      zigzag: brain.zigzagLevels.length,
+      timeSyncs: brain.timeAlgorithms.length,
+      winRate: brain.winRate,
+      trades: brain.totalTrades,
     });
   }, []);
 
   const saveBrainToDB = useCallback(async () => {
     try {
       const db = await initIndexedDB();
-      const transaction = db.transaction(STORE_NAME, 'readwrite');
-      const store = transaction.objectStore(STORE_NAME);
+
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+
       brainRef.current.lastUpdated = Date.now();
-      store.put(brainRef.current, 'trader_yodha_x_brain_state');
+
+      store.put(
+        brainRef.current,
+        'trader_yodha_x_brain_state'
+      );
+
       updateBrainStats();
-    } catch (err) {
-      console.error("IndexedDB Save Failure:", err);
+    } catch (error) {
+      console.error('Database save error:', error);
     }
   }, [initIndexedDB, updateBrainStats]);
 
   const loadBrainFromDB = useCallback(async () => {
     try {
       const db = await initIndexedDB();
-      const transaction = db.transaction(STORE_NAME, 'readonly');
-      const store = transaction.objectStore(STORE_NAME);
-      const request = store.get('trader_yodha_x_brain_state');
+
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+
+      const request = store.get(
+        'trader_yodha_x_brain_state'
+      );
 
       request.onsuccess = () => {
         if (request.result) {
-          const parsed: BrainState = request.result;
-          if (!parsed.zigzagLevels) parsed.zigzagLevels = [];
-          if (!parsed.timeAlgorithms) parsed.timeAlgorithms = [];
-          brainRef.current = parsed;
+          const loaded = request.result as BrainState;
+
+          brainRef.current = {
+            ...brainRef.current,
+            ...loaded,
+            patterns: loaded.patterns || [],
+            magicNumbers: loaded.magicNumbers || [],
+            timeAlgorithms: loaded.timeAlgorithms || [],
+            srLevels: loaded.srLevels || [],
+            zigzagLevels: loaded.zigzagLevels || [],
+          };
+
           updateBrainStats();
-          setStatusMessage(`Trader Yodha X Brain Active: ${parsed.patterns.length} patterns loaded.`);
+
+          setStatusMessage(
+            `Brain loaded: ${brainRef.current.patterns.length} historical setups.`
+          );
         }
       };
-    } catch (err) {
-      console.error("IndexedDB Load Failure:", err);
+    } catch (error) {
+      console.error('Database load error:', error);
     }
   }, [initIndexedDB, updateBrainStats]);
 
@@ -217,150 +375,51 @@ export default function TraderYodhaXEngine() {
     loadBrainFromDB();
   }, [loadBrainFromDB]);
 
-  const getPriceRange = (price: number): string => {
+  /* =========================================================
+     BASIC PRICE UTILITIES
+     ========================================================= */
+
+  const getPriceRange = (price: number) => {
     const base = Math.floor(price * 1000);
-    return `${(base / 1000).toFixed(3)}-${((base + 1) / 1000).toFixed(3)}`;
+
+    return `${(base / 1000).toFixed(3)}-${(
+      (base + 1) /
+      1000
+    ).toFixed(3)}`;
   };
 
-  const checkIsRoundNumber = (price: number): boolean => {
-    const priceStr = price.toFixed(5);
-    return priceStr.endsWith('000') || priceStr.endsWith('500') || priceStr.endsWith('0000') || priceStr.endsWith('5000');
-  };
+  const checkIsRoundNumber = (price: number) => {
+    if (!price || !Number.isFinite(price)) return false;
 
-  const drawZigZagOverlays = useCallback(() => {
-    if (!overlayCanvasRef.current || !videoRef.current) return;
-    const canvas = overlayCanvasRef.current;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    const scaled = Math.round(price * 10000);
 
-    canvas.width = videoRef.current.clientWidth || 800;
-    canvas.height = videoRef.current.clientHeight || 450;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    const levels = brainRef.current.zigzagLevels;
-    if (levels.length === 0) return;
-
-    levels.slice(-5).forEach((level) => {
-      const y = level.screenY || Math.floor(canvas.height * 0.4);
-      ctx.beginPath();
-      ctx.setLineDash([6, 6]);
-      ctx.strokeStyle = level.type === 'HIGH' ? '#f43f5e' : '#10b981';
-      ctx.lineWidth = 2;
-      ctx.moveTo(0, y);
-      ctx.lineTo(canvas.width, y);
-      ctx.stroke();
-
-      ctx.fillStyle = level.type === 'HIGH' ? '#f43f5e' : '#10b981';
-      ctx.font = 'bold 12px monospace';
-      ctx.fillText(`ZIGZAG ${level.type}: ${level.price.toFixed(5)}`, 15, y - 5);
-    });
-  }, []);
-
-  const processZigZagLogic = useCallback((currentPrice: number) => {
-    const history = priceHistoryRef.current;
-    history.push({ price: currentPrice, time: Date.now() });
-    if (history.length > 50) history.shift();
-    if (history.length < 10) return;
-
-    const prices = history.map(h => h.price);
-    const maxPrice = Math.max(...prices);
-    const minPrice = Math.min(...prices);
-    const lastIndex = history.length - 1;
-
-    let detectedPeak: 'HIGH' | 'LOW' | null = null;
-    let peakPrice = 0;
-
-    if (history[lastIndex].price === maxPrice && maxPrice - history[0].price > 0.00030) {
-      detectedPeak = 'HIGH';
-      peakPrice = maxPrice;
-    } else if (history[lastIndex].price === minPrice && history[0].price - minPrice > 0.00030) {
-      detectedPeak = 'LOW';
-      peakPrice = minPrice;
-    }
-
-    if (detectedPeak) {
-      const brain = brainRef.current;
-      const existingLevel = brain.zigzagLevels.find(zl => Math.abs(zl.price - peakPrice) < 0.00020);
-
-      if (existingLevel) {
-        existingLevel.occurrences++;
-        existingLevel.timestamp = Date.now();
-      } else {
-        brain.zigzagLevels.push({
-          price: peakPrice,
-          type: detectedPeak,
-          occurrences: 1,
-          timestamp: Date.now(),
-          screenY: Math.floor(Math.random() * 200) + 100
-        });
-      }
-      drawZigZagOverlays();
-    }
-  }, [drawZigZagOverlays]);
-
-  const detectMagicNumber = useCallback((currentPrice: number, currentColor: 'GREEN' | 'RED' | 'NEUTRAL', lastPrice: number, lastColor: 'GREEN' | 'RED' | 'NEUTRAL') => {
-    if (lastColor === currentColor || currentColor === 'NEUTRAL' || lastColor === 'NEUTRAL') return;
-
-    const isRound = checkIsRoundNumber(currentPrice);
-    const priceRange = getPriceRange(currentPrice);
-    const direction = lastColor === 'GREEN' ? 'GREEN_TO_RED' : 'RED_TO_GREEN';
-
-    const existing = brainRef.current.magicNumbers.find(
-      mn => Math.abs(mn.priceLevel - currentPrice) < 0.0003 && mn.priceRange === priceRange
+    return (
+      scaled % 100 === 0 ||
+      scaled % 50 === 0 ||
+      scaled % 10 === 0
     );
+  };
 
-    if (existing) {
-      existing.occurrences++;
-      existing.lastSeen = Date.now();
-      existing.isRoundNumber = isRound;
-    } else {
-      brainRef.current.magicNumbers.push({
-        priceLevel: currentPrice,
-        isRoundNumber: isRound,
-        priceRange,
-        direction,
-        occurrences: 1,
-        successRate: 0.5,
-        lastSeen: Date.now()
-      });
-    }
-  }, []);
-
-  const trackTimeAlgorithm = useCallback((currentMinute: number, currentSecond: number, color: 'GREEN' | 'RED' | 'NEUTRAL') => {
-    const brain = brainRef.current;
-    const now = new Date();
-    const timeKey24H = `${String(now.getHours()).padStart(2, '0')}:${String(currentMinute).padStart(2, '0')}:${String(currentSecond).padStart(2, '0')}`;
-    
-    let timeAlgo = brain.timeAlgorithms.find(ta => ta.timeKey24H === timeKey24H);
-    const direction = color === 'GREEN' ? 'UP' : color === 'RED' ? 'DOWN' : 'NEUTRAL';
-
-    if (!timeAlgo) {
-      timeAlgo = {
-        timeKey24H,
-        minuteMarker: currentMinute,
-        secondMarker: currentSecond,
-        direction,
-        frequency: 1,
-        successRate: 0.5,
-        lastOccurrences: [Date.now()]
-      };
-      brain.timeAlgorithms.push(timeAlgo);
-    } else {
-      timeAlgo.frequency++;
-      if (timeAlgo.direction !== direction && direction !== 'NEUTRAL') {
-        timeAlgo.direction = direction;
-      }
-    }
-    if (currentSecond % 15 === 0) saveBrainToDB();
-  }, [saveBrainToDB]);
+  /* =========================================================
+     ROI
+     ========================================================= */
 
   const getScaledROI = useCallback(() => {
-    if (!videoRef.current || !videoContainerRef.current) return roiBox;
+    if (!videoRef.current || !videoContainerRef.current) {
+      return roiBox;
+    }
 
-    const containerWidth = videoContainerRef.current.clientWidth || 800;
-    const containerHeight = videoContainerRef.current.clientHeight || 450;
-    const actualWidth = videoRef.current.videoWidth || containerWidth;
-    const actualHeight = videoRef.current.videoHeight || containerHeight;
+    const containerWidth =
+      videoContainerRef.current.clientWidth || 800;
+
+    const containerHeight =
+      videoContainerRef.current.clientHeight || 450;
+
+    const actualWidth =
+      videoRef.current.videoWidth || containerWidth;
+
+    const actualHeight =
+      videoRef.current.videoHeight || containerHeight;
 
     const scaleX = actualWidth / containerWidth;
     const scaleY = actualHeight / containerHeight;
@@ -368,390 +427,2153 @@ export default function TraderYodhaXEngine() {
     return {
       x: Math.max(0, Math.floor(roiBox.x * scaleX)),
       y: Math.max(0, Math.floor(roiBox.y * scaleY)),
-      width: Math.min(actualWidth, Math.floor(roiBox.width * scaleX)),
-      height: Math.min(actualHeight, Math.floor(roiBox.height * scaleY))
+      width: Math.max(
+        1,
+        Math.min(
+          actualWidth,
+          Math.floor(roiBox.width * scaleX)
+        )
+      ),
+      height: Math.max(
+        1,
+        Math.min(
+          actualHeight,
+          Math.floor(roiBox.height * scaleY)
+        )
+      ),
     };
   }, [roiBox]);
 
-  const extractPriceLevelWithOCR = async (ctx: CanvasRenderingContext2D): Promise<number> => {
-    if (ocrWorkerRef.current && ocrCanvasRef.current) {
-      const ocrCtx = ocrCanvasRef.current.getContext('2d');
-      if (ocrCtx) {
-        const targetROI = getScaledROI();
-        ocrCanvasRef.current.width = Math.max(1, targetROI.width);
-        ocrCanvasRef.current.height = Math.max(1, targetROI.height);
+  /* =========================================================
+     PIXEL ANALYSIS
+     ========================================================= */
 
-        ocrCtx.drawImage(
-          ctx.canvas,
-          targetROI.x, targetROI.y, targetROI.width, targetROI.height,
-          0, 0, targetROI.width, targetROI.height
-        );
-
-        try {
-          const { data: { text } } = await ocrWorkerRef.current.recognize(ocrCanvasRef.current);
-          const matched = text.match(/\d+\.\d+/);
-          if (matched) {
-            const parsedPrice = parseFloat(matched[0]);
-            if (!isNaN(parsedPrice) && parsedPrice > 0) {
-              const isRound = checkIsRoundNumber(parsedPrice);
-              setOcrPriceText(`${parsedPrice.toFixed(5)} ${isRound ? '🎯 [ROUND SNR]' : ''}`);
-              setIsRealRoundNumber(isRound);
-              return parsedPrice;
-            }
-          }
-        } catch (e) {}
-      }
-    }
-    return lastPriceRef.current || 0;
-  };
-
-  const analyzePixelDistribution = (frameData: Uint8ClampedArray, width: number, height: number) => {
+  const analyzePixelDistribution = (
+    frameData: Uint8ClampedArray,
+    width: number,
+    height: number
+  ) => {
     let greenPixels = 0;
     let redPixels = 0;
-    const candleRegions: { x: number; color: 'GREEN' | 'RED' }[] = [];
-    
-    let globalYMin = height; 
-    let globalYMax = 0;   
-    let bodyTopCoord = height;
-    let bodyBottomCoord = 0;
 
-    const chunkSize = Math.floor(width / 20); 
-    for (let chunk = 0; chunk < 20; chunk++) {
-      let chunkGreen = 0;
-      let chunkRed = 0;
+    const chunks: {
+      index: number;
+      green: number;
+      red: number;
+      color: CandleColor;
+    }[] = [];
 
-      for (let x = chunk * chunkSize; x < (chunk + 1) * chunkSize; x++) {
+    const chunkCount = 20;
+    const chunkWidth = Math.max(
+      1,
+      Math.floor(width / chunkCount)
+    );
+
+    for (let chunk = 0; chunk < chunkCount; chunk++) {
+      let green = 0;
+      let red = 0;
+
+      const startX = chunk * chunkWidth;
+      const endX =
+        chunk === chunkCount - 1
+          ? width
+          : Math.min(width, (chunk + 1) * chunkWidth);
+
+      for (let x = startX; x < endX; x++) {
         for (let y = 0; y < height; y++) {
-          const i = (y * width + x) * 4;
-          const r = frameData[i];
-          const g = frameData[i + 1];
-          const b = frameData[i + 2];
+          const index = (y * width + x) * 4;
 
-          const isGreen = g > r + 30 && g > b + 30;
-          const isRed = r > g + 30 && r > b + 30;
+          const r = frameData[index];
+          const g = frameData[index + 1];
+          const b = frameData[index + 2];
 
-          if (isGreen || isRed) {
-            if (y < globalYMin) globalYMin = y;
-            if (y > globalYMax) globalYMax = y;
-            if (isGreen) chunkGreen++;
-            if (isRed) chunkRed++;
+          const isGreen =
+            g > r + 30 && g > b + 30;
+
+          const isRed =
+            r > g + 30 && r > b + 30;
+
+          if (isGreen) {
+            green++;
+            greenPixels++;
+          }
+
+          if (isRed) {
+            red++;
+            redPixels++;
           }
         }
       }
 
-      if (chunkGreen > 100 || chunkRed > 100) {
-        candleRegions.push({
-          x: chunk,
-          color: chunkGreen > chunkRed ? 'GREEN' : 'RED'
-        });
-        
-        if (chunk === 19 || chunk === 18) { 
-          bodyTopCoord = globalYMin + 15;
-          bodyBottomCoord = globalYMax - 15;
-        }
-      }
+      const color: CandleColor =
+        green > red * 1.15
+          ? 'GREEN'
+          : red > green * 1.15
+          ? 'RED'
+          : 'NEUTRAL';
 
-      greenPixels += chunkGreen;
-      redPixels += chunkRed;
+      chunks.push({
+        index: chunk,
+        green,
+        red,
+        color,
+      });
     }
 
-    const actualBodySize = Math.max(0, bodyBottomCoord - bodyTopCoord);
-    const actualTopWickSize = Math.max(0, bodyTopCoord - globalYMin);
-    const actualBottomWickSize = Math.max(0, globalYMax - bodyBottomCoord);
-
-    return { 
-      greenPixels, 
-      redPixels, 
-      candleRegions,
-      actualBodySize,
-      actualTopWickSize,
-      actualBottomWickSize
+    return {
+      greenPixels,
+      redPixels,
+      chunks,
     };
   };
 
-  const startContinuousLearning = useCallback((mediaStream: MediaStream) => {
-    const learnInterval = setInterval(async () => {
-      if (!canvasRef.current || !videoRef.current) return;
-      const ctx = canvasRef.current.getContext('2d', { willReadFrequently: true });
-      if (!ctx) return;
+  /* =========================================================
+     OCR PRICE
+     ========================================================= */
 
-      const vWidth = videoRef.current.videoWidth || 800;
-      const vHeight = videoRef.current.videoHeight || 400;
-      canvasRef.current.width = vWidth;
-      canvasRef.current.height = vHeight;
+  const extractPriceLevelWithOCR = async (
+    ctx: CanvasRenderingContext2D
+  ): Promise<number> => {
+    if (!ocrWorkerRef.current || !ocrCanvasRef.current) {
+      return lastPriceRef.current;
+    }
 
-      ctx.drawImage(videoRef.current, 0, 0, vWidth, vHeight);
-      
-      const targetROI = getScaledROI();
-      const croppedImageData = ctx.getImageData(
-        targetROI.x, targetROI.y, 
-        Math.max(1, targetROI.width), Math.max(1, targetROI.height)
-      );
+    const targetROI = getScaledROI();
 
-      const { greenPixels, redPixels } = analyzePixelDistribution(
-        croppedImageData.data, Math.max(1, targetROI.width), Math.max(1, targetROI.height)
-      );
-      
-      const currentColor = greenPixels > redPixels * 1.05 ? 'GREEN' : redPixels > greenPixels * 1.05 ? 'RED' : 'NEUTRAL';
-      const currentPrice = await extractPriceLevelWithOCR(ctx);
-      
-      if (currentPrice > 0) {
-        processZigZagLogic(currentPrice);
-        detectMagicNumber(currentPrice, currentColor, lastPriceRef.current, lastColorRef.current);
-        lastPriceRef.current = currentPrice;
+    const ocrCanvas = ocrCanvasRef.current;
+
+    ocrCanvas.width = targetROI.width;
+    ocrCanvas.height = targetROI.height;
+
+    const ocrCtx = ocrCanvas.getContext('2d');
+
+    if (!ocrCtx) return lastPriceRef.current;
+
+    ocrCtx.clearRect(
+      0,
+      0,
+      ocrCanvas.width,
+      ocrCanvas.height
+    );
+
+    ocrCtx.drawImage(
+      ctx.canvas,
+      targetROI.x,
+      targetROI.y,
+      targetROI.width,
+      targetROI.height,
+      0,
+      0,
+      targetROI.width,
+      targetROI.height
+    );
+
+    try {
+      const result =
+        await ocrWorkerRef.current.recognize(
+          ocrCanvas
+        );
+
+      const text =
+        result?.data?.text || '';
+
+      /*
+       * More conservative price parser.
+       * Looks for decimal numbers.
+       */
+      const matches =
+        text.match(/\d+\.\d{2,8}/g);
+
+      if (!matches || matches.length === 0) {
+        return lastPriceRef.current;
       }
 
-      const now = new Date();
-      trackTimeAlgorithm(now.getMinutes(), now.getSeconds(), currentColor);
-      lastColorRef.current = currentColor;
-    }, 500);
+      /*
+       * Prefer the number closest to the previous price
+       * when possible.
+       */
+      const candidates = matches
+        .map((value: string) => parseFloat(value))
+        .filter(
+          (value: number) =>
+            Number.isFinite(value) && value > 0
+        );
 
-    continuousLearningRef.current = learnInterval;
-  }, [getScaledROI, processZigZagLogic, detectMagicNumber, trackTimeAlgorithm]);
+      if (!candidates.length) {
+        return lastPriceRef.current;
+      }
+
+      let selected = candidates[0];
+
+      if (lastPriceRef.current > 0) {
+        selected = candidates.reduce(
+          (best: number, value: number) => {
+            const bestDiff =
+              Math.abs(
+                best - lastPriceRef.current
+              );
+
+            const valueDiff =
+              Math.abs(
+                value - lastPriceRef.current
+              );
+
+            return valueDiff < bestDiff
+              ? value
+              : best;
+          },
+          candidates[0]
+        );
+      }
+
+      const isRound =
+        checkIsRoundNumber(selected);
+
+      setOcrPriceText(
+        `${selected.toFixed(5)}${
+          isRound ? ' 🎯 ROUND' : ''
+        }`
+      );
+
+      setIsRealRoundNumber(isRound);
+
+      return selected;
+    } catch {
+      return lastPriceRef.current;
+    }
+  };
+
+  /* =========================================================
+     CANDLE BUILDER
+     ========================================================= */
+
+  const buildOneMinuteCandle = useCallback(() => {
+    const history = priceHistoryRef.current;
+
+    if (!history.length) return;
+
+    const currentTime = Date.now();
+
+    const minuteKey = new Date(
+      currentTime
+    ).toISOString().slice(0, 16);
+
+    const minuteData = history.filter(
+      item => {
+        const key = new Date(
+          item.time
+        ).toISOString().slice(0, 16);
+
+        return key === minuteKey;
+      }
+    );
+
+    if (minuteData.length < 2) return;
+
+    const prices = minuteData.map(
+      item => item.price
+    );
+
+    const open = prices[0];
+    const close = prices[prices.length - 1];
+
+    const high = Math.max(...prices);
+    const low = Math.min(...prices);
+
+    const body = Math.abs(close - open);
+
+    const upperWick =
+      Math.max(0, high - Math.max(open, close));
+
+    const lowerWick =
+      Math.max(0, Math.min(open, close) - low);
+
+    const color: CandleColor =
+      close > open
+        ? 'GREEN'
+        : close < open
+        ? 'RED'
+        : 'NEUTRAL';
+
+    const candle: Candle = {
+      time: currentTime,
+      minuteKey,
+      open,
+      high,
+      low,
+      close,
+      color,
+      body,
+      upperWick,
+      lowerWick,
+    };
+
+    const previous =
+      candleHistoryRef.current[
+        candleHistoryRef.current.length - 1
+      ];
+
+    if (!previous || previous.minuteKey !== minuteKey) {
+      candleHistoryRef.current.push(candle);
+
+      if (candleHistoryRef.current.length > 100) {
+        candleHistoryRef.current.shift();
+      }
+    } else {
+      candleHistoryRef.current[
+        candleHistoryRef.current.length - 1
+      ] = candle;
+    }
+  }, []);
+
+  /* =========================================================
+     CANDLE PATTERN ENGINE
+     ========================================================= */
+
+  const detectCandlePattern = (
+    candles: Candle[]
+  ) => {
+    if (!candles.length) {
+      return 'NO_CANDLE';
+    }
+
+    const current =
+      candles[candles.length - 1];
+
+    const previous =
+      candles[candles.length - 2];
+
+    if (!previous) {
+      return current.color === 'GREEN'
+        ? 'BULLISH_CANDLE'
+        : current.color === 'RED'
+        ? 'BEARISH_CANDLE'
+        : 'NEUTRAL_CANDLE';
+    }
+
+    const body =
+      Math.max(current.body, 0.00000001);
+
+    /*
+     * Doji
+     */
+    const range =
+      current.high - current.low;
+
+    if (
+      range > 0 &&
+      current.body <= range * 0.15
+    ) {
+      return 'DOJI';
+    }
+
+    /*
+     * Bullish rejection
+     */
+    if (
+      current.lowerWick > body * 1.8 &&
+      current.close >= current.open
+    ) {
+      return 'BULLISH_REJECTION';
+    }
+
+    /*
+     * Bearish rejection
+     */
+    if (
+      current.upperWick > body * 1.8 &&
+      current.close <= current.open
+    ) {
+      return 'BEARISH_REJECTION';
+    }
+
+    /*
+     * Bullish engulfing
+     */
+    if (
+      previous.color === 'RED' &&
+      current.color === 'GREEN' &&
+      current.open <= previous.close &&
+      current.close >= previous.open
+    ) {
+      return 'BULLISH_ENGULFING';
+    }
+
+    /*
+     * Bearish engulfing
+     */
+    if (
+      previous.color === 'GREEN' &&
+      current.color === 'RED' &&
+      current.open >= previous.close &&
+      current.close <= previous.open
+    ) {
+      return 'BEARISH_ENGULFING';
+    }
+
+    if (current.color === 'GREEN') {
+      return 'BULLISH_CANDLE';
+    }
+
+    if (current.color === 'RED') {
+      return 'BEARISH_CANDLE';
+    }
+
+    return 'NEUTRAL_CANDLE';
+  };
+
+  /* =========================================================
+     MARKET STRUCTURE
+     ========================================================= */
+
+  const detectMarketStructure = (
+    candles: Candle[]
+  ): {
+    trend: Trend;
+    structure: Structure;
+  } => {
+    if (candles.length < 5) {
+      return {
+        trend: 'UNKNOWN',
+        structure: 'UNKNOWN',
+      };
+    }
+
+    const recent = candles.slice(-6);
+
+    const highs = recent.map(
+      candle => candle.high
+    );
+
+    const lows = recent.map(
+      candle => candle.low
+    );
+
+    const higherHigh =
+      highs[highs.length - 1] >
+      highs[0];
+
+    const higherLow =
+      lows[lows.length - 1] >
+      lows[0];
+
+    const lowerHigh =
+      highs[highs.length - 1] <
+      highs[0];
+
+    const lowerLow =
+      lows[lows.length - 1] <
+      lows[0];
+
+    let trend: Trend = 'RANGE';
+
+    if (higherHigh && higherLow) {
+      trend = 'UPTREND';
+    } else if (lowerHigh && lowerLow) {
+      trend = 'DOWNTREND';
+    }
+
+    let structure: Structure = 'RANGE';
+
+    if (higherHigh && higherLow) {
+      structure = 'HH_HL';
+    } else if (lowerHigh && lowerLow) {
+      structure = 'LH_LL';
+    }
+
+    /*
+     * Basic BOS detection.
+     */
+    const previousHigh = Math.max(
+      ...recent.slice(0, -1).map(
+        c => c.high
+      )
+    );
+
+    const previousLow = Math.min(
+      ...recent.slice(0, -1).map(
+        c => c.low
+      )
+    );
+
+    const last =
+      recent[recent.length - 1];
+
+    if (last.close > previousHigh) {
+      structure = 'BOS_UP';
+      trend = 'UPTREND';
+    }
+
+    if (last.close < previousLow) {
+      structure = 'BOS_DOWN';
+      trend = 'DOWNTREND';
+    }
+
+    return {
+      trend,
+      structure,
+    };
+  };
+
+  /* =========================================================
+     SUPPORT / RESISTANCE
+     ========================================================= */
+
+  const updateSupportResistance = useCallback(
+    (price: number) => {
+      if (!price || price <= 0) return;
+
+      const brain = brainRef.current;
+
+      const tolerance = Math.max(
+        Math.abs(price) * 0.00015,
+        0.00005
+      );
+
+      const existing = brain.srLevels.find(
+        level =>
+          Math.abs(level.price - price) <
+          tolerance
+      );
+
+      if (existing) {
+        existing.touches += 1;
+        existing.lastSeen = Date.now();
+
+        existing.strength = Math.min(
+          100,
+          40 + existing.touches * 10
+        );
+
+        return;
+      }
+
+      /*
+       * New candidate level.
+       * Classification is refined later from surrounding price.
+       */
+      brain.srLevels.push({
+        price,
+        type: 'SUPPORT',
+        touches: 1,
+        strength: 40,
+        lastSeen: Date.now(),
+      });
+
+      /*
+       * Limit memory.
+       */
+      if (brain.srLevels.length > 100) {
+        brain.srLevels.sort(
+          (a, b) =>
+            b.lastSeen - a.lastSeen
+        );
+
+        brain.srLevels =
+          brain.srLevels.slice(0, 100);
+      }
+    },
+    []
+  );
+
+  const findNearestSR = (
+    price: number
+  ): {
+    support: SRLevel | null;
+    resistance: SRLevel | null;
+  } => {
+    const levels =
+      brainRef.current.srLevels;
+
+    let support: SRLevel | null = null;
+    let resistance: SRLevel | null = null;
+
+    for (const level of levels) {
+      if (level.price <= price) {
+        if (
+          !support ||
+          level.price > support.price
+        ) {
+          support = {
+            ...level,
+            type: 'SUPPORT',
+          };
+        }
+      }
+
+      if (level.price >= price) {
+        if (
+          !resistance ||
+          level.price < resistance.price
+        ) {
+          resistance = {
+            ...level,
+            type: 'RESISTANCE',
+          };
+        }
+      }
+    }
+
+    return {
+      support,
+      resistance,
+    };
+  };
+
+  /* =========================================================
+     PRICE ACTION
+     ========================================================= */
+
+  const detectPriceAction = (
+    candles: Candle[],
+    support: SRLevel | null,
+    resistance: SRLevel | null
+  ) => {
+    if (!candles.length) {
+      return 'NONE';
+    }
+
+    const current =
+      candles[candles.length - 1];
+
+    const previous =
+      candles[candles.length - 2];
+
+    if (!previous) {
+      return 'NONE';
+    }
+
+    const price = current.close;
+
+    const nearSupport =
+      support &&
+      Math.abs(
+        price - support.price
+      ) <=
+        Math.max(
+          Math.abs(price) * 0.0004,
+          0.0001
+        );
+
+    const nearResistance =
+      resistance &&
+      Math.abs(
+        price - resistance.price
+      ) <=
+        Math.max(
+          Math.abs(price) * 0.0004,
+          0.0001
+        );
+
+    if (
+      nearSupport &&
+      current.lowerWick > current.body * 1.5
+    ) {
+      return 'SUPPORT_REJECTION';
+    }
+
+    if (
+      nearResistance &&
+      current.upperWick > current.body * 1.5
+    ) {
+      return 'RESISTANCE_REJECTION';
+    }
+
+    /*
+     * Breakout
+     */
+    if (
+      resistance &&
+      previous.close <= resistance.price &&
+      current.close > resistance.price
+    ) {
+      return 'BREAKOUT_UP';
+    }
+
+    if (
+      support &&
+      previous.close >= support.price &&
+      current.close < support.price
+    ) {
+      return 'BREAKOUT_DOWN';
+    }
+
+    /*
+     * Simple retest
+     */
+    if (
+      resistance &&
+      previous.close > resistance.price &&
+      current.low <= resistance.price &&
+      current.close > resistance.price
+    ) {
+      return 'RETEST_SUPPORT_AFTER_BREAKOUT';
+    }
+
+    if (
+      support &&
+      previous.close < support.price &&
+      current.high >= support.price &&
+      current.close < support.price
+    ) {
+      return 'RETEST_RESISTANCE_AFTER_BREAKDOWN';
+    }
+
+    return 'NONE';
+  };
+
+  /* =========================================================
+     ZIGZAG
+     ========================================================= */
+
+  const processZigZag = useCallback(
+    (price: number) => {
+      const history =
+        priceHistoryRef.current;
+
+      if (history.length < 10) return;
+
+      const recent = history.slice(-20);
+
+      const prices = recent.map(
+        item => item.price
+      );
+
+      const max = Math.max(...prices);
+      const min = Math.min(...prices);
+
+      const tolerance = Math.max(
+        Math.abs(price) * 0.0002,
+        0.00005
+      );
+
+      let type: 'HIGH' | 'LOW' | null =
+        null;
+
+      if (
+        Math.abs(price - max) <= tolerance
+      ) {
+        type = 'HIGH';
+      } else if (
+        Math.abs(price - min) <= tolerance
+      ) {
+        type = 'LOW';
+      }
+
+      if (!type) return;
+
+      const existing =
+        brainRef.current.zigzagLevels.find(
+          level =>
+            level.type === type &&
+            Math.abs(level.price - price) <
+              tolerance
+        );
+
+      if (existing) {
+        existing.occurrences++;
+        existing.timestamp = Date.now();
+      } else {
+        brainRef.current.zigzagLevels.push({
+          price,
+          type,
+          occurrences: 1,
+          timestamp: Date.now(),
+        });
+      }
+
+      if (
+        brainRef.current.zigzagLevels.length >
+        100
+      ) {
+        brainRef.current.zigzagLevels =
+          brainRef.current.zigzagLevels.slice(
+            -100
+          );
+      }
+    },
+    []
+  );
+
+  /* =========================================================
+     MAGIC NUMBERS
+     ========================================================= */
+
+  const detectMagicNumber = useCallback(
+    (
+      currentPrice: number,
+      currentColor: CandleColor,
+      previousPrice: number,
+      previousColor: CandleColor
+    ) => {
+      if (
+        !currentPrice ||
+        !previousPrice ||
+        currentColor === 'NEUTRAL' ||
+        previousColor === 'NEUTRAL' ||
+        currentColor === previousColor
+      ) {
+        return;
+      }
+
+      const direction =
+        previousColor === 'GREEN'
+          ? 'GREEN_TO_RED'
+          : 'RED_TO_GREEN';
+
+      const range =
+        getPriceRange(currentPrice);
+
+      const existing =
+        brainRef.current.magicNumbers.find(
+          item =>
+            item.priceRange === range &&
+            Math.abs(
+              item.priceLevel -
+                currentPrice
+            ) < 0.0005
+        );
+
+      if (existing) {
+        existing.occurrences++;
+        existing.lastSeen = Date.now();
+
+        return;
+      }
+
+      brainRef.current.magicNumbers.push({
+        priceLevel: currentPrice,
+        isRoundNumber:
+          checkIsRoundNumber(currentPrice),
+        priceRange: range,
+        direction,
+        occurrences: 1,
+        wins: 0,
+        losses: 0,
+        successRate: 50,
+        lastSeen: Date.now(),
+      });
+    },
+    []
+  );
+
+  /* =========================================================
+     TIME STATISTICS
+     ========================================================= */
+
+  const trackTime = useCallback(
+    (
+      direction: 'UP' | 'DOWN' | 'NEUTRAL'
+    ) => {
+      const now = new Date();
+
+      /*
+       * Use minute-level buckets rather than
+       * exact second so there are enough observations.
+       */
+      const timeKey =
+        `${String(
+          now.getHours()
+        ).padStart(2, '0')}:` +
+        `${String(
+          now.getMinutes()
+        ).padStart(2, '0')}`;
+
+      let existing =
+        brainRef.current.timeAlgorithms.find(
+          item =>
+            item.timeKey === timeKey
+        );
+
+      if (!existing) {
+        existing = {
+          timeKey,
+          direction,
+          occurrences: 1,
+          wins: 0,
+          losses: 0,
+          successRate: 50,
+          lastOccurrences: [
+            Date.now(),
+          ],
+        };
+
+        brainRef.current.timeAlgorithms.push(
+          existing
+        );
+      } else {
+        existing.occurrences++;
+
+        if (direction !== 'NEUTRAL') {
+          existing.direction = direction;
+        }
+
+        existing.lastOccurrences.push(
+          Date.now()
+        );
+
+        if (
+          existing.lastOccurrences.length >
+          20
+        ) {
+          existing.lastOccurrences.shift();
+        }
+      }
+    },
+    []
+  );
+
+  /* =========================================================
+     HISTORICAL SETUP STATISTICS
+     ========================================================= */
+
+  const getHistoricalSetupScore = (
+    candlePattern: string,
+    priceAction: string,
+    signal: Direction
+  ) => {
+    const patterns =
+      brainRef.current.patterns.filter(
+        item =>
+          item.candlePattern ===
+            candlePattern &&
+          item.priceAction ===
+            priceAction &&
+          item.signal === signal
+      );
+
+    if (patterns.length < 5) {
+      return {
+        score: 0,
+        sample: patterns.length,
+        winRate: 0,
+      };
+    }
+
+    const wins = patterns.filter(
+      item => item.result === 'WIN'
+    ).length;
+
+    const winRate =
+      (wins / patterns.length) * 100;
+
+    const score =
+      Math.max(
+        -10,
+        Math.min(10, (winRate - 50) / 5)
+      );
+
+    return {
+      score,
+      sample: patterns.length,
+      winRate,
+    };
+  };
+
+  /* =========================================================
+     MULTI FACTOR SIGNAL ENGINE
+     ========================================================= */
+
+  const buildSignal = (
+    price: number
+  ): LiveAnalysis => {
+    const candles =
+      candleHistoryRef.current.slice(-20);
+
+    const current =
+      candles[candles.length - 1] || null;
+
+    const previousCandles =
+      candles.slice(
+        Math.max(0, candles.length - 10),
+        -1
+      );
+
+    if (
+      !current ||
+      candles.length < MIN_CANDLES_FOR_ANALYSIS
+    ) {
+      return {
+        signal: 'WAIT',
+        score: 0,
+        confidence: 0,
+        quality: 'WAIT',
+        price,
+        trend: 'UNKNOWN',
+        structure: 'UNKNOWN',
+        candlePattern: 'INSUFFICIENT_DATA',
+        priceAction: 'INSUFFICIENT_DATA',
+        support: null,
+        resistance: null,
+        reasons: [
+          'More 1-minute candle history required.',
+        ],
+        currentCandle: current,
+        previousCandles,
+        timeKey: '',
+      };
+    }
+
+    const {
+      trend,
+      structure,
+    } = detectMarketStructure(candles);
+
+    const candlePattern =
+      detectCandlePattern(candles);
+
+    const {
+      support,
+      resistance,
+    } = findNearestSR(price);
+
+    const priceAction =
+      detectPriceAction(
+        candles,
+        support,
+        resistance
+      );
+
+    let callScore = 0;
+    let putScore = 0;
+
+    const reasons: string[] = [];
+
+    /* -------------------------------------------------------
+       MARKET STRUCTURE
+       ------------------------------------------------------- */
+
+    if (trend === 'UPTREND') {
+      callScore += 20;
+      reasons.push('Trend: UPTREND');
+    }
+
+    if (trend === 'DOWNTREND') {
+      putScore += 20;
+      reasons.push('Trend: DOWNTREND');
+    }
+
+    if (structure === 'HH_HL') {
+      callScore += 15;
+      reasons.push('Structure: HH + HL');
+    }
+
+    if (structure === 'LH_LL') {
+      putScore += 15;
+      reasons.push('Structure: LH + LL');
+    }
+
+    if (structure === 'BOS_UP') {
+      callScore += 20;
+      reasons.push('Bullish BOS detected');
+    }
+
+    if (structure === 'BOS_DOWN') {
+      putScore += 20;
+      reasons.push('Bearish BOS detected');
+    }
+
+    /* -------------------------------------------------------
+       CANDLE PATTERN
+       ------------------------------------------------------- */
+
+    if (
+      candlePattern ===
+        'BULLISH_REJECTION' ||
+      candlePattern ===
+        'BULLISH_ENGULFING'
+    ) {
+      callScore += 18;
+
+      reasons.push(
+        `Bullish candle: ${candlePattern}`
+      );
+    }
+
+    if (
+      candlePattern ===
+        'BEARISH_REJECTION' ||
+      candlePattern ===
+        'BEARISH_ENGULFING'
+    ) {
+      putScore += 18;
+
+      reasons.push(
+        `Bearish candle: ${candlePattern}`
+      );
+    }
+
+    if (
+      candlePattern === 'BULLISH_CANDLE'
+    ) {
+      callScore += 7;
+    }
+
+    if (
+      candlePattern === 'BEARISH_CANDLE'
+    ) {
+      putScore += 7;
+    }
+
+    /*
+     * Doji = uncertainty.
+     */
+    if (candlePattern === 'DOJI') {
+      callScore -= 10;
+      putScore -= 10;
+
+      reasons.push(
+        'Doji/noise filter active'
+      );
+    }
+
+    /* -------------------------------------------------------
+       SUPPORT / RESISTANCE
+       ------------------------------------------------------- */
+
+    if (support) {
+      const distance =
+        Math.abs(
+          price - support.price
+        );
+
+      const tolerance =
+        Math.max(
+          Math.abs(price) * 0.0005,
+          0.0001
+        );
+
+      if (distance <= tolerance) {
+        callScore += 12;
+
+        reasons.push(
+          `Near support ${support.price.toFixed(
+            5
+          )}`
+        );
+      }
+    }
+
+    if (resistance) {
+      const distance =
+        Math.abs(
+          price - resistance.price
+        );
+
+      const tolerance =
+        Math.max(
+          Math.abs(price) * 0.0005,
+          0.0001
+        );
+
+      if (distance <= tolerance) {
+        putScore += 12;
+
+        reasons.push(
+          `Near resistance ${resistance.price.toFixed(
+            5
+          )}`
+        );
+      }
+    }
+
+    /* -------------------------------------------------------
+       PRICE ACTION
+       ------------------------------------------------------- */
+
+    switch (priceAction) {
+      case 'SUPPORT_REJECTION':
+        callScore += 20;
+        reasons.push(
+          'Support rejection confirmed'
+        );
+        break;
+
+      case 'RESISTANCE_REJECTION':
+        putScore += 20;
+        reasons.push(
+          'Resistance rejection confirmed'
+        );
+        break;
+
+      case 'BREAKOUT_UP':
+        callScore += 18;
+        reasons.push(
+          'Resistance breakout'
+        );
+        break;
+
+      case 'BREAKOUT_DOWN':
+        putScore += 18;
+        reasons.push(
+          'Support breakdown'
+        );
+        break;
+
+      case 'RETEST_SUPPORT_AFTER_BREAKOUT':
+        callScore += 22;
+        reasons.push(
+          'Bullish breakout retest'
+        );
+        break;
+
+      case 'RETEST_RESISTANCE_AFTER_BREAKDOWN':
+        putScore += 22;
+        reasons.push(
+          'Bearish breakdown retest'
+        );
+        break;
+    }
+
+    /* -------------------------------------------------------
+       ROUND NUMBER
+       ------------------------------------------------------- */
+
+    if (checkIsRoundNumber(price)) {
+      /*
+       * Round number alone is NOT a signal.
+       */
+      reasons.push(
+        'Round-number level detected'
+      );
+    }
+
+    /* -------------------------------------------------------
+       HISTORICAL LEARNING
+       ------------------------------------------------------- */
+
+    const provisionalSignal =
+      callScore > putScore
+        ? 'CALL'
+        : putScore > callScore
+        ? 'PUT'
+        : 'WAIT';
+
+    if (provisionalSignal !== 'WAIT') {
+      const historical =
+        getHistoricalSetupScore(
+          candlePattern,
+          priceAction,
+          provisionalSignal
+        );
+
+      if (historical.sample >= 5) {
+        if (
+          provisionalSignal === 'CALL'
+        ) {
+          callScore += historical.score;
+        } else {
+          putScore += historical.score;
+        }
+
+        reasons.push(
+          `Historical setup: ${historical.winRate.toFixed(
+            1
+          )}% (${historical.sample} samples)`
+        );
+      }
+    }
+
+    /* -------------------------------------------------------
+       FINAL SCORE
+       ------------------------------------------------------- */
+
+    const bestScore = Math.max(
+      callScore,
+      putScore
+    );
+
+    const difference = Math.abs(
+      callScore - putScore
+    );
+
+    let signal: Direction = 'WAIT';
+
+    if (
+      callScore >= 55 &&
+      callScore > putScore + 8
+    ) {
+      signal = 'CALL';
+    }
+
+    if (
+      putScore >= 55 &&
+      putScore > callScore + 8
+    ) {
+      signal = 'PUT';
+    }
+
+    /*
+     * Noise filter:
+     * if there is not enough confirmation,
+     * stay WAIT.
+     */
+    if (
+      candles.length < 10 ||
+      difference < 8 ||
+      bestScore < 45
+    ) {
+      signal = 'WAIT';
+
+      reasons.push(
+        'Confirmation insufficient → WAIT'
+      );
+    }
+
+    /*
+     * Confidence is derived from score,
+     * not hard-coded 85%.
+     */
+    const confidence =
+      signal === 'WAIT'
+        ? Math.min(
+            49,
+            Math.max(
+              0,
+              bestScore
+            )
+          )
+        : Math.min(
+            95,
+            Math.max(
+              50,
+              50 +
+                bestScore * 0.45 +
+                difference * 0.2
+            )
+          );
+
+    let quality:
+      | 'STRONG'
+      | 'MEDIUM'
+      | 'WEAK'
+      | 'WAIT' = 'WAIT';
+
+    if (signal !== 'WAIT') {
+      if (confidence >= 80) {
+        quality = 'STRONG';
+      } else if (confidence >= 65) {
+        quality = 'MEDIUM';
+      } else {
+        quality = 'WEAK';
+      }
+    }
+
+    const score =
+      signal === 'CALL'
+        ? Math.round(callScore)
+        : signal === 'PUT'
+        ? Math.round(putScore)
+        : Math.round(bestScore);
+
+    const now = new Date();
+
+    const timeKey =
+      `${String(
+        now.getHours()
+      ).padStart(2, '0')}:` +
+      `${String(
+        now.getMinutes()
+      ).padStart(2, '0')}`;
+
+    return {
+      signal,
+      score,
+      confidence,
+      quality,
+      price,
+      trend,
+      structure,
+      candlePattern,
+      priceAction,
+      support,
+      resistance,
+      reasons,
+      currentCandle: current,
+      previousCandles,
+      timeKey,
+    };
+  };
+
+  /* =========================================================
+     FRAME PROCESSING
+     ========================================================= */
+
+  const captureCurrentFrame = useCallback(
+    async () => {
+      if (
+        !canvasRef.current ||
+        !videoRef.current
+      ) {
+        return null;
+      }
+
+      const ctx =
+        canvasRef.current.getContext(
+          '2d',
+          {
+            willReadFrequently: true,
+          }
+        );
+
+      if (!ctx) return null;
+
+      const width =
+        videoRef.current.videoWidth ||
+        800;
+
+      const height =
+        videoRef.current.videoHeight ||
+        450;
+
+      canvasRef.current.width = width;
+      canvasRef.current.height = height;
+
+      ctx.drawImage(
+        videoRef.current,
+        0,
+        0,
+        width,
+        height
+      );
+
+      const roi = getScaledROI();
+
+      const imageData =
+        ctx.getImageData(
+          roi.x,
+          roi.y,
+          roi.width,
+          roi.height
+        );
+
+      const pixelAnalysis =
+        analyzePixelDistribution(
+          imageData.data,
+          roi.width,
+          roi.height
+        );
+
+      const color: CandleColor =
+        pixelAnalysis.greenPixels >
+        pixelAnalysis.redPixels * 1.15
+          ? 'GREEN'
+          : pixelAnalysis.redPixels >
+            pixelAnalysis.greenPixels *
+              1.15
+          ? 'RED'
+          : 'NEUTRAL';
+
+      const price =
+        await extractPriceLevelWithOCR(
+          ctx
+        );
+
+      return {
+        ctx,
+        color,
+        price,
+      };
+    },
+    [getScaledROI]
+  );
+
+  /* =========================================================
+     CONTINUOUS LEARNING
+     ========================================================= */
+
+  const startContinuousLearning =
+    useCallback(() => {
+      if (
+        continuousLearningRef.current
+      ) {
+        clearInterval(
+          continuousLearningRef.current
+        );
+      }
+
+      continuousLearningRef.current =
+        setInterval(async () => {
+          if (!isStreamActive) return;
+
+          const frame =
+            await captureCurrentFrame();
+
+          if (!frame) return;
+
+          const {
+            color,
+            price,
+          } = frame;
+
+          if (
+            price &&
+            Number.isFinite(price) &&
+            price > 0
+          ) {
+            priceHistoryRef.current.push({
+              price,
+              time: Date.now(),
+              color,
+            });
+
+            if (
+              priceHistoryRef.current
+                .length > 2000
+            ) {
+              priceHistoryRef.current.shift();
+            }
+
+            updateSupportResistance(
+              price
+            );
+
+            processZigZag(price);
+
+            detectMagicNumber(
+              price,
+              color,
+              lastPriceRef.current,
+              lastColorRef.current
+            );
+
+            lastPriceRef.current = price;
+            lastColorRef.current = color;
+
+            buildOneMinuteCandle();
+          }
+
+          const direction =
+            color === 'GREEN'
+              ? 'UP'
+              : color === 'RED'
+              ? 'DOWN'
+              : 'NEUTRAL';
+
+          trackTime(direction);
+        }, 1000);
+    }, [
+      isStreamActive,
+      captureCurrentFrame,
+      updateSupportResistance,
+      processZigZag,
+      detectMagicNumber,
+      buildOneMinuteCandle,
+      trackTime,
+    ]);
+
+  /* =========================================================
+     CONNECT
+     ========================================================= */
 
   const connectStream = async () => {
     try {
-      const mediaStream = await navigator.mediaDevices.getDisplayMedia({
-        video: { displaySurface: "window", width: 1280, height: 720, frameRate: 30 } as any,
-        audio: false
-      });
+      const mediaStream =
+        await navigator.mediaDevices.getDisplayMedia(
+          {
+            video: {
+              displaySurface: 'window',
+              width: {
+                ideal: 1920,
+              },
+              height: {
+                ideal: 1080,
+              },
+              frameRate: {
+                ideal: 30,
+              },
+            } as any,
+            audio: false,
+          }
+        );
+
       setStream(mediaStream);
       setIsStreamActive(true);
-      setStatusMessage("Connected! Trader Yodha X OTC Engine live...");
-      startContinuousLearning(mediaStream);
-    } catch (err) {
-      console.error(err);
-      setStatusMessage("Connection failed. Share Quotex screen.");
+
+      setStatusMessage(
+        'Screen connected. Building 1-minute market structure...'
+      );
+
+      mediaStream
+        .getVideoTracks()[0]
+        ?.addEventListener(
+          'ended',
+          () => {
+            setIsStreamActive(false);
+            setStream(null);
+          }
+        );
+    } catch (error) {
+      console.error(error);
+
+      setStatusMessage(
+        'Screen sharing failed. Please share the chart window.'
+      );
     }
   };
+
+  useEffect(() => {
+    if (isStreamActive) {
+      startContinuousLearning();
+    }
+  }, [
+    isStreamActive,
+    startContinuousLearning,
+  ]);
 
   const disconnectStream = () => {
-    if (continuousLearningRef.current) clearInterval(continuousLearningRef.current);
-    if (stream) stream.getTracks().forEach(track => track.stop());
+    if (
+      continuousLearningRef.current
+    ) {
+      clearInterval(
+        continuousLearningRef.current
+      );
+
+      continuousLearningRef.current =
+        null;
+    }
+
+    if (stream) {
+      stream
+        .getTracks()
+        .forEach(track =>
+          track.stop()
+        );
+    }
+
     setStream(null);
     setIsStreamActive(false);
-    setIsScanning(false);
     setAiSignal('WAIT');
-    setStatusMessage("Engine paused.");
+    setCurrentAnalysis(null);
+
+    pendingSignalRef.current = null;
+
+    setStatusMessage(
+      'Engine paused.'
+    );
   };
 
-  // Instant OTC Fast Engine (Runs within 2 seconds instead of 46s)
+  /* =========================================================
+     FAST SCAN
+     ========================================================= */
+
   const executeFastScan = async () => {
-    if (!canvasRef.current || !videoRef.current) return;
-    const ctx = canvasRef.current.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return;
-
-    const vWidth = videoRef.current.videoWidth || 800;
-    const vHeight = videoRef.current.videoHeight || 400;
-    canvasRef.current.width = vWidth;
-    canvasRef.current.height = vHeight;
-    ctx.drawImage(videoRef.current, 0, 0, vWidth, vHeight);
-
-    const targetROI = getScaledROI();
-    const croppedImageData = ctx.getImageData(
-      targetROI.x, targetROI.y, 
-      Math.max(1, targetROI.width), Math.max(1, targetROI.height)
-    );
-
-    const analysisRes = analyzePixelDistribution(
-      croppedImageData.data, Math.max(1, targetROI.width), Math.max(1, targetROI.height)
-    );
-
-    const currentPrice = await extractPriceLevelWithOCR(ctx);
-    const isRound = checkIsRoundNumber(currentPrice);
-    const priceRange = getPriceRange(currentPrice);
-
-    const matchedZigZag = brainRef.current.zigzagLevels.reduce((closest, current) => {
-      const currentDiff = Math.abs(current.price - currentPrice);
-      const closestDiff = closest ? Math.abs(closest.price - currentPrice) : Infinity;
-      return currentDiff < closestDiff && currentDiff < 0.00150 ? current : closest;
-    }, null as ZigZagLevel | null);
-
-    const relevantMagicNumbers = brainRef.current.magicNumbers.filter(
-      mn => mn.priceRange === priceRange && Math.abs(mn.priceLevel - currentPrice) < 0.005
-    );
-
-    const now = new Date();
-    const currentMinute = now.getMinutes();
-    const currentSecond = now.getSeconds();
-    const timeKey24H = `${String(now.getHours()).padStart(2, '0')}:${String(currentMinute).padStart(2, '0')}:${String(currentSecond).padStart(2, '0')}`;
-    const timeSyncData = brainRef.current.timeAlgorithms.find(ta => ta.timeKey24H === timeKey24H);
-
-    const dominantColor: 'GREEN' | 'RED' | 'NEUTRAL' = 
-      analysisRes.greenPixels > analysisRes.redPixels * 1.05 ? 'GREEN' : analysisRes.redPixels > analysisRes.greenPixels * 1.05 ? 'RED' : 'NEUTRAL';
-
-    let proposedSignal: 'CALL' | 'PUT' = dominantColor === 'GREEN' ? 'CALL' : 'PUT';
-    let confidence = 0.85;
-    let patternString = `Dominant Candle: ${dominantColor}`;
-
-    if (analysisRes.actualTopWickSize > analysisRes.actualBodySize * 1.8) {
-      proposedSignal = 'PUT';
-      patternString += ` | REVERSAL: TOP WICK EXHAUSTION`;
-    } else if (analysisRes.actualBottomWickSize > analysisRes.actualBodySize * 1.8) {
-      proposedSignal = 'CALL';
-      patternString += ` | REVERSAL: BOTTOM WICK EXHAUSTION`;
+    if (
+      !isStreamActive ||
+      !videoRef.current
+    ) {
+      return;
     }
 
-    if (matchedZigZag) {
-      if (matchedZigZag.type === 'HIGH' && proposedSignal === 'CALL') {
-        proposedSignal = 'PUT';
-        patternString += ` | ZIGZAG RESISTANCE`;
-      } else if (matchedZigZag.type === 'LOW' && proposedSignal === 'PUT') {
-        proposedSignal = 'CALL';
-        patternString += ` | ZIGZAG SUPPORT`;
+    setIsScanning(true);
+
+    try {
+      /*
+       * Take several quick samples instead of
+       * trusting one frame.
+       */
+      for (let i = 0; i < 3; i++) {
+        const frame =
+          await captureCurrentFrame();
+
+        if (!frame) continue;
+
+        if (
+          frame.price &&
+          Number.isFinite(frame.price)
+        ) {
+          priceHistoryRef.current.push({
+            price: frame.price,
+            time: Date.now(),
+            color: frame.color,
+          });
+
+          lastPriceRef.current =
+            frame.price;
+
+          lastColorRef.current =
+            frame.color;
+
+          buildOneMinuteCandle();
+        }
+
+        await new Promise(resolve =>
+          setTimeout(resolve, 150)
+        );
       }
+
+      const price =
+        lastPriceRef.current;
+
+      if (!price) {
+        setStatusMessage(
+          'Price not detected. Adjust OCR ROI.'
+        );
+
+        setIsScanning(false);
+        return;
+      }
+
+      const analysis =
+        buildSignal(price);
+
+      setCurrentAnalysis(analysis);
+
+      /*
+       * Only prepare executable direction when
+       * confirmation is sufficient.
+       */
+      if (
+        analysis.signal !== 'WAIT'
+      ) {
+        pendingSignalRef.current = {
+          signal: analysis.signal,
+          analysis,
+        };
+
+        setStatusMessage(
+          `${analysis.quality} setup prepared. Score ${analysis.score}/100. Entry synchronized to next candle.`
+        );
+      } else {
+        pendingSignalRef.current = null;
+
+        setStatusMessage(
+          `WAIT — confirmation insufficient. Score ${analysis.score}.`
+        );
+      }
+    } catch (error) {
+      console.error(
+        'Fast scan error:',
+        error
+      );
+
+      setStatusMessage(
+        'Scan error. Check ROI and OCR.'
+      );
     }
 
-    if (isRound) {
-      patternString += ` | SNR ROUND LEVEL`;
-    }
-
-    const liveData: LiveAnalysis = {
-      pattern: patternString,
-      sequence: [dominantColor === 'GREEN' ? 'G' : 'R'],
-      dominantColor,
-      strength: confidence,
-      priceLevel: currentPrice,
-      isRoundNumber: isRound,
-      bodySize: analysisRes.actualBodySize,
-      topWick: analysisRes.actualTopWickSize,
-      bottomWick: analysisRes.actualBottomWickSize,
-      detectedMagicNumbers: relevantMagicNumbers,
-      matchedZigZag,
-      timeKey24H,
-      timestampSecond: currentSecond,
-      currentMinute,
-      timeSyncData: timeSyncData || null
-    };
-
-    setCurrentAnalysis(liveData);
-    pendingSignalRef.current = { signal: proposedSignal, analysis: liveData };
     setIsScanning(false);
-    setStatusMessage(`Signal Prepared for Next 1-Min Candle! Lock time: 00:00`);
   };
 
   const triggerAnalysis = () => {
-    if (!isStreamActive || !videoRef.current) {
-      setStatusMessage("Error: Connect screen first!");
+    if (!isStreamActive) {
+      setStatusMessage(
+        'Connect screen first.'
+      );
       return;
     }
+
     setIsScanning(true);
-    setStatusMessage("Trader Yodha X Fast Scan: Analyzing OTC Candle Setup...");
-    setAiSignal('WAIT');
+
     setTimeout(() => {
       executeFastScan();
-    }, 1500);
+    }, 500);
   };
 
-  // Candle Sync Loop for 00:00 Exact Second Lock
+  /* =========================================================
+     CANDLE SYNCHRONIZATION
+     ========================================================= */
+
   useEffect(() => {
-    const candleSync = setInterval(() => {
-      const now = new Date();
-      const seconds = now.getSeconds();
-      const milliseconds = now.getMilliseconds();
-      const timeUntilNext = 60 - seconds - (milliseconds / 1000);
-      setTimeUntilCandle(Math.ceil(timeUntilNext));
+    const interval =
+      setInterval(() => {
+        const now = new Date();
 
-      // Auto trigger fast scan at :52 seconds
-      if (isStreamActive && seconds === 52 && !isScanning && !pendingSignalRef.current) {
-        executeFastScan();
-      }
+        const seconds =
+          now.getSeconds();
 
-      // Execute Signal exactly at :00 entry
-      if (pendingSignalRef.current && (seconds === 0 || seconds === 59) && milliseconds < 400) {
-        setAiSignal(pendingSignalRef.current.signal);
-        setStatusMessage(`🚀 SIGNAL ACTIVE (${pendingSignalRef.current.signal}) | Entry: 00:00`);
-        pendingSignalRef.current = null;
-      }
-    }, 100);
+        const milliseconds =
+          now.getMilliseconds();
 
-    return () => clearInterval(candleSync);
-  }, [isStreamActive, isScanning]);
+        const remaining =
+          60 -
+          seconds -
+          milliseconds / 1000;
 
-  const logTradeOutcome = (result: 'WIN' | 'LOSS') => {
-    if (aiSignal === 'WAIT' || !currentAnalysis) return;
+        setTimeUntilCandle(
+          Math.ceil(remaining)
+        );
 
-    const brain = brainRef.current;
-    const patternId = `${currentAnalysis.bodySize.toFixed(0)}_${Date.now()}`;
+        /*
+         * Automatic scan at :52.
+         */
+        if (
+          isStreamActive &&
+          seconds === 52 &&
+          !isScanning &&
+          !pendingSignalRef.current
+        ) {
+          executeFastScan();
+        }
 
-    brain.patterns.push({
-      id: patternId,
-      pattern: currentAnalysis.pattern,
-      sequenceLength: currentAnalysis.sequence.length,
-      priceLevel: currentAnalysis.priceLevel,
-      priceRange: getPriceRange(currentAnalysis.priceLevel),
-      bodySize: currentAnalysis.bodySize,
-      topWickSize: currentAnalysis.topWick,
-      bottomWickSize: currentAnalysis.bottomWick,
+        /*
+         * Activate prepared signal at :00.
+         */
+        if (
+          pendingSignalRef.current &&
+          seconds === 0 &&
+          milliseconds < 500
+        ) {
+          const pending =
+            pendingSignalRef.current;
+
+          setAiSignal(
+            pending.signal
+          );
+
+          setStatusMessage(
+            `🚀 ${pending.signal} ACTIVE | ${pending.quality} | Score ${pending.score}/100`
+          );
+
+          pendingSignalRef.current =
+            null;
+        }
+      }, 100);
+
+    return () =>
+      clearInterval(interval);
+  }, [
+    isStreamActive,
+    isScanning,
+  ]);
+
+  /* =========================================================
+     JOURNAL / WIN LOSS
+     ========================================================= */
+
+  const logTradeOutcome = async (
+    result: 'WIN' | 'LOSS'
+  ) => {
+    if (
+      aiSignal === 'WAIT' ||
+      !currentAnalysis
+    ) {
+      return;
+    }
+
+    const analysis =
+      currentAnalysis;
+
+    const id =
+      `${Date.now()}_${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
+
+    brainRef.current.patterns.push({
+      id,
+
+      pattern:
+        `${analysis.candlePattern} | ${analysis.priceAction}`,
+
+      signal: aiSignal,
+
       result,
+
       timestamp: Date.now(),
-      timeSync: currentAnalysis.timestampSecond,
-      timeKey24H: currentAnalysis.timeKey24H,
-      minuteMarker: currentAnalysis.currentMinute,
-      confidence: currentAnalysis.strength
+
+      priceLevel:
+        analysis.price,
+
+      trend:
+        analysis.trend,
+
+      structure:
+        analysis.structure,
+
+      candlePattern:
+        analysis.candlePattern,
+
+      priceAction:
+        analysis.priceAction,
+
+      score:
+        analysis.score,
+
+      confidence:
+        analysis.confidence,
+
+      timeKey:
+        analysis.timeKey,
+
+      minute:
+        new Date().getMinutes(),
     });
 
-    brain.totalTrades++;
-    const wins = brain.patterns.filter(p => p.result === 'WIN').length;
-    brain.winRate = brain.patterns.length > 0 ? (wins / brain.patterns.length) * 100 : 0;
+    brainRef.current.totalTrades++;
 
-    saveBrainToDB();
-    setStatusMessage(`Outcome logged [${result}]. System Win Rate: ${brain.winRate.toFixed(1)}%`);
+    if (result === 'WIN') {
+      brainRef.current.wins++;
+    } else {
+      brainRef.current.losses++;
+    }
+
+    brainRef.current.winRate =
+      brainRef.current.totalTrades > 0
+        ? (brainRef.current.wins /
+            brainRef.current
+              .totalTrades) *
+          100
+        : 0;
+
+    /*
+     * Update magic number statistics.
+     */
+    const magic =
+      brainRef.current.magicNumbers.find(
+        item =>
+          Math.abs(
+            item.priceLevel -
+              analysis.price
+          ) <
+          Math.max(
+            Math.abs(
+              analysis.price
+            ) * 0.0005,
+            0.0001
+          )
+      );
+
+    if (magic) {
+      if (result === 'WIN') {
+        magic.wins++;
+      } else {
+        magic.losses++;
+      }
+
+      const total =
+        magic.wins +
+        magic.losses;
+
+      magic.successRate =
+        total > 0
+          ? (magic.wins / total) *
+            100
+          : 50;
+    }
+
+    /*
+     * Update time statistics.
+     */
+    const timeAlgo =
+      brainRef.current.timeAlgorithms.find(
+        item =>
+          item.timeKey ===
+          analysis.timeKey
+      );
+
+    if (timeAlgo) {
+      if (result === 'WIN') {
+        timeAlgo.wins++;
+      } else {
+        timeAlgo.losses++;
+      }
+
+      const total =
+        timeAlgo.wins +
+        timeAlgo.losses;
+
+      timeAlgo.successRate =
+        total > 0
+          ? (timeAlgo.wins / total) *
+            100
+          : 50;
+    }
+
+    await saveBrainToDB();
+
+    setStatusMessage(
+      `${result} logged. Overall historical win rate: ${brainRef.current.winRate.toFixed(
+        1
+      )}%`
+    );
+
     setAiSignal('WAIT');
     setCurrentAnalysis(null);
   };
 
+  /* =========================================================
+     CLEAR BRAIN
+     ========================================================= */
+
   const clearBrain = async () => {
-    const password = prompt('Enter Master Password:');
-    if (password === 'YODDHAX_REBORN') {
-      brainRef.current = {
-        patterns: [],
-        magicNumbers: [],
-        timeAlgorithms: [],
-        zigzagLevels: [],
-        totalTrades: 0,
-        winRate: 0,
-        lastUpdated: Date.now()
-      };
-      await saveBrainToDB();
-      setStatusMessage("Trader Yodha X Memory Reset.");
+    const password =
+      window.prompt(
+        'Enter Master Password:'
+      );
+
+    if (
+      password !==
+      'YODDHAX_REBORN'
+    ) {
+      return;
     }
+
+    brainRef.current = {
+      patterns: [],
+      magicNumbers: [],
+      timeAlgorithms: [],
+      srLevels: [],
+      zigzagLevels: [],
+
+      totalTrades: 0,
+      wins: 0,
+      losses: 0,
+      winRate: 0,
+
+      lastUpdated: Date.now(),
+    };
+
+    await saveBrainToDB();
+
+    setCurrentAnalysis(null);
+    setAiSignal('WAIT');
+
+    setStatusMessage(
+      'Trader Yodha X Brain reset.'
+    );
   };
 
-  const handleMouseDown = (e: React.MouseEvent) => {
+  /* =========================================================
+     ROI DRAG / RESIZE
+     ========================================================= */
+
+  const [
+    isDragging,
+    setIsDragging,
+  ] = useState(false);
+
+  const [
+    isResizing,
+    setIsResizing,
+  ] = useState(false);
+
+  const [
+    dragStart,
+    setDragStart,
+  ] = useState({
+    x: 0,
+    y: 0,
+  });
+
+  const handleMouseDown = (
+    event: React.MouseEvent
+  ) => {
     if (isRoiLocked) return;
-    e.stopPropagation();
+
+    event.stopPropagation();
+
     setIsDragging(true);
-    setDragStart({ x: e.clientX - roiBox.x, y: e.clientY - roiBox.y });
+
+    setDragStart({
+      x:
+        event.clientX -
+        roiBox.x,
+      y:
+        event.clientY -
+        roiBox.y,
+    });
   };
 
-  const handleResizeDown = (e: React.MouseEvent) => {
+  const handleResizeDown = (
+    event: React.MouseEvent
+  ) => {
     if (isRoiLocked) return;
-    e.stopPropagation();
+
+    event.stopPropagation();
+
     setIsResizing(true);
-    setDragStart({ x: e.clientX, y: e.clientY });
+
+    setDragStart({
+      x: event.clientX,
+      y: event.clientY,
+    });
   };
 
-  const handleMouseMove = (e: React.MouseEvent) => {
-    if (isRoiLocked || (!isDragging && !isResizing)) return;
+  const handleMouseMove = (
+    event: React.MouseEvent
+  ) => {
+    if (
+      isRoiLocked ||
+      (!isDragging && !isResizing)
+    ) {
+      return;
+    }
 
-    if (videoContainerRef.current) {
-      const bounds = videoContainerRef.current.getBoundingClientRect();
+    const container =
+      videoContainerRef.current;
 
-      if (isDragging) {
-        const newX = Math.max(0, Math.min(bounds.width - roiBox.width, e.clientX - bounds.left - dragStart.x));
-        const newY = Math.max(0, Math.min(bounds.height - roiBox.height, e.clientY - bounds.top - dragStart.y));
-        setRoiBox(prev => ({ ...prev, x: newX, y: newY }));
-      } else if (isResizing) {
-        const deltaX = e.clientX - dragStart.x;
-        const deltaY = e.clientY - dragStart.y;
-        setDragStart({ x: e.clientX, y: e.clientY });
-        setRoiBox(prev => ({
-          ...prev,
-          width: Math.max(80, Math.min(bounds.width - prev.x, prev.width + deltaX)),
-          height: Math.max(80, Math.min(bounds.height - prev.y, prev.height + deltaY))
-        }));
-      }
+    if (!container) return;
+
+    const bounds =
+      container.getBoundingClientRect();
+
+    if (isDragging) {
+      const newX = Math.max(
+        0,
+        Math.min(
+          bounds.width -
+            roiBox.width,
+          event.clientX -
+            bounds.left -
+            dragStart.x
+        )
+      );
+
+      const newY = Math.max(
+        0,
+        Math.min(
+          bounds.height -
+            roiBox.height,
+          event.clientY -
+            bounds.top -
+            dragStart.y
+        )
+      );
+
+      setRoiBox(prev => ({
+        ...prev,
+        x: newX,
+        y: newY,
+      }));
+    }
+
+    if (isResizing) {
+      const deltaX =
+        event.clientX -
+        dragStart.x;
+
+      const deltaY =
+        event.clientY -
+        dragStart.y;
+
+      setDragStart({
+        x: event.clientX,
+        y: event.clientY,
+      });
+
+      setRoiBox(prev => ({
+        ...prev,
+
+        width: Math.max(
+          120,
+          Math.min(
+            bounds.width -
+              prev.x,
+            prev.width +
+              deltaX
+          )
+        ),
+
+        height: Math.max(
+          100,
+          Math.min(
+            bounds.height -
+              prev.y,
+            prev.height +
+              deltaY
+          )
+        ),
+      }));
     }
   };
 
@@ -760,27 +2582,70 @@ export default function TraderYodhaXEngine() {
     setIsResizing(false);
   };
 
+  /* =========================================================
+     UI HELPERS
+     ========================================================= */
+
+  const signalClass =
+    aiSignal === 'CALL'
+      ? 'bg-emerald-500/10 border-emerald-400 text-emerald-400'
+      : aiSignal === 'PUT'
+      ? 'bg-red-500/10 border-red-400 text-red-400'
+      : 'bg-slate-800 border-slate-700 text-slate-600';
+
+  /* =========================================================
+     UI
+     ========================================================= */
+
   return (
-    <div className="min-h-screen bg-[#040814] text-slate-100 font-sans" onMouseMove={handleMouseMove} onMouseUp={handleMouseUp}>
+    <div
+      className="min-h-screen bg-[#040814] text-slate-100 font-sans"
+      onMouseMove={handleMouseMove}
+      onMouseUp={handleMouseUp}
+    >
       <header className="border-b border-slate-800 px-6 py-4">
-        <div className="max-w-7xl mx-auto flex items-center justify-between">
+        <div className="max-w-7xl mx-auto flex items-center justify-between gap-5">
           <div>
-            <h1 className="text-2xl font-bold text-cyan-400 tracking-wider">TRADER YODHA X AI (OTC FAST ENGINE)</h1>
-            <p className="text-slate-500 text-sm">Candle-to-Candle Direct Signal Generator</p>
+            <h1 className="text-2xl font-bold text-cyan-400 tracking-wider">
+              TRADER YODHA X AI
+            </h1>
+
+            <p className="text-slate-500 text-sm">
+              OTC 1-Min Multi-Factor Analysis Engine
+            </p>
           </div>
-          <div className="flex items-center gap-3">
-            <div className="text-right mr-4">
-              <div className="text-xs text-slate-500">Intelligence Nodes</div>
+
+          <div className="flex items-center gap-4">
+            <div className="text-right">
+              <div className="text-xs text-slate-500">
+                Historical Setups
+              </div>
+
               <div className="text-sm font-mono text-emerald-400">
-                {brainStats.patterns} Patterns | Win Rate: {brainStats.winRate.toFixed(1)}%
+                {brainStats.patterns} |{' '}
+                {brainStats.winRate.toFixed(
+                  1
+                )}
+                %
               </div>
             </div>
+
             {!isStreamActive ? (
-              <button onClick={connectStream} className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg transition-all shadow-md shadow-emerald-600/20">
-                Connect Quotex Screen
+              <button
+                onClick={
+                  connectStream
+                }
+                className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg"
+              >
+                Connect Chart Screen
               </button>
             ) : (
-              <button onClick={disconnectStream} className="px-5 py-2.5 bg-red-600 hover:bg-red-500 text-white font-bold rounded-lg transition-all">
+              <button
+                onClick={
+                  disconnectStream
+                }
+                className="px-5 py-2.5 bg-red-600 hover:bg-red-500 text-white font-bold rounded-lg"
+              >
                 Disconnect
               </button>
             )}
@@ -790,146 +2655,519 @@ export default function TraderYodhaXEngine() {
 
       <main className="max-w-7xl mx-auto px-6 py-6">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+          {/* =================================================
+              LEFT PANEL
+              ================================================= */}
+
           <div className="space-y-4">
-            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800 shadow-md">
+
+            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
               <button
-                onClick={triggerAnalysis}
-                disabled={!isStreamActive || isScanning}
-                className={`w-full py-4 rounded-xl font-bold text-lg transition-all ${
-                  !isStreamActive || isScanning
-                    ? 'bg-slate-700 text-slate-500 cursor-not-allowed'
-                    : 'bg-cyan-600 hover:bg-cyan-500 text-white shadow-lg shadow-cyan-600/30'
+                onClick={
+                  triggerAnalysis
+                }
+                disabled={
+                  !isStreamActive ||
+                  isScanning
+                }
+                className={`w-full py-4 rounded-xl font-bold text-lg ${
+                  !isStreamActive ||
+                  isScanning
+                    ? 'bg-slate-700 text-slate-500'
+                    : 'bg-cyan-600 hover:bg-cyan-500 text-white'
                 }`}
               >
-                {isScanning ? (
-                  <span className="flex items-center justify-center gap-2">
-                    <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                    Scanning OTC Candle...
-                  </span>
-                ) : (
-                  'INSTANT OTC SCAN'
-                )}
+                {isScanning
+                  ? 'SCANNING...'
+                  : 'INSTANT OTC SCAN'}
               </button>
-              <div className="mt-4 flex items-center justify-between text-sm">
-                <span className="text-slate-500">Next Candle Entry In:</span>
-                <span className="font-mono text-xl text-amber-400">{timeUntilCandle}s</span>
+
+              <div className="mt-4 flex justify-between">
+                <span className="text-sm text-slate-500">
+                  Next candle
+                </span>
+
+                <span className="font-mono text-xl text-amber-400">
+                  {timeUntilCandle}s
+                </span>
               </div>
             </div>
 
+            {/* Brain stats */}
+
             <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
-              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">OCR Telemetry</h3>
-              <div className="text-xs space-y-2 font-mono">
-                <div className="flex justify-between">
-                  <span className="text-slate-500">OCR Level:</span>
-                  <span className={`font-bold ${isRealRoundNumber ? 'text-emerald-400' : 'text-cyan-400'}`}>{ocrPriceText}</span>
+              <h3 className="text-xs font-bold text-slate-400 uppercase mb-4">
+                AI Brain Statistics
+              </h3>
+
+              <div className="grid grid-cols-2 gap-3 text-xs font-mono">
+                <div>
+                  <span className="text-slate-500">
+                    Setups
+                  </span>
+
+                  <div className="text-cyan-400 text-lg">
+                    {brainStats.patterns}
+                  </div>
+                </div>
+
+                <div>
+                  <span className="text-slate-500">
+                    Trades
+                  </span>
+
+                  <div className="text-cyan-400 text-lg">
+                    {brainStats.trades}
+                  </div>
+                </div>
+
+                <div>
+                  <span className="text-slate-500">
+                    S/R
+                  </span>
+
+                  <div className="text-purple-400 text-lg">
+                    {brainStats.sr}
+                  </div>
+                </div>
+
+                <div>
+                  <span className="text-slate-500">
+                    ZigZag
+                  </span>
+
+                  <div className="text-purple-400 text-lg">
+                    {brainStats.zigzag}
+                  </div>
+                </div>
+
+                <div className="col-span-2">
+                  <span className="text-slate-500">
+                    Historical Win Rate
+                  </span>
+
+                  <div className="text-emerald-400 text-2xl font-bold">
+                    {brainStats.winRate.toFixed(
+                      1
+                    )}
+                    %
+                  </div>
                 </div>
               </div>
             </div>
 
+            {/* OCR */}
+
+            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
+              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3">
+                OCR Telemetry
+              </h3>
+
+              <div className="font-mono text-sm">
+                <span className="text-slate-500">
+                  Price:
+                </span>{' '}
+                <span className="text-cyan-400">
+                  {ocrPriceText}
+                </span>
+              </div>
+            </div>
+
+            {/* Analysis */}
+
             {currentAnalysis && (
-              <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800 animate-fadeIn">
-                <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono font-bold">OTC Live Pattern</h3>
-                <div className="text-xs text-slate-300 space-y-2 font-mono">
-                  <p className="break-all"><span className="text-slate-500">Logic:</span> {currentAnalysis.pattern}</p>
+              <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
+                <h3 className="text-xs font-bold text-slate-400 uppercase mb-4">
+                  Multi-Factor Analysis
+                </h3>
+
+                <div className="space-y-2 text-xs font-mono">
+
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">
+                      Signal
+                    </span>
+
+                    <span
+                      className={
+                        currentAnalysis.signal ===
+                        'CALL'
+                          ? 'text-emerald-400 font-bold'
+                          : currentAnalysis.signal ===
+                            'PUT'
+                          ? 'text-red-400 font-bold'
+                          : 'text-slate-400 font-bold'
+                      }
+                    >
+                      {
+                        currentAnalysis.signal
+                      }
+                    </span>
+                  </div>
+
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">
+                      Score
+                    </span>
+
+                    <span className="text-cyan-400">
+                      {
+                        currentAnalysis.score
+                      }
+                      /100
+                    </span>
+                  </div>
+
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">
+                      Confidence
+                    </span>
+
+                    <span className="text-amber-400">
+                      {currentAnalysis.confidence.toFixed(
+                        1
+                      )}
+                      %
+                    </span>
+                  </div>
+
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">
+                      Quality
+                    </span>
+
+                    <span className="text-purple-400">
+                      {
+                        currentAnalysis.quality
+                      }
+                    </span>
+                  </div>
+
+                  <div>
+                    <span className="text-slate-500">
+                      Trend:
+                    </span>{' '}
+                    {
+                      currentAnalysis.trend
+                    }
+                  </div>
+
+                  <div>
+                    <span className="text-slate-500">
+                      Structure:
+                    </span>{' '}
+                    {
+                      currentAnalysis.structure
+                    }
+                  </div>
+
+                  <div>
+                    <span className="text-slate-500">
+                      Candle:
+                    </span>{' '}
+                    {
+                      currentAnalysis.candlePattern
+                    }
+                  </div>
+
+                  <div>
+                    <span className="text-slate-500">
+                      Price Action:
+                    </span>{' '}
+                    {
+                      currentAnalysis.priceAction
+                    }
+                  </div>
+
+                  <div className="pt-2">
+                    <span className="text-slate-500">
+                      Confirmations:
+                    </span>
+
+                    <div className="mt-2 space-y-1">
+                      {currentAnalysis.reasons.map(
+                        (reason, index) => (
+                          <div
+                            key={index}
+                            className="text-slate-300"
+                          >
+                            ✓ {reason}
+                          </div>
+                        )
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
             )}
+
+            <button
+              onClick={clearBrain}
+              className="w-full py-2 bg-slate-800 hover:bg-slate-700 text-slate-400 rounded-lg text-xs"
+            >
+              Reset AI Memory
+            </button>
           </div>
 
+          {/* =================================================
+              RIGHT PANEL
+              ================================================= */}
+
           <div className="lg:col-span-2 space-y-4">
+
             <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
+
               <div className="flex items-center justify-between mb-3">
+
                 <div className="flex items-center gap-2">
-                  <div className={`w-2 h-2 rounded-full ${isStreamActive ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'}`} />
-                  <span className="text-xs font-bold text-slate-400">QUOTEX CHART STREAM</span>
+                  <div
+                    className={`w-2 h-2 rounded-full ${
+                      isStreamActive
+                        ? 'bg-emerald-400 animate-pulse'
+                        : 'bg-slate-600'
+                    }`}
+                  />
+
+                  <span className="text-xs font-bold text-slate-400">
+                    LIVE CHART SCREEN
+                  </span>
                 </div>
+
                 {isStreamActive && (
                   <button
-                    onClick={() => setIsRoiLocked(!isRoiLocked)}
-                    className={`px-3 py-1 rounded text-xs font-bold transition-all ${
-                      isRoiLocked ? 'bg-red-900/60 text-red-400 border border-red-500/40' : 'bg-cyan-900/60 text-cyan-400 border border-cyan-500/40'
-                    }`}
+                    onClick={() =>
+                      setIsRoiLocked(
+                        value => !value
+                      )
+                    }
+                    className="px-3 py-1 rounded text-xs font-bold bg-slate-800"
                   >
-                    {isRoiLocked ? '🔒 ROI Box Locked' : '🔓 Drag/Resize Box Active'}
+                    {isRoiLocked
+                      ? '🔒 ROI Locked'
+                      : '🔓 Move ROI'}
                   </button>
                 )}
               </div>
-              
-              <div ref={videoContainerRef} className="bg-[#020617] rounded-lg aspect-video flex items-center justify-center overflow-hidden border border-slate-900 relative select-none">
+
+              <div
+                ref={
+                  videoContainerRef
+                }
+                className="bg-[#020617] rounded-lg aspect-video flex items-center justify-center overflow-hidden border border-slate-900 relative select-none"
+              >
+
                 {isStreamActive ? (
                   <>
-                    <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-contain pointer-events-none" />
-                    <canvas ref={overlayCanvasRef} className="absolute inset-0 pointer-events-none w-full h-full" />
-                    
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className="w-full h-full object-contain pointer-events-none"
+                    />
+
                     <div
-                      onMouseDown={handleMouseDown}
+                      onMouseDown={
+                        handleMouseDown
+                      }
                       style={{
                         left: `${roiBox.x}px`,
                         top: `${roiBox.y}px`,
                         width: `${roiBox.width}px`,
-                        height: `${roiBox.height}px`
+                        height: `${roiBox.height}px`,
                       }}
                       className={`absolute border-2 ${
-                        isRoiLocked ? 'border-amber-400 bg-amber-500/10' : 'border-cyan-400 bg-cyan-500/10 cursor-move'
-                      } flex flex-col justify-between p-1 z-20 shadow-[0_0_15px_rgba(6,182,212,0.3)]`}
+                        isRoiLocked
+                          ? 'border-amber-400 bg-amber-500/10'
+                          : 'border-cyan-400 bg-cyan-500/10 cursor-move'
+                      } z-20`}
                     >
-                      <div className="flex justify-between items-center text-[10px] font-mono text-cyan-300 font-bold bg-slate-950/80 px-1 py-0.5 rounded pointer-events-none">
-                        <span>AI OCR TARGET</span>
-                        <span>{roiBox.width}x{roiBox.height}</span>
+                      <div className="text-[10px] bg-slate-950/80 text-cyan-300 font-mono px-1">
+                        AI OCR / CHART ROI
                       </div>
-                      
+
                       {!isRoiLocked && (
                         <div
-                          onMouseDown={handleResizeDown}
-                          className="w-3.5 h-3.5 bg-cyan-400 absolute bottom-0 right-0 cursor-se-resize rounded-tl shadow-md"
+                          onMouseDown={
+                            handleResizeDown
+                          }
+                          className="w-4 h-4 bg-cyan-400 absolute bottom-0 right-0 cursor-se-resize"
                         />
                       )}
                     </div>
                   </>
                 ) : (
-                  <div className="text-center space-y-2">
-                    <p className="text-slate-500 font-medium">Connect chart screen to start TRADER YODHA X AI.</p>
+                  <div className="text-center text-slate-500">
+                    Connect chart screen to start.
                   </div>
                 )}
               </div>
-              <canvas ref={canvasRef} className="hidden" />
-              <canvas ref={ocrCanvasRef} className="hidden" />
-              
+
+              <canvas
+                ref={canvasRef}
+                className="hidden"
+              />
+
+              <canvas
+                ref={ocrCanvasRef}
+                className="hidden"
+              />
+
               <div className="mt-3 px-4 py-2 bg-[#020617] rounded-lg border-l-4 border-cyan-500">
-                <p className="text-xs text-slate-400"><strong className="text-cyan-400">Status:</strong> {statusMessage}</p>
+                <p className="text-xs text-slate-400">
+                  <strong className="text-cyan-400">
+                    Status:
+                  </strong>{' '}
+                  {statusMessage}
+                </p>
               </div>
             </div>
 
+            {/* =================================================
+                SIGNAL
+                ================================================= */}
+
             <div className="bg-[#0f172a] rounded-xl p-6 border border-slate-800">
+
               <div className="flex items-center justify-between mb-4">
-                <span className="px-3 py-1 bg-purple-900/50 text-purple-300 text-xs font-bold rounded tracking-wide">TRADER YODHA X SIGNAL EXECUTOR</span>
-                <span className="text-xs text-slate-500 font-mono">1-Min Candle Transition</span>
+                <span className="px-3 py-1 bg-purple-900/50 text-purple-300 text-xs font-bold rounded">
+                  SIGNAL EXECUTOR
+                </span>
+
+                <span className="text-xs text-slate-500 font-mono">
+                  1-MIN CANDLE
+                </span>
               </div>
+
               <div className="text-center py-8">
-                <div className={`inline-block px-14 py-6 rounded-2xl text-6xl font-black tracking-widest border-4 transition-all duration-300 ${
-                  aiSignal === 'CALL'
-                    ? 'bg-emerald-500/10 border-emerald-400 text-emerald-400 shadow-[0_0_30px_rgba(52,211,153,0.2)]'
-                    : aiSignal === 'PUT'
-                    ? 'bg-red-500/10 border-red-400 text-red-400 shadow-[0_0_30px_rgba(248,113,113,0.2)]'
-                    : 'bg-slate-800 border-slate-700 text-slate-600'
-                }`}>
+
+                <div
+                  className={`inline-block px-14 py-6 rounded-2xl text-6xl font-black tracking-widest border-4 ${signalClass}`}
+                >
                   {aiSignal}
                 </div>
+
+                {currentAnalysis && (
+                  <div className="mt-5 text-sm font-mono">
+                    <span className="text-slate-500">
+                      Score:
+                    </span>{' '}
+                    <span className="text-cyan-400">
+                      {
+                        currentAnalysis.score
+                      }
+                      /100
+                    </span>
+
+                    {' • '}
+
+                    <span className="text-slate-500">
+                      Confidence:
+                    </span>{' '}
+
+                    <span className="text-amber-400">
+                      {currentAnalysis.confidence.toFixed(
+                        1
+                      )}
+                      %
+                    </span>
+                  </div>
+                )}
               </div>
+
               {aiSignal !== 'WAIT' && (
                 <div className="mt-4 pt-4 border-t border-slate-800">
-                  <p className="text-xs text-slate-400 text-center mb-3">Log outcome to train TRADER YODHA X AI:</p>
+
+                  <p className="text-xs text-slate-400 text-center mb-3">
+                    Record actual outcome for AI learning:
+                  </p>
+
                   <div className="grid grid-cols-2 gap-3">
-                    <button onClick={() => logTradeOutcome('WIN')} className="py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg transition-all tracking-wide">
+
+                    <button
+                      onClick={() =>
+                        logTradeOutcome(
+                          'WIN'
+                        )
+                      }
+                      className="py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg"
+                    >
                       WIN
                     </button>
-                    <button onClick={() => logTradeOutcome('LOSS')} className="py-3 bg-red-600 hover:bg-red-500 text-white font-bold rounded-lg transition-all tracking-wide">
+
+                    <button
+                      onClick={() =>
+                        logTradeOutcome(
+                          'LOSS'
+                        )
+                      }
+                      className="py-3 bg-red-600 hover:bg-red-500 text-white font-bold rounded-lg"
+                    >
                       LOSS
                     </button>
+
                   </div>
                 </div>
               )}
             </div>
+
+            {/* =================================================
+                EDUCATION / ENGINE STATUS
+                ================================================= */}
+
+            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
+
+              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3">
+                Active Analysis Modules
+              </h3>
+
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-2 text-xs font-mono">
+
+                <div className="px-3 py-2 bg-slate-900 rounded">
+                  ✓ Candlestick
+                </div>
+
+                <div className="px-3 py-2 bg-slate-900 rounded">
+                  ✓ Market Structure
+                </div>
+
+                <div className="px-3 py-2 bg-slate-900 rounded">
+                  ✓ Support / Resistance
+                </div>
+
+                <div className="px-3 py-2 bg-slate-900 rounded">
+                  ✓ Price Action
+                </div>
+
+                <div className="px-3 py-2 bg-slate-900 rounded">
+                  ✓ Noise Filter
+                </div>
+
+                <div className="px-3 py-2 bg-slate-900 rounded">
+                  ✓ Historical Journal
+                </div>
+
+                <div className="px-3 py-2 bg-slate-900 rounded">
+                  ✓ OCR
+                </div>
+
+                <div className="px-3 py-2 bg-slate-900 rounded">
+                  ✓ Time Statistics
+                </div>
+
+                <div className="px-3 py-2 bg-slate-900 rounded">
+                  ✓ ZigZag
+                </div>
+
+              </div>
+
+              <p className="mt-4 text-[11px] text-slate-600">
+                This engine provides statistical/technical
+                analysis only. No trading result is guaranteed.
+              </p>
+            </div>
+
           </div>
         </div>
       </main>
