@@ -1,10 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { createWorker } from 'tesseract.js';
 
-// Brain Memory Types - TRADER YODHA X HUMAN BRAIN AI
+// Brain Memory Types - TRADER YODHA X AI Systems
 interface PatternMemory {
   id: string;
-  patternSequence: string; // e.g. "G-G-R"
   pattern: string;
   sequenceLength: number;
   priceLevel: number;
@@ -18,7 +17,6 @@ interface PatternMemory {
   timeKey24H: string;
   minuteMarker: number;
   confidence: number;
-  marketState: 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGEBOUND' | 'VOLATILE';
 }
 
 interface MagicNumber {
@@ -61,7 +59,6 @@ interface BrainState {
 
 interface LiveAnalysis {
   pattern: string;
-  sequenceStr: string;
   sequence: string[];
   dominantColor: 'GREEN' | 'RED' | 'NEUTRAL';
   strength: number;
@@ -76,7 +73,6 @@ interface LiveAnalysis {
   timestampSecond: number;
   currentMinute: number;
   timeSyncData: TimeAlgorithm | null;
-  marketState: 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGEBOUND' | 'VOLATILE';
 }
 
 interface CropRegion {
@@ -95,7 +91,7 @@ export default function TraderYodhaXEngine() {
   const [isStreamActive, setIsStreamActive] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const [aiSignal, setAiSignal] = useState<'WAIT' | 'CALL' | 'PUT'>('WAIT');
-  const [statusMessage, setStatusMessage] = useState("Trader Yodha X Brain OTC Engine Ready.");
+  const [statusMessage, setStatusMessage] = useState("Trader Yodha X OTC Engine Ready. Connect Quotex Screen.");
   const [brainStats, setBrainStats] = useState({ patterns: 0, magicNumbers: 0, timeSyncs: 0, zigzag: 0, winRate: 0 });
   const [currentAnalysis, setCurrentAnalysis] = useState<LiveAnalysis | null>(null);
   const [timeUntilCandle, setTimeUntilCandle] = useState(60);
@@ -128,12 +124,12 @@ export default function TraderYodhaXEngine() {
     lastUpdated: Date.now()
   });
   
-  const pendingSignalRef = useRef<{ signal: 'CALL' | 'PUT' | 'WAIT'; analysis: LiveAnalysis } | null>(null);
+  const pendingSignalRef = useRef<{ signal: 'CALL' | 'PUT'; analysis: LiveAnalysis } | null>(null);
   const continuousLearningRef = useRef<NodeJS.Timeout | null>(null);
   const lastPriceRef = useRef<number>(0);
   const lastColorRef = useRef<'GREEN' | 'RED' | 'NEUTRAL'>('NEUTRAL');
   const priceHistoryRef = useRef<{price: number, time: number}[]>([]);
-  const recentCandleSequenceRef = useRef<('GREEN' | 'RED' | 'NEUTRAL')[]>([]);
+  const recentCandleColorsRef = useRef<('GREEN' | 'RED' | 'NEUTRAL')[]>([]);
 
   useEffect(() => {
     if (isStreamActive && stream && videoRef.current) {
@@ -210,7 +206,7 @@ export default function TraderYodhaXEngine() {
           if (!parsed.timeAlgorithms) parsed.timeAlgorithms = [];
           brainRef.current = parsed;
           updateBrainStats();
-          setStatusMessage(`Trader Yodha X Human Brain Active: ${parsed.patterns.length} dynamic patterns loaded.`);
+          setStatusMessage(`Trader Yodha X Brain Active: ${parsed.patterns.length} patterns loaded.`);
         }
       };
     } catch (err) {
@@ -303,28 +299,61 @@ export default function TraderYodhaXEngine() {
     }
   }, [drawZigZagOverlays]);
 
-  // Human Brain Logic: Detect Overall Market Context & State
-  const analyzeMarketState = (): 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGEBOUND' | 'VOLATILE' => {
-    const history = priceHistoryRef.current;
-    if (history.length < 15) return 'RANGEBOUND';
+  const detectMagicNumber = useCallback((currentPrice: number, currentColor: 'GREEN' | 'RED' | 'NEUTRAL', lastPrice: number, lastColor: 'GREEN' | 'RED' | 'NEUTRAL') => {
+    if (lastColor === currentColor || currentColor === 'NEUTRAL' || lastColor === 'NEUTRAL') return;
 
-    const prices = history.map(h => h.price);
-    const firstHalf = prices.slice(0, Math.floor(prices.length / 2));
-    const secondHalf = prices.slice(Math.floor(prices.length / 2));
+    const isRound = checkIsRoundNumber(currentPrice);
+    const priceRange = getPriceRange(currentPrice);
+    const direction = lastColor === 'GREEN' ? 'GREEN_TO_RED' : 'RED_TO_GREEN';
 
-    const avgFirst = firstHalf.reduce((a, b) => a + b, 0) / firstHalf.length;
-    const avgSecond = secondHalf.reduce((a, b) => a + b, 0) / secondHalf.length;
-    const diff = avgSecond - avgFirst;
+    const existing = brainRef.current.magicNumbers.find(
+      mn => Math.abs(mn.priceLevel - currentPrice) < 0.0003 && mn.priceRange === priceRange
+    );
 
-    // Check volatility
-    const maxP = Math.max(...prices);
-    const minP = Math.min(...prices);
-    if ((maxP - minP) > 0.0015) return 'VOLATILE';
+    if (existing) {
+      existing.occurrences++;
+      existing.lastSeen = Date.now();
+      existing.isRoundNumber = isRound;
+    } else {
+      brainRef.current.magicNumbers.push({
+        priceLevel: currentPrice,
+        isRoundNumber: isRound,
+        priceRange,
+        direction,
+        occurrences: 1,
+        successRate: 0.5,
+        lastSeen: Date.now()
+      });
+    }
+  }, []);
 
-    if (diff > 0.00025) return 'TRENDING_UP';
-    if (diff < -0.00025) return 'TRENDING_DOWN';
-    return 'RANGEBOUND';
-  };
+  const trackTimeAlgorithm = useCallback((currentMinute: number, currentSecond: number, color: 'GREEN' | 'RED' | 'NEUTRAL') => {
+    const brain = brainRef.current;
+    const now = new Date();
+    const timeKey24H = `${String(now.getHours()).padStart(2, '0')}:${String(currentMinute).padStart(2, '0')}:${String(currentSecond).padStart(2, '0')}`;
+    
+    let timeAlgo = brain.timeAlgorithms.find(ta => ta.timeKey24H === timeKey24H);
+    const direction = color === 'GREEN' ? 'UP' : color === 'RED' ? 'DOWN' : 'NEUTRAL';
+
+    if (!timeAlgo) {
+      timeAlgo = {
+        timeKey24H,
+        minuteMarker: currentMinute,
+        secondMarker: currentSecond,
+        direction,
+        frequency: 1,
+        successRate: 0.5,
+        lastOccurrences: [Date.now()]
+      };
+      brain.timeAlgorithms.push(timeAlgo);
+    } else {
+      timeAlgo.frequency++;
+      if (timeAlgo.direction !== direction && direction !== 'NEUTRAL') {
+        timeAlgo.direction = direction;
+      }
+    }
+    if (currentSecond % 15 === 0) saveBrainToDB();
+  }, [saveBrainToDB]);
 
   const getScaledROI = useCallback(() => {
     if (!videoRef.current || !videoContainerRef.current) return roiBox;
@@ -380,6 +409,7 @@ export default function TraderYodhaXEngine() {
   const analyzePixelDistribution = (frameData: Uint8ClampedArray, width: number, height: number) => {
     let greenPixels = 0;
     let redPixels = 0;
+    const candleRegions: { x: number; color: 'GREEN' | 'RED' }[] = [];
     
     let globalYMin = height; 
     let globalYMax = 0;   
@@ -411,6 +441,11 @@ export default function TraderYodhaXEngine() {
       }
 
       if (chunkGreen > 100 || chunkRed > 100) {
+        candleRegions.push({
+          x: chunk,
+          color: chunkGreen > chunkRed ? 'GREEN' : 'RED'
+        });
+        
         if (chunk === 19 || chunk === 18) { 
           bodyTopCoord = globalYMin + 15;
           bodyBottomCoord = globalYMax - 15;
@@ -428,11 +463,89 @@ export default function TraderYodhaXEngine() {
     return { 
       greenPixels, 
       redPixels, 
+      candleRegions,
       actualBodySize,
       actualTopWickSize,
       actualBottomWickSize
     };
   };
+
+  // ==================== NEW ADVANCED STRATEGY ENGINES ====================
+
+  // 1. Hidden SNR / Gap / Wick Retest Engine
+  const checkHiddenSNRAndWickRetest = (currentPrice: number, topWick: number, bottomWick: number, bodySize: number) => {
+    const zigzag = brainRef.current.zigzagLevels.find(zl => Math.abs(zl.price - currentPrice) < 0.00025);
+    const magicNum = brainRef.current.magicNumbers.find(mn => Math.abs(mn.priceLevel - currentPrice) < 0.00025);
+
+    if (zigzag || magicNum) {
+      if (topWick > bodySize * 1.5) {
+        return { signal: 'PUT' as const, reason: 'HIDDEN SNR WICK REJECTION (RESISTANCE)' };
+      } else if (bottomWick > bodySize * 1.5) {
+        return { signal: 'CALL' as const, reason: 'HIDDEN SNR WICK REJECTION (SUPPORT)' };
+      }
+    }
+    return null;
+  };
+
+  // 2. 7-Candle OTC Cycle & Box Breakout Engine
+  const checkSevenCandleBreakout = (recentColors: ('GREEN' | 'RED' | 'NEUTRAL')[]) => {
+    if (recentColors.length < 7) return null;
+    const last7 = recentColors.slice(-7);
+    const greenCount = last7.filter(c => c === 'GREEN').length;
+    const redCount = last7.filter(c => c === 'RED').length;
+
+    // Consolidation Box Check (Balanced 7 Candles)
+    if (Math.abs(greenCount - redCount) <= 2) {
+      const seventhCandle = last7[6];
+      if (seventhCandle === 'GREEN') {
+        return { signal: 'CALL' as const, reason: '7-CANDLE CYCLE OTC BREAKOUT (BUY)' };
+      } else if (seventhCandle === 'RED') {
+        return { signal: 'PUT' as const, reason: '7-CANDLE CYCLE OTC BREAKOUT (SELL)' };
+      }
+    }
+    return null;
+  };
+
+  // 3. 2 Red + 1 Green Pullback & Alternating Pattern Engine
+  const checkTwoRedOneGreenPattern = (recentColors: ('GREEN' | 'RED' | 'NEUTRAL')[]) => {
+    if (recentColors.length < 3) return null;
+    const len = recentColors.length;
+    const c1 = recentColors[len - 3];
+    const c2 = recentColors[len - 2];
+    const c3 = recentColors[len - 1];
+
+    // 2 Red + 1 Green Pullback Strategy
+    if (c1 === 'RED' && c2 === 'RED' && c3 === 'GREEN') {
+      return { signal: 'PUT' as const, reason: '2 RED + 1 GREEN PULLBACK CONTINUATION' };
+    }
+
+    // Alternating R-G-R-G Pattern Strategy
+    if (len >= 4) {
+      const c0 = recentColors[len - 4];
+      if (c0 === 'RED' && c1 === 'GREEN' && c2 === 'RED' && c3 === 'GREEN') {
+        return { signal: 'PUT' as const, reason: 'ALTERNATING R-G-R-G PATTERN REVERSAL' };
+      } else if (c0 === 'GREEN' && c1 === 'RED' && c2 === 'GREEN' && c3 === 'RED') {
+        return { signal: 'CALL' as const, reason: 'ALTERNATING G-R-G-R PATTERN REVERSAL' };
+      }
+    }
+    return null;
+  };
+
+  // 4. OTC Trap Detection Algorithm
+  const detectOTCTrap = (topWick: number, bottomWick: number, bodySize: number, matchedZigZag: ZigZagLevel | null) => {
+    // Detect Fake Breakout / Wick Trap
+    if (matchedZigZag && matchedZigZag.occurrences >= 3) {
+      if (matchedZigZag.type === 'HIGH' && topWick > bodySize * 2.0) {
+        return { signal: 'PUT' as const, reason: 'OTC FAKE BREAKOUT TRAP DETECTED' };
+      }
+      if (matchedZigZag.type === 'LOW' && bottomWick > bodySize * 2.0) {
+        return { signal: 'CALL' as const, reason: 'OTC SUPPORT REJECTION TRAP DETECTED' };
+      }
+    }
+    return null;
+  };
+
+  // ========================================================================
 
   const startContinuousLearning = useCallback((mediaStream: MediaStream) => {
     const learnInterval = setInterval(async () => {
@@ -462,14 +575,23 @@ export default function TraderYodhaXEngine() {
       
       if (currentPrice > 0) {
         processZigZagLogic(currentPrice);
+        detectMagicNumber(currentPrice, currentColor, lastPriceRef.current, lastColorRef.current);
         lastPriceRef.current = currentPrice;
       }
 
+      // Track recent candle color sequence
+      if (currentColor !== 'NEUTRAL' && lastColorRef.current !== currentColor) {
+        recentCandleColorsRef.current.push(currentColor);
+        if (recentCandleColorsRef.current.length > 10) recentCandleColorsRef.current.shift();
+      }
+
+      const now = new Date();
+      trackTimeAlgorithm(now.getMinutes(), now.getSeconds(), currentColor);
       lastColorRef.current = currentColor;
     }, 500);
 
     continuousLearningRef.current = learnInterval;
-  }, [getScaledROI, processZigZagLogic]);
+  }, [getScaledROI, processZigZagLogic, detectMagicNumber, trackTimeAlgorithm]);
 
   const connectStream = async () => {
     try {
@@ -479,7 +601,7 @@ export default function TraderYodhaXEngine() {
       });
       setStream(mediaStream);
       setIsStreamActive(true);
-      setStatusMessage("Connected! Trader Yodha X OTC Engine Live.");
+      setStatusMessage("Connected! Trader Yodha X OTC Engine live...");
       startContinuousLearning(mediaStream);
     } catch (err) {
       console.error(err);
@@ -497,14 +619,11 @@ export default function TraderYodhaXEngine() {
     setStatusMessage("Engine paused.");
   };
 
-  // 46-SECOND DEEP SCAN ENGINE & HUMAN BRAIN REASONING
-  const execute46SecDeepScan = async () => {
+  // Instant OTC Fast Engine (Includes All Strategy Modules)
+  const executeFastScan = async () => {
     if (!canvasRef.current || !videoRef.current) return;
     const ctx = canvasRef.current.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
-
-    setIsScanning(true);
-    setStatusMessage("🧠 Human Brain 46s Deep Analysis Active... Reading OTC Micro Structure...");
 
     const vWidth = videoRef.current.videoWidth || 800;
     const vHeight = videoRef.current.videoHeight || 400;
@@ -526,21 +645,6 @@ export default function TraderYodhaXEngine() {
     const isRound = checkIsRoundNumber(currentPrice);
     const priceRange = getPriceRange(currentPrice);
 
-    // 1. Context Analysis
-    const marketState = analyzeMarketState();
-
-    // 2. Sequential Candle Memory Update
-    const dominantColor: 'GREEN' | 'RED' | 'NEUTRAL' = 
-      analysisRes.greenPixels > analysisRes.redPixels * 1.05 ? 'GREEN' : analysisRes.redPixels > analysisRes.greenPixels * 1.05 ? 'RED' : 'NEUTRAL';
-
-    const recentSeq = recentCandleSequenceRef.current;
-    if (recentSeq.length === 0 || recentSeq[recentSeq.length - 1] !== dominantColor) {
-      recentSeq.push(dominantColor);
-      if (recentSeq.length > 4) recentSeq.shift();
-    }
-    const sequenceStr = recentSeq.map(c => c === 'GREEN' ? 'G' : c === 'RED' ? 'R' : 'N').join('-');
-
-    // 3. Level Matching
     const matchedZigZag = brainRef.current.zigzagLevels.reduce((closest, current) => {
       const currentDiff = Math.abs(current.price - currentPrice);
       const closestDiff = closest ? Math.abs(closest.price - currentPrice) : Infinity;
@@ -557,64 +661,75 @@ export default function TraderYodhaXEngine() {
     const timeKey24H = `${String(now.getHours()).padStart(2, '0')}:${String(currentMinute).padStart(2, '0')}:${String(currentSecond).padStart(2, '0')}`;
     const timeSyncData = brainRef.current.timeAlgorithms.find(ta => ta.timeKey24H === timeKey24H);
 
-    // 4. Human Decision Matrix
-    let proposedSignal: 'CALL' | 'PUT' | 'WAIT' = dominantColor === 'GREEN' ? 'CALL' : 'PUT';
-    let confidenceScore = 75; // Base confidence %
-    let patternString = `Seq: [${sequenceStr}] | State: ${marketState}`;
+    const dominantColor: 'GREEN' | 'RED' | 'NEUTRAL' = 
+      analysisRes.greenPixels > analysisRes.redPixels * 1.05 ? 'GREEN' : analysisRes.redPixels > analysisRes.greenPixels * 1.05 ? 'RED' : 'NEUTRAL';
 
-    // Volatility Filter - Human Brain Discipline
-    if (marketState === 'VOLATILE') {
-      proposedSignal = 'WAIT';
-      confidenceScore = 40;
-      patternString += ` | HIGH VOLATILITY - SKIPPING`;
+    let proposedSignal: 'CALL' | 'PUT' = dominantColor === 'GREEN' ? 'CALL' : 'PUT';
+    let confidence = 0.85;
+    let patternString = `Dominant: ${dominantColor}`;
+
+    // --- APPLY ADVANCED STRATEGIES IN ORDER ---
+    
+    // 1. OTC Trap Detection
+    const otcTrap = detectOTCTrap(analysisRes.actualTopWickSize, analysisRes.actualBottomWickSize, analysisRes.actualBodySize, matchedZigZag);
+    if (otcTrap) {
+      proposedSignal = otcTrap.signal;
+      patternString += ` | ${otcTrap.reason}`;
     }
+    // 2. Hidden SNR / Wick Retest
+    else {
+      const hiddenSNR = checkHiddenSNRAndWickRetest(currentPrice, analysisRes.actualTopWickSize, analysisRes.actualBottomWickSize, analysisRes.actualBodySize);
+      if (hiddenSNR) {
+        proposedSignal = hiddenSNR.signal;
+        patternString += ` | ${hiddenSNR.reason}`;
+      }
+      // 3. 2 Red + 1 Green / Alternating Pattern
+      else {
+        const pullBack = checkTwoRedOneGreenPattern(recentCandleColorsRef.current);
+        if (pullBack) {
+          proposedSignal = pullBack.signal;
+          patternString += ` | ${pullBack.reason}`;
+        }
+        // 4. 7-Candle Cycle
+        else {
+          const sevenCandle = checkSevenCandleBreakout(recentCandleColorsRef.current);
+          if (sevenCandle) {
+            proposedSignal = sevenCandle.signal;
+            patternString += ` | ${sevenCandle.reason}`;
+          }
+          // 5. Default Wick Exhaustion / ZigZag
+          else {
+            if (analysisRes.actualTopWickSize > analysisRes.actualBodySize * 1.8) {
+              proposedSignal = 'PUT';
+              patternString += ` | TOP WICK EXHAUSTION`;
+            } else if (analysisRes.actualBottomWickSize > analysisRes.actualBodySize * 1.8) {
+              proposedSignal = 'CALL';
+              patternString += ` | BOTTOM WICK EXHAUSTION`;
+            }
 
-    // Wick Exhaustion Logic
-    if (analysisRes.actualTopWickSize > analysisRes.actualBodySize * 1.8) {
-      proposedSignal = 'PUT';
-      confidenceScore += 15;
-      patternString += ` | REVERSAL: TOP WICK EXHAUSTION`;
-    } else if (analysisRes.actualBottomWickSize > analysisRes.actualBodySize * 1.8) {
-      proposedSignal = 'CALL';
-      confidenceScore += 15;
-      patternString += ` | REVERSAL: BOTTOM WICK EXHAUSTION`;
-    }
-
-    // Support / Resistance Rejection
-    if (matchedZigZag) {
-      if (matchedZigZag.type === 'HIGH' && proposedSignal === 'CALL') {
-        proposedSignal = 'PUT';
-        confidenceScore += 10;
-        patternString += ` | ZIGZAG RESISTANCE`;
-      } else if (matchedZigZag.type === 'LOW' && proposedSignal === 'PUT') {
-        proposedSignal = 'CALL';
-        confidenceScore += 10;
-        patternString += ` | ZIGZAG SUPPORT`;
+            if (matchedZigZag) {
+              if (matchedZigZag.type === 'HIGH' && proposedSignal === 'CALL') {
+                proposedSignal = 'PUT';
+                patternString += ` | ZIGZAG RESISTANCE`;
+              } else if (matchedZigZag.type === 'LOW' && proposedSignal === 'PUT') {
+                proposedSignal = 'CALL';
+                patternString += ` | ZIGZAG SUPPORT`;
+              }
+            }
+          }
+        }
       }
     }
 
     if (isRound) {
-      confidenceScore += 10;
       patternString += ` | SNR ROUND LEVEL`;
-    }
-
-    // Self-Correction Memory Filter (Check past win-rate for this sequence)
-    const pastMatchingPatterns = brainRef.current.patterns.filter(p => p.patternSequence === sequenceStr);
-    if (pastMatchingPatterns.length >= 3) {
-      const pastWins = pastMatchingPatterns.filter(p => p.result === 'WIN').length;
-      const historicWinRate = (pastWins / pastMatchingPatterns.length) * 100;
-      if (historicWinRate < 60) {
-        proposedSignal = 'WAIT';
-        patternString += ` | BLOCKED BY BRAIN (Historic Winrate <60%)`;
-      }
     }
 
     const liveData: LiveAnalysis = {
       pattern: patternString,
-      sequenceStr,
       sequence: [dominantColor === 'GREEN' ? 'G' : 'R'],
       dominantColor,
-      strength: confidenceScore,
+      strength: confidence,
       priceLevel: currentPrice,
       isRoundNumber: isRound,
       bodySize: analysisRes.actualBodySize,
@@ -625,17 +740,29 @@ export default function TraderYodhaXEngine() {
       timeKey24H,
       timestampSecond: currentSecond,
       currentMinute,
-      timeSyncData: timeSyncData || null,
-      marketState
+      timeSyncData: timeSyncData || null
     };
 
     setCurrentAnalysis(liveData);
     pendingSignalRef.current = { signal: proposedSignal, analysis: liveData };
     setIsScanning(false);
-    setStatusMessage(`🎯 Deep Analysis Complete! Signal Prepared (${proposedSignal}) - Lock Entry: 00:00`);
+    setStatusMessage(`Signal Prepared for Next 1-Min Candle! Lock time: 00:00`);
   };
 
-  // Candle Synchronization Loop: Triggers at :46, Locks Entry at :00
+  const triggerAnalysis = () => {
+    if (!isStreamActive || !videoRef.current) {
+      setStatusMessage("Error: Connect screen first!");
+      return;
+    }
+    setIsScanning(true);
+    setStatusMessage("Trader Yodha X Fast Scan: Analyzing OTC Candle Setup...");
+    setAiSignal('WAIT');
+    setTimeout(() => {
+      executeFastScan();
+    }, 1500);
+  };
+
+  // Candle Sync Loop for 00:00 Exact Second Lock
   useEffect(() => {
     const candleSync = setInterval(() => {
       const now = new Date();
@@ -644,15 +771,15 @@ export default function TraderYodhaXEngine() {
       const timeUntilNext = 60 - seconds - (milliseconds / 1000);
       setTimeUntilCandle(Math.ceil(timeUntilNext));
 
-      // Auto trigger 46-second deep scan
-      if (isStreamActive && seconds === 46 && !isScanning && !pendingSignalRef.current) {
-        execute46SecDeepScan();
+      // Auto trigger fast scan at :52 seconds
+      if (isStreamActive && seconds === 52 && !isScanning && !pendingSignalRef.current) {
+        executeFastScan();
       }
 
-      // Execute Prepared Signal exactly at :58 to :00 entry window
+      // Execute Signal exactly at :00 entry
       if (pendingSignalRef.current && (seconds === 0 || seconds === 59) && milliseconds < 400) {
-        setAiSignal(pendingSignalRef.current.signal as 'CALL' | 'PUT' | 'WAIT');
-        setStatusMessage(`🚀 SIGNAL ACTIVE [${pendingSignalRef.current.signal}] | Entry: 00:00`);
+        setAiSignal(pendingSignalRef.current.signal);
+        setStatusMessage(`🚀 SIGNAL ACTIVE (${pendingSignalRef.current.signal}) | Entry: 00:00`);
         pendingSignalRef.current = null;
       }
     }, 100);
@@ -668,7 +795,6 @@ export default function TraderYodhaXEngine() {
 
     brain.patterns.push({
       id: patternId,
-      patternSequence: currentAnalysis.sequenceStr,
       pattern: currentAnalysis.pattern,
       sequenceLength: currentAnalysis.sequence.length,
       priceLevel: currentAnalysis.priceLevel,
@@ -681,8 +807,7 @@ export default function TraderYodhaXEngine() {
       timeSync: currentAnalysis.timestampSecond,
       timeKey24H: currentAnalysis.timeKey24H,
       minuteMarker: currentAnalysis.currentMinute,
-      confidence: currentAnalysis.strength,
-      marketState: currentAnalysis.marketState
+      confidence: currentAnalysis.strength
     });
 
     brain.totalTrades++;
@@ -690,9 +815,26 @@ export default function TraderYodhaXEngine() {
     brain.winRate = brain.patterns.length > 0 ? (wins / brain.patterns.length) * 100 : 0;
 
     saveBrainToDB();
-    setStatusMessage(`Outcome logged [${result}]. Human Brain Win Rate: ${brain.winRate.toFixed(1)}%`);
+    setStatusMessage(`Outcome logged [${result}]. System Win Rate: ${brain.winRate.toFixed(1)}%`);
     setAiSignal('WAIT');
     setCurrentAnalysis(null);
+  };
+
+  const clearBrain = async () => {
+    const password = prompt('Enter Master Password:');
+    if (password === 'YODDHAX_REBORN') {
+      brainRef.current = {
+        patterns: [],
+        magicNumbers: [],
+        timeAlgorithms: [],
+        zigzagLevels: [],
+        totalTrades: 0,
+        winRate: 0,
+        lastUpdated: Date.now()
+      };
+      await saveBrainToDB();
+      setStatusMessage("Trader Yodha X Memory Reset.");
+    }
   };
 
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -716,8 +858,8 @@ export default function TraderYodhaXEngine() {
       const bounds = videoContainerRef.current.getBoundingClientRect();
 
       if (isDragging) {
-        const newX = Math.max(0, Math.min(bounds.width - roiBox.width, e.clientX - dragStart.x));
-        const newY = Math.max(0, Math.min(bounds.height - roiBox.height, e.clientY - dragStart.y));
+        const newX = Math.max(0, Math.min(bounds.width - roiBox.width, e.clientX - bounds.left - dragStart.x));
+        const newY = Math.max(0, Math.min(bounds.height - roiBox.height, e.clientY - bounds.top - dragStart.y));
         setRoiBox(prev => ({ ...prev, x: newX, y: newY }));
       } else if (isResizing) {
         const deltaX = e.clientX - dragStart.x;
@@ -742,14 +884,14 @@ export default function TraderYodhaXEngine() {
       <header className="border-b border-slate-800 px-6 py-4">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-cyan-400 tracking-wider">TRADER YODHA X AI (HUMAN BRAIN OTC)</h1>
-            <p className="text-slate-500 text-sm">46s Deep Analysis & Adaptive Pattern Engine</p>
+            <h1 className="text-2xl font-bold text-cyan-400 tracking-wider">TRADER YODHA X AI (OTC FAST ENGINE)</h1>
+            <p className="text-slate-500 text-sm">Candle-to-Candle Direct Signal Generator</p>
           </div>
           <div className="flex items-center gap-3">
             <div className="text-right mr-4">
-              <div className="text-xs text-slate-500">Brain Memory Nodes</div>
+              <div className="text-xs text-slate-500">Intelligence Nodes</div>
               <div className="text-sm font-mono text-emerald-400">
-                {brainStats.patterns} Dynamic Patterns | Win Rate: {brainStats.winRate.toFixed(1)}%
+                {brainStats.patterns} Patterns | Win Rate: {brainStats.winRate.toFixed(1)}%
               </div>
             </div>
             {!isStreamActive ? (
@@ -770,7 +912,7 @@ export default function TraderYodhaXEngine() {
           <div className="space-y-4">
             <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800 shadow-md">
               <button
-                onClick={execute46SecDeepScan}
+                onClick={triggerAnalysis}
                 disabled={!isStreamActive || isScanning}
                 className={`w-full py-4 rounded-xl font-bold text-lg transition-all ${
                   !isStreamActive || isScanning
@@ -781,10 +923,10 @@ export default function TraderYodhaXEngine() {
                 {isScanning ? (
                   <span className="flex items-center justify-center gap-2">
                     <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                    46s Deep Scan Running...
+                    Scanning OTC Candle...
                   </span>
                 ) : (
-                  'TRIGGER 46s DEEP ANALYSIS'
+                  'INSTANT OTC SCAN'
                 )}
               </button>
               <div className="mt-4 flex items-center justify-between text-sm">
@@ -794,10 +936,10 @@ export default function TraderYodhaXEngine() {
             </div>
 
             <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
-              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">Vision & OCR Telemetry</h3>
+              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">OCR Telemetry</h3>
               <div className="text-xs space-y-2 font-mono">
                 <div className="flex justify-between">
-                  <span className="text-slate-500">OCR SNR Level:</span>
+                  <span className="text-slate-500">OCR Level:</span>
                   <span className={`font-bold ${isRealRoundNumber ? 'text-emerald-400' : 'text-cyan-400'}`}>{ocrPriceText}</span>
                 </div>
               </div>
@@ -805,11 +947,9 @@ export default function TraderYodhaXEngine() {
 
             {currentAnalysis && (
               <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800 animate-fadeIn">
-                <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono font-bold">Human Brain Context</h3>
+                <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono font-bold">OTC Live Pattern</h3>
                 <div className="text-xs text-slate-300 space-y-2 font-mono">
-                  <p><span className="text-slate-500">Market State:</span> <strong className="text-amber-400">{currentAnalysis.marketState}</strong></p>
-                  <p><span className="text-slate-500">Confidence Score:</span> <strong className="text-emerald-400">{currentAnalysis.strength}%</strong></p>
-                  <p className="break-all"><span className="text-slate-500">Reasoning:</span> {currentAnalysis.pattern}</p>
+                  <p className="break-all"><span className="text-slate-500">Logic:</span> {currentAnalysis.pattern}</p>
                 </div>
               </div>
             )}
@@ -897,7 +1037,7 @@ export default function TraderYodhaXEngine() {
               </div>
               {aiSignal !== 'WAIT' && (
                 <div className="mt-4 pt-4 border-t border-slate-800">
-                  <p className="text-xs text-slate-400 text-center mb-3">Log outcome to train TRADER YODHA X Human Brain:</p>
+                  <p className="text-xs text-slate-400 text-center mb-3">Log outcome to train TRADER YODHA X AI:</p>
                   <div className="grid grid-cols-2 gap-3">
                     <button onClick={() => logTradeOutcome('WIN')} className="py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg transition-all tracking-wide">
                       WIN
