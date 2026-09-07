@@ -241,7 +241,7 @@ export default function TraderYodhaXEngine() {
     return priceStr.endsWith('000') || priceStr.endsWith('500') || priceStr.endsWith('0000') || priceStr.endsWith('5000');
   };
 
-  // Render Overlay with ZigZag & Candle Sequence Numbers (1, 2, 3...)
+  // Render Overlay with ZigZag & Candle Sequence Numbers
   const drawChartOverlays = useCallback((detectedCandles: CandleDetail[] = []) => {
     if (!overlayCanvasRef.current || !videoRef.current) return;
     const canvas = overlayCanvasRef.current;
@@ -271,7 +271,7 @@ export default function TraderYodhaXEngine() {
       });
     }
 
-    // 2. Draw Candle Sequence Numbers (1, 2, 3, 4...)
+    // 2. Draw Candle Sequence Numbers
     if (detectedCandles.length > 0) {
       ctx.setLineDash([]);
       ctx.font = 'bold 18px monospace';
@@ -288,7 +288,7 @@ export default function TraderYodhaXEngine() {
         
         ctx.fillText(`${candle.index}`, candle.x, textY);
       });
-      ctx.shadowBlur = 0; // Reset Shadow
+      ctx.shadowBlur = 0;
     }
   }, []);
 
@@ -441,83 +441,107 @@ export default function TraderYodhaXEngine() {
     return lastPriceRef.current || 0;
   };
 
-  // Enhanced Pixel Analyzer with Multi-Candle Indexing & Coordinates Detection
+  // Precision Color-Clustering Analyzer
   const analyzePixelDistribution = (frameData: Uint8ClampedArray, width: number, height: number) => {
     let greenPixels = 0;
     let redPixels = 0;
     const candleRegions: CandleDetail[] = [];
-    
-    let globalYMin = height; 
-    let globalYMax = 0;   
-    let bodyTopCoord = height;
-    let bodyBottomCoord = 0;
 
-    const totalChunks = 15; // Divide screen into 15 horizontal slices
-    const chunkSize = Math.floor(width / totalChunks); 
-    let candleCount = 1;
+    // Filter out top 10% and bottom 15% UI text/time-axis
+    const minY = Math.floor(height * 0.10);
+    const maxY = Math.floor(height * 0.85);
 
-    for (let chunk = 0; chunk < totalChunks; chunk++) {
-      let chunkGreen = 0;
-      let chunkRed = 0;
-      let chunkYMin = height;
-      let chunkYMax = 0;
+    const columnStats: { green: number; red: number; topY: number; bottomY: number }[] = [];
 
-      for (let x = chunk * chunkSize; x < (chunk + 1) * chunkSize; x++) {
-        for (let y = 0; y < height; y++) {
-          const i = (y * width + x) * 4;
-          const r = frameData[i];
-          const g = frameData[i + 1];
-          const b = frameData[i + 2];
+    for (let x = 0; x < width; x++) {
+      let colGreen = 0;
+      let colRed = 0;
+      let topY = height;
+      let bottomY = 0;
 
-          const isGreen = g > r + 30 && g > b + 30;
-          const isRed = r > g + 30 && r > b + 30;
+      for (let y = minY; y < maxY; y++) {
+        const i = (y * width + x) * 4;
+        const r = frameData[i];
+        const g = frameData[i + 1];
+        const b = frameData[i + 2];
 
-          if (isGreen || isRed) {
-            if (y < globalYMin) globalYMin = y;
-            if (y > globalYMax) globalYMax = y;
-            if (y < chunkYMin) chunkYMin = y;
-            if (y > chunkYMax) chunkYMax = y;
+        // Strict Red & Green filter
+        const isGreen = g > 130 && g > r + 40 && g > b + 40;
+        const isRed = r > 130 && r > g + 40 && r > b + 40;
 
-            if (isGreen) chunkGreen++;
-            if (isRed) chunkRed++;
-          }
+        if (isGreen || isRed) {
+          if (y < topY) topY = y;
+          if (y > bottomY) bottomY = y;
+          if (isGreen) colGreen++;
+          if (isRed) colRed++;
         }
       }
 
-      if (chunkGreen > 80 || chunkRed > 80) {
-        const color = chunkGreen > chunkRed ? 'GREEN' : 'RED';
-        const centerX = Math.floor((chunk * chunkSize) + (chunkSize / 2));
-
-        candleRegions.push({
-          index: candleCount++,
-          color,
-          x: centerX,
-          topY: chunkYMin,
-          bottomY: chunkYMax,
-          bodySize: Math.max(1, chunkYMax - chunkYMin)
-        });
-        
-        if (chunk === totalChunks - 1 || chunk === totalChunks - 2) { 
-          bodyTopCoord = globalYMin + 15;
-          bodyBottomCoord = globalYMax - 15;
-        }
-      }
-
-      greenPixels += chunkGreen;
-      redPixels += chunkRed;
+      columnStats.push({ green: colGreen, red: colRed, topY, bottomY });
     }
 
-    const actualBodySize = Math.max(0, bodyBottomCoord - bodyTopCoord);
-    const actualTopWickSize = Math.max(0, bodyTopCoord - globalYMin);
-    const actualBottomWickSize = Math.max(0, globalYMax - bodyBottomCoord);
+    // Cluster continuous vertical columns into candles
+    let candleIndex = 1;
+    let inCandle = false;
+    let startX = 0;
+    let sumX = 0;
+    let totalGreen = 0;
+    let totalRed = 0;
+    let clusterTopY = height;
+    let clusterBottomY = 0;
 
-    return { 
-      greenPixels, 
-      redPixels, 
+    for (let x = 0; x < width; x++) {
+      const stat = columnStats[x];
+      const isCandleColumn = (stat.green + stat.red) > 8;
+
+      if (isCandleColumn) {
+        if (!inCandle) {
+          inCandle = true;
+          startX = x;
+          sumX = 0;
+          totalGreen = 0;
+          totalRed = 0;
+          clusterTopY = height;
+          clusterBottomY = 0;
+        }
+        sumX += x;
+        totalGreen += stat.green;
+        totalRed += stat.red;
+        if (stat.topY < clusterTopY) clusterTopY = stat.topY;
+        if (stat.bottomY > clusterBottomY) clusterBottomY = stat.bottomY;
+      } else {
+        if (inCandle) {
+          const clusterWidth = x - startX;
+          if (clusterWidth >= 3) {
+            const centerX = Math.floor(sumX / clusterWidth);
+            const color = totalGreen >= totalRed ? 'GREEN' : 'RED';
+            
+            candleRegions.push({
+              index: candleIndex++,
+              color,
+              x: centerX,
+              topY: clusterTopY,
+              bottomY: clusterBottomY,
+              bodySize: Math.max(1, clusterBottomY - clusterTopY)
+            });
+          }
+          inCandle = false;
+        }
+      }
+
+      greenPixels += stat.green;
+      redPixels += stat.red;
+    }
+
+    const lastCandle = candleRegions.length > 0 ? candleRegions[candleRegions.length - 1] : null;
+
+    return {
+      greenPixels,
+      redPixels,
       candleRegions,
-      actualBodySize,
-      actualTopWickSize,
-      actualBottomWickSize
+      actualBodySize: lastCandle ? lastCandle.bodySize : 0,
+      actualTopWickSize: 0,
+      actualBottomWickSize: 0
     };
   };
 
@@ -544,7 +568,6 @@ export default function TraderYodhaXEngine() {
         croppedImageData.data, Math.max(1, targetROI.width), Math.max(1, targetROI.height)
       );
       
-      // Update Candle Number Overlays on Chart Live
       drawChartOverlays(candleRegions);
 
       const currentColor = greenPixels > redPixels * 1.05 ? 'GREEN' : redPixels > greenPixels * 1.05 ? 'RED' : 'NEUTRAL';
@@ -590,7 +613,6 @@ export default function TraderYodhaXEngine() {
     setStatusMessage("Engine paused.");
   };
 
-  // 46-Second Deep OTC Engine Analysis Execution
   const execute46sFullAnalysis = async () => {
     setIsScanning(true);
     setStatusMessage("46s Deep OTC Analysis Completed. Generating Signal...");
@@ -616,7 +638,6 @@ export default function TraderYodhaXEngine() {
         croppedImageData.data, Math.max(1, targetROI.width), Math.max(1, targetROI.height)
       );
 
-      // Draw numbered overlays explicitly on scan execution
       drawChartOverlays(analysisRes.candleRegions);
 
       const currentPrice = await extractPriceLevelWithOCR(ctx);
@@ -648,16 +669,6 @@ export default function TraderYodhaXEngine() {
       let confidence = 0.92;
       let patternString = `Sequence: [${candleSequenceStr.join('-')}] | Dominant: ${dominantColor}`;
 
-      // Check Reversals
-      if (analysisRes.actualTopWickSize > analysisRes.actualBodySize * 1.5) {
-        proposedSignal = 'PUT';
-        patternString += ` | TOP WICK REVERSAL`;
-      } else if (analysisRes.actualBottomWickSize > analysisRes.actualBodySize * 1.5) {
-        proposedSignal = 'CALL';
-        patternString += ` | BOTTOM WICK REVERSAL`;
-      }
-
-      // Check ZigZag Levels Reversals
       if (matchedZigZag) {
         if (matchedZigZag.type === 'HIGH') {
           proposedSignal = 'PUT';
@@ -709,7 +720,6 @@ export default function TraderYodhaXEngine() {
     execute46sFullAnalysis();
   };
 
-  // Candle Sync Loop for 46s Analysis & Exact 00:00 Entry Lock
   useEffect(() => {
     const candleSync = setInterval(() => {
       const now = new Date();
