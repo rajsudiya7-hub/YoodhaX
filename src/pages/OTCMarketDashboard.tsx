@@ -1,1156 +1,2085 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { screenCaptureController, type ScreenCaptureStatus, type ViewportAnalysis } from "@/lib/screen-capture-controller";
-import { voiceController } from "@/lib/voice-controller";
-import { memoryBuffer } from "@/lib/memory-buffer";
-import { generateDecisionEngineSignal, recordPatternFailure, getLastFailureAnalysis, type TradeSignal } from "@/lib/decision-engine";
-import { candleTimerService, type CandleTimerState } from "@/lib/candle-timer";
-import { executionTimer, type ExecutionState } from "@/lib/execution-timer";
-import { patternLearning } from "@/lib/pattern-learning";
-import { sequenceMemory } from "@/lib/sequence-memory";
-import { ScreenVisionEngine, type VisionAnalysis } from "@/lib/vision-ai-engine";
-import { parseVoiceIntent, buildSignalMessage, buildAnalysisStartMessage, buildTimerMessage, buildWinMessage, buildLossMessage, type Lang } from "@/lib/language-engine";
-import { OTC_ASSETS } from "@/lib/trading-assets";
-import {
-  Activity, Monitor, ChevronDown, Brain, Zap, Mic, MicOff,
-  Volume2, VolumeX, Database, TrendingUp, TrendingDown,
-  Clock, Radio, Shield, BookOpen, ChevronRight,
-  Search, Target, AlertCircle, Eye, Layers, Loader2
-} from "lucide-react";
+import { createWorker } from "tesseract.js";
 
-type SignalType = "CALL" | "PUT" | "WAIT";
+/* =========================================================
+   TRADER YODHA X AI — OTC MARKET DASHBOARD
+   Candle Vision + Sequence Memory + Pattern Discovery
+   ========================================================= */
 
-function candleKey(timeframe: 1 | 5, now = Date.now()): number {
-  return Math.floor(now / (timeframe * 60 * 1000));
+type CandleColor = "GREEN" | "RED" | "NEUTRAL";
+type Signal = "WAIT" | "CALL" | "PUT";
+type TradeResult = "WIN" | "LOSS";
+type CandleSize = "TINY" | "SMALL" | "MEDIUM" | "LARGE" | "HUGE";
+type WickSize = "NONE" | "SMALL" | "MEDIUM" | "LARGE";
+type CandleShape =
+  | "BULL_STRONG"
+  | "BEAR_STRONG"
+  | "BULL_REJECTION"
+  | "BEAR_REJECTION"
+  | "DOJI"
+  | "SMALL_BULL"
+  | "SMALL_BEAR"
+  | "INDECISION";
+
+interface DetectedCandle {
+  id: number;
+  x: number;
+  width: number;
+  top: number;
+  bottom: number;
+  bodyTop: number;
+  bodyBottom: number;
+  highY: number;
+  lowY: number;
+  color: CandleColor;
+  bodySize: number;
+  topWick: number;
+  bottomWick: number;
+  bodyRatio: number;
+  upperWickRatio: number;
+  lowerWickRatio: number;
+  bodyClass: CandleSize;
+  topWickClass: WickSize;
+  bottomWickClass: WickSize;
+  shape: CandleShape;
+  timestamp: number;
 }
 
-function isEntryWindow(timeframe: 1 | 5, now = Date.now()): boolean {
-  const elapsed = now % (timeframe * 60 * 1000);
-  return elapsed < 5_000;
+interface CandlePatternMemory {
+  id: string;
+  sequenceKey: string;
+  sequenceLength: number;
+  nextGreen: number;
+  nextRed: number;
+  nextNeutral: number;
+  wins: number;
+  losses: number;
+  occurrences: number;
+  confidence: number;
+  lastSeen: number;
+  description: string;
 }
 
-export default function OTCMarketPage() {
-  const [selectedAsset, setSelectedAsset] = useState(OTC_ASSETS[0]);
-  const [selectedTimeframe, setSelectedTimeframe] = useState<1 | 5>(1);
-  const [isDropdownOpen, setIsDropdownOpen] = useState(false);
-  const [captureStatus, setCaptureStatus] = useState<ScreenCaptureStatus | null>(null);
-  const [viewportAnalysis, setViewportAnalysis] = useState<ViewportAnalysis | null>(null);
-  const [signal, setSignal] = useState<TradeSignal | null>(null);
-  const [isVoiceMonitorOn, setIsVoiceMonitorOn] = useState(false);
-  const [isMuted, setIsMuted] = useState(false);
-  const [voiceLog, setVoiceLog] = useState<{ text: string; dir: "in" | "out"; ts: number; lang?: Lang }[]>([]);
-  const [memoryCount, setMemoryCount] = useState(0);
-  const [winRate, setWinRate] = useState(0);
-  const [timerState, setTimerState] = useState<CandleTimerState | null>(null);
-  const [execState, setExecState] = useState<ExecutionState | null>(null);
-  const [activeLang, setActiveLang] = useState<Lang>("en");
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [failureNote, setFailureNote] = useState<string | null>(null);
-  const [learnedSequences, setLearnedSequences] = useState(sequenceMemory.getLearnedSequences());
-  const [viewportSignal, setViewportSignal] = useState<{ dir: "UP" | "DOWN" | null; accuracy: number }>({ dir: null, accuracy: 0 });
-  const [visionAnalysis, setVisionAnalysis] = useState<VisionAnalysis | null>(null);
-  const [visionReady, setVisionReady] = useState(false);
-  const [isDeepScanning, setIsDeepScanning] = useState(false);
-  const [deepScanMessage, setDeepScanMessage] = useState("Automatic OTC scan arms at 46s.");
+interface PatternMemory {
+  id: string;
+  pattern: string;
+  sequenceLength: number;
+  priceLevel: number;
+  priceRange: string;
+  bodySize: number;
+  topWickSize: number;
+  bottomWickSize: number;
+  result: TradeResult;
+  timestamp: number;
+  timeSync?: number;
+  timeKey24H: string;
+  minuteMarker: number;
+  confidence: number;
+  candleSequence?: string[];
+}
 
-  // Stable refs
-  const observationStart = useRef<number>(Date.now());
-  const analysisInterval = useRef<ReturnType<typeof setInterval> | null>(null);
-  const viewportInterval = useRef<ReturnType<typeof setInterval> | null>(null);
-  const prevSignalRef = useRef<string>("WAIT");
-  const assetRef = useRef(selectedAsset);
-  const tfRef = useRef(selectedTimeframe);
-  const mutedRef = useRef(isMuted);
-  const langRef = useRef<Lang>("en");
-  const isAnalyzingRef = useRef(false);
-  const timerUnsubRef = useRef<(() => void) | null>(null);
-  const execUnsubRef = useRef<(() => void) | null>(null);
-  const timerAlertedRef = useRef(false);
-  const timerSecondsRef = useRef<number>(60);
-  const lastCandlesRef = useRef<Array<{ type: "GREEN" | "RED" | "DOJI" }>>([]);
-  const visionEngineRef = useRef<ScreenVisionEngine | null>(null);
-  const visionAnalysisRef = useRef<VisionAnalysis | null>(null);
-  const visionInterval = useRef<ReturnType<typeof setInterval> | null>(null);
-  const visionBusyRef = useRef(false);
-  const deepScanFnRef = useRef<((manual: boolean) => Promise<void>) | null>(null);
-  const releasePendingRef = useRef<(() => void) | null>(null);
-  const pendingSignalRef = useRef<TradeSignal | null>(null);
-  const pendingCandleRef = useRef<number | null>(null);
-  const lastDeepScanCandleRef = useRef<number | null>(null);
-  const screenCanvasRef = useRef<HTMLCanvasElement | null>(null);
+interface MagicNumber {
+  priceLevel: number;
+  isRoundNumber: boolean;
+  priceRange: string;
+  direction: "GREEN_TO_RED" | "RED_TO_GREEN";
+  occurrences: number;
+  successRate: number;
+  lastSeen: number;
+}
 
-  assetRef.current = selectedAsset;
-  tfRef.current = selectedTimeframe;
-  mutedRef.current = isMuted;
-  langRef.current = activeLang;
-  isAnalyzingRef.current = isAnalyzing;
-  visionAnalysisRef.current = visionAnalysis;
+interface TimeAlgorithm {
+  timeKey24H: string;
+  minuteMarker: number;
+  secondMarker: number;
+  direction: "UP" | "DOWN" | "NEUTRAL";
+  frequency: number;
+  successRate: number;
+  lastOccurrences: number[];
+}
 
-  const addVoiceLog = useCallback((text: string, dir: "in" | "out", lang?: Lang) => {
-    setVoiceLog(prev => [...prev.slice(-39), { text, dir, ts: Date.now(), lang }]);
-  }, []);
+interface ZigZagLevel {
+  price: number;
+  type: "HIGH" | "LOW";
+  occurrences: number;
+  timestamp: number;
+  screenY?: number;
+}
 
-  const speak = useCallback((msg: string) => {
-    if (mutedRef.current) return;
-    voiceController.speak(msg, true);
-    addVoiceLog(msg, "out", langRef.current);
-  }, [addVoiceLog]);
+interface BrainState {
+  patterns: PatternMemory[];
+  candlePatterns: CandlePatternMemory[];
+  magicNumbers: MagicNumber[];
+  timeAlgorithms: TimeAlgorithm[];
+  zigzagLevels: ZigZagLevel[];
+  totalTrades: number;
+  winRate: number;
+  lastUpdated: number;
+}
 
-  // ─── Viewport loop (every 2s) ────────────────────────────────────────────
-  const startViewportLoop = useCallback(() => {
-    if (viewportInterval.current) clearInterval(viewportInterval.current);
-    viewportInterval.current = setInterval(() => {
-      const vp = screenCaptureController.getViewportAnalysis();
-      if (vp) {
-        setViewportAnalysis(vp);
-        if (vp.direction !== "NEUTRAL" && vp.accuracy >= 75) {
-          setViewportSignal({ dir: vp.direction, accuracy: vp.accuracy });
-        }
-      }
-    }, 2000);
-  }, []);
+interface LiveAnalysis {
+  pattern: string;
+  sequence: string[];
+  detectedCandles: DetectedCandle[];
+  dominantColor: CandleColor;
+  strength: number;
+  priceLevel: number;
+  isRoundNumber: boolean;
+  bodySize: number;
+  topWick: number;
+  bottomWick: number;
+  detectedMagicNumbers: MagicNumber[];
+  matchedZigZag: ZigZagLevel | null;
+  matchedCandlePattern: CandlePatternMemory | null;
+  timeKey24H: string;
+  timestampSecond: number;
+  currentMinute: number;
+  timeSyncData: TimeAlgorithm | null;
+  reasons: string[];
+  callScore: number;
+  putScore: number;
+}
 
-  const stopViewportLoop = useCallback(() => {
-    if (viewportInterval.current) { clearInterval(viewportInterval.current); viewportInterval.current = null; }
-    setViewportAnalysis(null);
-    setViewportSignal({ dir: null, accuracy: 0 });
-  }, []);
+interface CropRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
 
-  // ─── Screen vision loop (every 1.5s) ─────────────────────────────────────
-  const startVisionLoop = useCallback(() => {
-    if (visionInterval.current) clearInterval(visionInterval.current);
+interface PixelAnalysis {
+  greenPixels: number;
+  redPixels: number;
+  candles: DetectedCandle[];
+  actualBodySize: number;
+  actualTopWickSize: number;
+  actualBottomWickSize: number;
+}
 
-    const scan = async () => {
-      if (!isAnalyzingRef.current || visionBusyRef.current) return;
-      const frame = screenCaptureController.getLatestFrame();
-      const engine = visionEngineRef.current;
-      if (!frame || !engine) return;
+const DB_NAME = "TraderYodhaX_AI_Database";
+const DB_VERSION = 2;
+const STORE_NAME = "trader_yodha_x_brain_store";
 
-      visionBusyRef.current = true;
+const MAX_CANDLE_HISTORY = 120;
+const PATTERN_SEQUENCE_LENGTH = 5;
+
+/* =========================================================
+   MAIN ENGINE
+   ========================================================= */
+
+export default function OTCMarketDashboard() {
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [isStreamActive, setIsStreamActive] = useState(false);
+  const [isScanning, setIsScanning] = useState(false);
+  const [aiSignal, setAiSignal] = useState<Signal>("WAIT");
+  const [statusMessage, setStatusMessage] = useState(
+    "Trader Yodha X OTC Engine Ready. Connect Quotex Screen."
+  );
+
+  const [brainStats, setBrainStats] = useState({
+    patterns: 0,
+    candlePatterns: 0,
+    candles: 0,
+    magicNumbers: 0,
+    timeSyncs: 0,
+    zigzag: 0,
+    winRate: 0,
+  });
+
+  const [currentAnalysis, setCurrentAnalysis] = useState<LiveAnalysis | null>(null);
+  const [timeUntilCandle, setTimeUntilCandle] = useState(60);
+  const [ocrPriceText, setOcrPriceText] = useState<string>("Searching...");
+  const [isRealRoundNumber, setIsRealRoundNumber] = useState<boolean>(false);
+  const [detectedCandles, setDetectedCandles] = useState<DetectedCandle[]>([]);
+
+  const [roiBox, setRoiBox] = useState<CropRegion>({
+    x: 100,
+    y: 50,
+    width: 500,
+    height: 350,
+  });
+
+  const [isRoiLocked, setIsRoiLocked] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isResizing, setIsResizing] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
+  const ocrCanvasRef = useRef<HTMLCanvasElement>(null);
+  const videoContainerRef = useRef<HTMLDivElement>(null);
+  const ocrWorkerRef = useRef<any>(null);
+
+  /* =======================================================
+     BRAIN
+     ======================================================= */
+
+  const brainRef = useRef<BrainState>({
+    patterns: [],
+    candlePatterns: [],
+    magicNumbers: [],
+    timeAlgorithms: [],
+    zigzagLevels: [],
+    totalTrades: 0,
+    winRate: 0,
+    lastUpdated: Date.now(),
+  });
+
+  const candleHistoryRef = useRef<DetectedCandle[]>([]);
+  const nextCandleIdRef = useRef(1);
+  const pendingSignalRef = useRef<{ signal: "CALL" | "PUT"; analysis: LiveAnalysis } | null>(null);
+  const continuousLearningRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastPriceRef = useRef<number>(0);
+  const lastColorRef = useRef<CandleColor>("NEUTRAL");
+  const priceHistoryRef = useRef<{ price: number; time: number }[]>([]);
+  const hasScannedThisCandle = useRef(false);
+  const processingFrameRef = useRef(false);
+  const lastCandleSignatureRef = useRef("");
+  const lastScanMinuteRef = useRef(-1);
+
+  /* =======================================================
+     VIDEO
+     ======================================================= */
+
+  useEffect(() => {
+    if (isStreamActive && stream && videoRef.current) {
+      videoRef.current.srcObject = stream;
+    }
+  }, [isStreamActive, stream]);
+
+  /* =======================================================
+     OCR
+     ======================================================= */
+
+  useEffect(() => {
+    const initOCR = async () => {
       try {
-        const result = await engine.analyzeFrame(frame);
-        if (result) setVisionAnalysis(result);
-      } finally {
-        visionBusyRef.current = false;
+        const worker = await createWorker("eng");
+        ocrWorkerRef.current = worker;
+        setStatusMessage("Trader Yodha X Vision Engine Initialized.");
+      } catch (err) {
+        console.error("OCR Init Error:", err);
       }
     };
 
-    void scan();
-    visionInterval.current = setInterval(() => void scan(), 1500);
+    initOCR();
+
+    return () => {
+      if (ocrWorkerRef.current) {
+        ocrWorkerRef.current.terminate();
+        ocrWorkerRef.current = null;
+      }
+    };
   }, []);
 
-  const stopVisionLoop = useCallback(() => {
-    if (visionInterval.current) {
-      clearInterval(visionInterval.current);
-      visionInterval.current = null;
+  /* =======================================================
+     BRAIN STATS
+     ======================================================= */
+
+  const updateBrainStats = useCallback(() => {
+    const brain = brainRef.current;
+    setBrainStats({
+      patterns: brain.patterns.length,
+      candlePatterns: brain.candlePatterns.length,
+      candles: candleHistoryRef.current.length,
+      magicNumbers: brain.magicNumbers.length,
+      timeSyncs: brain.timeAlgorithms.length,
+      zigzag: brain.zigzagLevels.length,
+      winRate: brain.winRate,
+    });
+  }, []);
+
+  /* =======================================================
+     INDEXED DB
+     ======================================================= */
+
+  const initIndexedDB = useCallback((): Promise<IDBDatabase> => {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+      request.onupgradeneeded = (event) => {
+        const db = (event.target as IDBOpenDBRequest).result;
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          db.createObjectStore(STORE_NAME);
+        }
+      };
+
+      request.onsuccess = (event) => {
+        resolve((event.target as IDBOpenDBRequest).result);
+      };
+
+      request.onerror = (event) => {
+        reject((event.target as IDBOpenDBRequest).error);
+      };
+    });
+  }, []);
+
+  const saveBrainToDB = useCallback(async () => {
+    try {
+      const db = await initIndexedDB();
+      const transaction = db.transaction(STORE_NAME, "readwrite");
+      const store = transaction.objectStore(STORE_NAME);
+      brainRef.current.lastUpdated = Date.now();
+      store.put(brainRef.current, "trader_yodha_x_brain_state");
+      updateBrainStats();
+    } catch (err) {
+      console.error("IndexedDB Save Failure:", err);
     }
-    visionBusyRef.current = false;
-    setVisionAnalysis(null);
-  }, []);
+  }, [initIndexedDB, updateBrainStats]);
 
-  // Draw the captured chart plus candle IDs, ZigZag legs, and structure labels.
+  const loadBrainFromDB = useCallback(async () => {
+    try {
+      const db = await initIndexedDB();
+      const transaction = db.transaction(STORE_NAME, "readonly");
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.get("trader_yodha_x_brain_state");
+
+      request.onsuccess = () => {
+        if (!request.result) return;
+        const parsed = request.result as BrainState;
+        if (!parsed.patterns) parsed.patterns = [];
+        if (!parsed.candlePatterns) parsed.candlePatterns = [];
+        if (!parsed.magicNumbers) parsed.magicNumbers = [];
+        if (!parsed.timeAlgorithms) parsed.timeAlgorithms = [];
+        if (!parsed.zigzagLevels) parsed.zigzagLevels = [];
+        brainRef.current = parsed;
+        updateBrainStats();
+        setStatusMessage(
+          `Trader Yodha X Brain Active: ${parsed.patterns.length} trade memories + ${parsed.candlePatterns.length} candle patterns loaded.`
+        );
+      };
+    } catch (err) {
+      console.error("IndexedDB Load Failure:", err);
+    }
+  }, [initIndexedDB, updateBrainStats]);
+
   useEffect(() => {
-    const canvas = screenCanvasRef.current;
-    const frame = screenCaptureController.getLatestFrame();
-    if (!canvas || !frame) return;
+    loadBrainFromDB();
+  }, [loadBrainFromDB]);
 
-    canvas.width = frame.width;
-    canvas.height = frame.height;
-    const context = canvas.getContext("2d");
-    if (!context) return;
-    context.putImageData(frame, 0, 0);
+  /* =======================================================
+     PRICE HELPERS
+     ======================================================= */
 
-    if (!visionAnalysis) return;
-    context.lineWidth = Math.max(1, frame.width / 900);
-    context.font = `${Math.max(10, frame.width / 110)}px monospace`;
+  const getPriceRange = (price: number): string => {
+    const base = Math.floor(price * 1000);
+    return `${(base / 1000).toFixed(3)}-${((base + 1) / 1000).toFixed(3)}`;
+  };
 
-    visionAnalysis.candles.forEach(candle => {
-      context.strokeStyle = candle.color === "GREEN" ? "#4ade80" : "#f87171";
-      context.fillStyle = context.strokeStyle;
-      context.strokeRect(candle.x, candle.top, candle.width, Math.max(2, candle.bottom - candle.top));
-      context.fillText(`#${candle.id}`, candle.x, Math.max(12, candle.top - 4));
+  const checkIsRoundNumber = (price: number): boolean => {
+    if (!price || price <= 0) return false;
+    const priceStr = price.toFixed(5);
+    return (
+      priceStr.endsWith("000") ||
+      priceStr.endsWith("500") ||
+      priceStr.endsWith("0000") ||
+      priceStr.endsWith("5000")
+    );
+  };
+
+  /* =======================================================
+     CANDLE CLASSIFICATION
+     ======================================================= */
+
+  const classifyBodySize = (body: number, totalRange: number): CandleSize => {
+    if (totalRange <= 0) return "TINY";
+    const ratio = body / totalRange;
+    if (ratio < 0.1) return "TINY";
+    if (ratio < 0.25) return "SMALL";
+    if (ratio < 0.5) return "MEDIUM";
+    if (ratio < 0.75) return "LARGE";
+    return "HUGE";
+  };
+
+  const classifyWick = (wick: number, body: number): WickSize => {
+    if (wick <= 1) return "NONE";
+    if (body <= 1) {
+      return wick < 8 ? "SMALL" : wick < 20 ? "MEDIUM" : "LARGE";
+    }
+    const ratio = wick / body;
+    if (ratio < 0.35) return "SMALL";
+    if (ratio < 0.9) return "MEDIUM";
+    return "LARGE";
+  };
+
+  const classifyCandleShape = (
+    color: CandleColor,
+    body: number,
+    topWick: number,
+    bottomWick: number
+  ): CandleShape => {
+    if (color === "NEUTRAL") return "INDECISION";
+    const range = body + topWick + bottomWick;
+    if (range <= 0) return "INDECISION";
+    const bodyRatio = body / range;
+    const topRatio = topWick / Math.max(body, 1);
+    const bottomRatio = bottomWick / Math.max(body, 1);
+    if (bodyRatio < 0.12) return "DOJI";
+    if (bottomRatio >= 1.5 && bottomWick > topWick) {
+      return color === "GREEN" ? "BULL_REJECTION" : "BEAR_REJECTION";
+    }
+    if (topRatio >= 1.5 && topWick > bottomWick) {
+      return color === "GREEN" ? "BULL_REJECTION" : "BEAR_REJECTION";
+    }
+    if (bodyRatio >= 0.7) {
+      return color === "GREEN" ? "BULL_STRONG" : "BEAR_STRONG";
+    }
+    return color === "GREEN" ? "SMALL_BULL" : "SMALL_BEAR";
+  };
+
+  /* =======================================================
+     CANDLE DETECTION ENGINE
+     ======================================================= */
+
+  const detectCandlesFromPixels = (
+    frameData: Uint8ClampedArray,
+    width: number,
+    height: number
+  ): PixelAnalysis => {
+    if (width <= 0 || height <= 0) {
+      return {
+        greenPixels: 0,
+        redPixels: 0,
+        candles: [],
+        actualBodySize: 0,
+        actualTopWickSize: 0,
+        actualBottomWickSize: 0,
+      };
+    }
+
+    const greenX = new Uint32Array(width);
+    const redX = new Uint32Array(width);
+    let greenPixels = 0;
+    let redPixels = 0;
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = (y * width + x) * 4;
+        const r = frameData[i];
+        const g = frameData[i + 1];
+        const b = frameData[i + 2];
+        const green = g > r + 35 && g > b + 25 && g > 80;
+        const red = r > g + 35 && r > b + 25 && r > 80;
+        if (green) {
+          greenX[x]++;
+          greenPixels++;
+        }
+        if (red) {
+          redX[x]++;
+          redPixels++;
+        }
+      }
+    }
+
+    const activeColumns = new Array<boolean>(width).fill(false);
+    for (let x = 0; x < width; x++) {
+      if (greenX[x] + redX[x] >= 2) {
+        activeColumns[x] = true;
+      }
+    }
+
+    const groups: { start: number; end: number }[] = [];
+    let start = -1;
+    let gap = 0;
+
+    for (let x = 0; x < width; x++) {
+      if (activeColumns[x]) {
+        if (start === -1) start = x;
+        gap = 0;
+      } else if (start !== -1) {
+        gap++;
+        if (gap > 3) {
+          const end = x - gap;
+          if (end - start >= 2) {
+            groups.push({ start, end });
+          }
+          start = -1;
+          gap = 0;
+        }
+      }
+    }
+
+    if (start !== -1 && width - start >= 2) {
+      groups.push({ start, end: width - 1 });
+    }
+
+    const filteredGroups = groups.filter((group) => {
+      const w = group.end - group.start + 1;
+      return w >= 2 && w <= Math.max(40, Math.floor(width * 0.1));
     });
 
-    if (visionAnalysis.zigzag.length > 1) {
-      context.beginPath();
-      visionAnalysis.zigzag.forEach((point, index) => {
-        const candle = visionAnalysis.candles.find(item => item.id === point.candleId);
-        const x = (candle?.x ?? 0) + (candle?.width ?? 0) / 2;
-        if (index === 0) context.moveTo(x, point.y);
-        else context.lineTo(x, point.y);
-      });
-      context.strokeStyle = "#facc15";
-      context.lineWidth = Math.max(2, frame.width / 500);
-      context.stroke();
+    const candles: DetectedCandle[] = [];
 
-      visionAnalysis.zigzag.forEach(point => {
-        const candle = visionAnalysis.candles.find(item => item.id === point.candleId);
-        const x = (candle?.x ?? 0) + (candle?.width ?? 0) / 2;
-        context.fillStyle = "#facc15";
-        context.fillText(point.label, x + 4, point.y + (point.type === "HIGH" ? -6 : 14));
-      });
-    }
-  }, [captureStatus?.frameCount, visionAnalysis]);
+    for (const group of filteredGroups) {
+      const candleWidth = group.end - group.start + 1;
+      let top = height;
+      let bottom = 0;
+      let greenCount = 0;
+      let redCount = 0;
+      const rowOccupancy = new Uint16Array(height);
+      const rowGreen = new Uint16Array(height);
+      const rowRed = new Uint16Array(height);
 
-  // ─── Deep scan scheduler (automatic trigger near 46s) ────────────────────
-  const startSignalLoop = useCallback(() => {
-    if (analysisInterval.current) clearInterval(analysisInterval.current);
-    analysisInterval.current = setInterval(async () => {
-      if (!isAnalyzingRef.current) return;
-      if (executionTimer.isLocked) return;
-      if (timerSecondsRef.current <= 46 && timerSecondsRef.current >= 44) {
-        void deepScanFnRef.current?.(false);
-      }
-    }, 2000);
-  }, []);
-
-  const stopSignalLoop = useCallback(() => {
-    if (analysisInterval.current) { clearInterval(analysisInterval.current); analysisInterval.current = null; }
-  }, []);
-
-  const releasePendingSignal = useCallback(() => {
-    const pending = pendingSignalRef.current;
-    if (!pending || pending.signal === "WAIT" || executionTimer.isLocked) return;
-    if (!isEntryWindow(tfRef.current)) return;
-
-    pendingSignalRef.current = null;
-    pendingCandleRef.current = null;
-    setSignal(pending);
-    setDeepScanMessage(`Released ${pending.signal} in the 00–05s OTC entry window.`);
-
-    if (pending.currentSequence && pending.currentSequence !== "—") {
-      lastCandlesRef.current = pending.currentSequence.split("").reverse().map(c => ({
-        type: c === "G" ? "GREEN" as const : "RED" as const,
-      }));
-    }
-
-    if (pending.signal !== prevSignalRef.current && pending.confidence >= 45) {
-      const displayName = pending.isMemoryRecall
-        ? `Memory Recall [${pending.matchedSequence}]`
-        : pending.patternName;
-      speak(buildSignalMessage(pending.signal, pending.confidence, displayName, langRef.current));
-      prevSignalRef.current = pending.signal;
-      executionTimer.startSignal(pending.signal, tfRef.current, () => {
-        speak(langRef.current === "hi"
-          ? "कूलडाउन खत्म। अगला सिग्नल तैयार।"
-          : "Cooldown complete. Ready for the next OTC signal.");
-        prevSignalRef.current = "WAIT";
-      });
-    }
-  }, [speak]);
-
-  const runDeepScan = useCallback(async (manual: boolean) => {
-    if (!isAnalyzingRef.current) {
-      setDeepScanMessage("Start live screen sharing before running a deep scan.");
-      return;
-    }
-    if (executionTimer.isLocked) {
-      setDeepScanMessage("Deep scan paused during the active trade/cooldown lock.");
-      return;
-    }
-
-    const key = candleKey(tfRef.current);
-    if (!manual && lastDeepScanCandleRef.current === key) return;
-    lastDeepScanCandleRef.current = key;
-    setIsDeepScanning(true);
-    setDeepScanMessage(manual ? "Manual 46s deep OTC scan running…" : "Automatic 46s deep OTC scan running…");
-
-    try {
-      const candidate = await generateDecisionEngineSignal(
-        assetRef.current,
-        tfRef.current,
-        "otc",
-        observationStart.current,
-        timerSecondsRef.current,
-        visionAnalysisRef.current
-          ? {
-              signal: visionAnalysisRef.current.signal,
-              confidence: visionAnalysisRef.current.confidence,
-              reasoning: visionAnalysisRef.current.reasoning,
-              patternName: visionAnalysisRef.current.patternName,
-              sequence: visionAnalysisRef.current.sequence,
-              price: visionAnalysisRef.current.price,
-              reverse: visionAnalysisRef.current.advanced.reverse,
+      for (let x = group.start; x <= group.end; x++) {
+        for (let y = 0; y < height; y++) {
+          const i = (y * width + x) * 4;
+          const r = frameData[i];
+          const g = frameData[i + 1];
+          const b = frameData[i + 2];
+          const isGreen = g > r + 35 && g > b + 25 && g > 80;
+          const isRed = r > g + 35 && r > b + 25 && r > 80;
+          if (isGreen || isRed) {
+            rowOccupancy[y]++;
+            if (isGreen) {
+              greenCount++;
+              rowGreen[y]++;
             }
-          : undefined,
-      );
-      pendingSignalRef.current = candidate;
-      pendingCandleRef.current = key;
-
-      if (candidate.signal === "WAIT") {
-        setDeepScanMessage(`Deep scan found a doji/flat condition — no entry pending.`);
-      } else {
-        setDeepScanMessage(`Pending ${candidate.signal} · ${candidate.confidence}% · releases at 00–05s.`);
-        if (isEntryWindow(tfRef.current)) releasePendingSignal();
-      }
-    } catch (error) {
-      pendingSignalRef.current = null;
-      setDeepScanMessage(error instanceof Error ? `Deep scan failed: ${error.message}` : "Deep scan failed.");
-    } finally {
-      setIsDeepScanning(false);
-    }
-  }, [releasePendingSignal]);
-
-  deepScanFnRef.current = runDeepScan;
-  releasePendingRef.current = releasePendingSignal;
-
-  // ─── Candle timer ────────────────────────────────────────────────────────
-  const subscribeToTimer = useCallback((tf: 1 | 5) => {
-    if (timerUnsubRef.current) timerUnsubRef.current();
-    timerAlertedRef.current = false;
-    timerUnsubRef.current = candleTimerService.subscribe(tf, (state) => {
-      setTimerState(state);
-      timerSecondsRef.current = state.secondsRemaining;
-      if (state.secondsRemaining <= 46 && state.secondsRemaining >= 44) {
-        void deepScanFnRef.current?.(false);
-      }
-      if (isEntryWindow(tf)) {
-        releasePendingRef.current?.();
-      }
-      if (state.isAtClose && !timerAlertedRef.current && isAnalyzingRef.current) {
-        timerAlertedRef.current = true;
-        setSignal(prev => {
-          if (prev && prev.signal !== "WAIT") {
-            speak(buildTimerMessage(state.secondsRemaining, prev.signal as "CALL" | "PUT", langRef.current));
+            if (isRed) {
+              redCount++;
+              rowRed[y]++;
+            }
+            if (y < top) top = y;
+            if (y > bottom) bottom = y;
           }
-          return prev;
+        }
+      }
+
+      if (top >= height || bottom <= top) continue;
+
+      const color: CandleColor =
+        greenCount > redCount * 1.15
+          ? "GREEN"
+          : redCount > greenCount * 1.15
+          ? "RED"
+          : "NEUTRAL";
+
+      const bodyThreshold = Math.max(2, candleWidth * 0.45);
+      let bodyTop = bottom;
+      let bodyBottom = top;
+
+      for (let y = top; y <= bottom; y++) {
+        if (rowOccupancy[y] >= bodyThreshold) {
+          bodyTop = Math.min(bodyTop, y);
+          bodyBottom = Math.max(bodyBottom, y);
+        }
+      }
+
+      if (bodyBottom <= bodyTop) {
+        let bestY = top;
+        let bestValue = 0;
+        for (let y = top; y <= bottom; y++) {
+          if (rowOccupancy[y] > bestValue) {
+            bestValue = rowOccupancy[y];
+            bestY = y;
+          }
+        }
+        bodyTop = Math.max(top, bestY - 2);
+        bodyBottom = Math.min(bottom, bestY + 2);
+      }
+
+      const bodySize = Math.max(1, bodyBottom - bodyTop + 1);
+      const totalRange = Math.max(1, bottom - top + 1);
+      const topWick = Math.max(0, bodyTop - top);
+      const bottomWick = Math.max(0, bottom - bodyBottom);
+      const bodyClass = classifyBodySize(bodySize, totalRange);
+      const topWickClass = classifyWick(topWick, bodySize);
+      const bottomWickClass = classifyWick(bottomWick, bodySize);
+      const shape = classifyCandleShape(color, bodySize, topWick, bottomWick);
+
+      candles.push({
+        id: 0,
+        x: group.start,
+        width: candleWidth,
+        top,
+        bottom,
+        bodyTop,
+        bodyBottom,
+        highY: top,
+        lowY: bottom,
+        color,
+        bodySize,
+        topWick,
+        bottomWick,
+        bodyRatio: bodySize / totalRange,
+        upperWickRatio: topWick / Math.max(bodySize, 1),
+        lowerWickRatio: bottomWick / Math.max(bodySize, 1),
+        bodyClass,
+        topWickClass,
+        bottomWickClass,
+        shape,
+        timestamp: Date.now(),
+      });
+    }
+
+    candles.sort((a, b) => a.x - b.x);
+
+    const cleanCandles: DetectedCandle[] = [];
+    for (const candle of candles) {
+      const previous = cleanCandles[cleanCandles.length - 1];
+      if (!previous) {
+        cleanCandles.push(candle);
+        continue;
+      }
+      const overlap = previous.x + previous.width - candle.x;
+      if (overlap > Math.min(previous.width, candle.width) * 0.5) {
+        const prevScore = previous.bottom - previous.top;
+        const currentScore = candle.bottom - candle.top;
+        if (currentScore > prevScore) {
+          cleanCandles[cleanCandles.length - 1] = candle;
+        }
+      } else {
+        cleanCandles.push(candle);
+      }
+    }
+
+    return {
+      greenPixels,
+      redPixels,
+      candles: cleanCandles,
+      actualBodySize: cleanCandles.length ? cleanCandles[cleanCandles.length - 1].bodySize : 0,
+      actualTopWickSize: cleanCandles.length ? cleanCandles[cleanCandles.length - 1].topWick : 0,
+      actualBottomWickSize: cleanCandles.length ? cleanCandles[cleanCandles.length - 1].bottomWick : 0,
+    };
+  };
+
+  /* =======================================================
+     CANDLE NUMBERING + MEMORY
+     ======================================================= */
+
+  const makeCandleSignature = (candle: DetectedCandle) => {
+    return [candle.color, Math.round(candle.x / 4), Math.round(candle.top / 4), Math.round(candle.bottom / 4), candle.shape].join(
+      "|"
+    );
+  };
+
+  const mergeDetectedCandlesIntoHistory = useCallback(
+    (detected: DetectedCandle[]) => {
+      if (!detected.length) return;
+      const sorted = [...detected].sort((a, b) => a.x - b.x);
+
+      for (const detectedCandle of sorted) {
+        const signature = makeCandleSignature(detectedCandle);
+        if (signature === lastCandleSignatureRef.current) continue;
+
+        const existing = candleHistoryRef.current.find(
+          (c) => Math.abs(c.x - detectedCandle.x) < 8
+        );
+
+        if (existing) {
+          existing.color = detectedCandle.color;
+          existing.top = Math.min(existing.top, detectedCandle.top);
+          existing.bottom = Math.max(existing.bottom, detectedCandle.bottom);
+          existing.bodyTop = detectedCandle.bodyTop;
+          existing.bodyBottom = detectedCandle.bodyBottom;
+          existing.bodySize = detectedCandle.bodySize;
+          existing.topWick = detectedCandle.topWick;
+          existing.bottomWick = detectedCandle.bottomWick;
+          existing.bodyClass = detectedCandle.bodyClass;
+          existing.topWickClass = detectedCandle.topWickClass;
+          existing.bottomWickClass = detectedCandle.bottomWickClass;
+          existing.shape = detectedCandle.shape;
+          existing.timestamp = Date.now();
+          continue;
+        }
+
+        candleHistoryRef.current.push({
+          ...detectedCandle,
+          id: nextCandleIdRef.current++,
         });
       }
-      if (!state.isAtClose) timerAlertedRef.current = false;
-    });
-  }, [speak]);
 
-  // ─── Subscriptions ───────────────────────────────────────────────────────
-  useEffect(() => {
-    const engine = new ScreenVisionEngine();
-    visionEngineRef.current = engine;
-    let cancelled = false;
-
-    void engine.initialize().then(() => {
-      if (!cancelled) setVisionReady(true);
-    });
-
-    return () => {
-      cancelled = true;
-      void engine.dispose();
-      visionEngineRef.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    const unsub = screenCaptureController.subscribe(s => {
-      setCaptureStatus(s);
-      if (s.viewport) setViewportAnalysis(s.viewport);
-    });
-    return () => unsub();
-  }, []);
-
-  useEffect(() => {
-    execUnsubRef.current = executionTimer.subscribe(setExecState);
-    return () => { execUnsubRef.current?.(); };
-  }, []);
-
-  useEffect(() => {
-    const unsub = voiceController.subscribe((event) => {
-      if (event.type !== "result" || !event.isFinal || !event.transcript) return;
-      const { intent, lang } = parseVoiceIntent(event.transcript);
-      setActiveLang(lang);
-      langRef.current = lang;
-      addVoiceLog(event.transcript, "in", lang);
-      memoryBuffer.add({ type: "voice_command", content: event.transcript, tags: ["voice", lang] });
-      setMemoryCount(memoryBuffer.size());
-
-      if (intent === "win") {
-        const lastSig = signal;
-        if (lastSig && lastSig.signal !== "WAIT") {
-          patternLearning.recordOutcome(lastSig.patternName, lastSig.signal, assetRef.current, tfRef.current, "win");
-          // Record the candle sequence outcome for memory learning
-          if (lastCandlesRef.current.length >= 4) {
-            sequenceMemory.recordOutcome(lastCandlesRef.current, lastSig.signal as "CALL" | "PUT", "win");
-            setLearnedSequences(sequenceMemory.getLearnedSequences());
-          }
-          visionEngineRef.current?.recordOutcome(
-            lastSig.signal as "CALL" | "PUT",
-            "WIN",
-            visionAnalysisRef.current?.price ?? null,
-          );
-        }
-        memoryBuffer.add({ type: "signal_result", content: `Win on ${assetRef.current}`, asset: assetRef.current, timeframe: tfRef.current, outcome: "win", tags: [] });
-        setWinRate(memoryBuffer.getWinRate());
-        setFailureNote(null);
-        speak(buildWinMessage(lang));
-
-      } else if (intent === "loss") {
-        const lastSig = signal;
-        if (lastSig && lastSig.signal !== "WAIT") {
-          patternLearning.recordOutcome(lastSig.patternName, lastSig.signal, assetRef.current, tfRef.current, "loss");
-          // Record sequence outcome
-          if (lastCandlesRef.current.length >= 4) {
-            sequenceMemory.recordOutcome(lastCandlesRef.current, lastSig.signal as "CALL" | "PUT", "loss");
-            setLearnedSequences(sequenceMemory.getLearnedSequences());
-          }
-          visionEngineRef.current?.recordOutcome(
-            lastSig.signal as "CALL" | "PUT",
-            "LOSS",
-            visionAnalysisRef.current?.price ?? null,
-          );
-          recordPatternFailure(lastSig.patternName, assetRef.current, []);
-          const fa = getLastFailureAnalysis();
-          if (fa) {
-            setFailureNote(`⚠️ ${fa.reason} → ${fa.adjustment}`);
-            speak(lang === "hi" ? "समझ गया। अगली बार सुधार होगा।" : "Noted. Adjusting next signal logic.");
-          }
-        }
-        memoryBuffer.add({ type: "signal_result", content: `Loss on ${assetRef.current}`, asset: assetRef.current, timeframe: tfRef.current, outcome: "loss", tags: [] });
-        memoryBuffer.add({ type: "mistake", content: `Avoid: ${assetRef.current} ${tfRef.current}m`, asset: assetRef.current, tags: ["mistake"] });
-        setWinRate(memoryBuffer.getWinRate());
-        speak(buildLossMessage(lang));
+      if (candleHistoryRef.current.length > MAX_CANDLE_HISTORY) {
+        candleHistoryRef.current = candleHistoryRef.current.slice(-MAX_CANDLE_HISTORY);
       }
+
+      lastCandleSignatureRef.current = makeCandleSignature(sorted[sorted.length - 1]);
+      setDetectedCandles([...candleHistoryRef.current]);
+      updateBrainStats();
+    },
+    [updateBrainStats]
+  );
+
+  /* =======================================================
+     CANDLE TOKEN
+     ======================================================= */
+
+  const candleToToken = (candle: DetectedCandle): string => {
+    return [
+      candle.color === "GREEN" ? "G" : candle.color === "RED" ? "R" : "N",
+      candle.shape,
+      candle.bodyClass,
+      `U${candle.topWickClass}`,
+      `L${candle.bottomWickClass}`,
+    ].join("_");
+  };
+
+  const candleToShortToken = (candle: DetectedCandle): string => {
+    const color = candle.color === "GREEN" ? "G" : candle.color === "RED" ? "R" : "N";
+    return `${color}-${candle.shape}`;
+  };
+
+  /* =======================================================
+     PATTERN DISCOVERY
+     ======================================================= */
+
+  const getRecentCandleSequence = (length = PATTERN_SEQUENCE_LENGTH): DetectedCandle[] => {
+    return candleHistoryRef.current.slice(-length);
+  };
+
+  const buildSequenceKey = (candles: DetectedCandle[]): string => {
+    return candles.map(candleToToken).join(">");
+  };
+
+  const learnNextCandlePattern = useCallback(
+    (sequenceBeforeNext: DetectedCandle[], nextCandle: DetectedCandle) => {
+      if (sequenceBeforeNext.length < PATTERN_SEQUENCE_LENGTH) return;
+      const sequence = sequenceBeforeNext.slice(-PATTERN_SEQUENCE_LENGTH);
+      const sequenceKey = buildSequenceKey(sequence);
+
+      let memory = brainRef.current.candlePatterns.find((p) => p.sequenceKey === sequenceKey);
+
+      if (!memory) {
+        memory = {
+          id: `CP_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          sequenceKey,
+          sequenceLength: sequence.length,
+          nextGreen: 0,
+          nextRed: 0,
+          nextNeutral: 0,
+          wins: 0,
+          losses: 0,
+          occurrences: 0,
+          confidence: 0,
+          lastSeen: Date.now(),
+          description: sequence.map(candleToShortToken).join(" → "),
+        };
+        brainRef.current.candlePatterns.push(memory);
+      }
+
+      memory.occurrences++;
+      if (nextCandle.color === "GREEN") memory.nextGreen++;
+      else if (nextCandle.color === "RED") memory.nextRed++;
+      else memory.nextNeutral++;
+
+      memory.lastSeen = Date.now();
+      const total = memory.nextGreen + memory.nextRed + memory.nextNeutral;
+      const maxCount = Math.max(memory.nextGreen, memory.nextRed, memory.nextNeutral);
+      memory.confidence = total > 0 ? (maxCount / total) * 100 : 0;
+
+      if (brainRef.current.candlePatterns.length > 5000) {
+        brainRef.current.candlePatterns = brainRef.current.candlePatterns.slice(-5000);
+      }
+    },
+    []
+  );
+
+  const learnFromCandleHistory = useCallback(() => {
+    const history = candleHistoryRef.current;
+    if (history.length < PATTERN_SEQUENCE_LENGTH + 1) return;
+    const nextCandle = history[history.length - 1];
+    const sequence = history.slice(-(PATTERN_SEQUENCE_LENGTH + 1), -1);
+    learnNextCandlePattern(sequence, nextCandle);
+    updateBrainStats();
+  }, [learnNextCandlePattern, updateBrainStats]);
+
+  /* =======================================================
+     MATCH CANDLE PATTERN
+     ======================================================= */
+
+  const findMatchingCandlePattern = (candles: DetectedCandle[]): CandlePatternMemory | null => {
+    if (candles.length < PATTERN_SEQUENCE_LENGTH) return null;
+    const sequence = candles.slice(-PATTERN_SEQUENCE_LENGTH);
+    const key = buildSequenceKey(sequence);
+
+    const exact = brainRef.current.candlePatterns.find((p) => p.sequenceKey === key);
+    if (exact) return exact;
+
+    const shortKey = sequence.map(candleToShortToken).join(">");
+    let best: CandlePatternMemory | null = null;
+    let bestScore = 0;
+
+    for (const memory of brainRef.current.candlePatterns) {
+      const parts = memory.description.split(" → ");
+      const target = shortKey.split(">");
+      if (parts.length !== target.length) continue;
+      let matches = 0;
+      for (let i = 0; i < target.length; i++) {
+        if (parts[i] === target[i]) matches++;
+      }
+      const score = matches / target.length;
+      if (score > bestScore && score >= 0.6) {
+        bestScore = score;
+        best = memory;
+      }
+    }
+    return best;
+  };
+
+  /* =======================================================
+     ROI
+     ======================================================= */
+
+  const getScaledROI = useCallback(() => {
+    if (!videoRef.current || !videoContainerRef.current) {
+      return roiBox;
+    }
+
+    const containerWidth = videoContainerRef.current.clientWidth || 800;
+    const containerHeight = videoContainerRef.current.clientHeight || 450;
+    const actualWidth = videoRef.current.videoWidth || containerWidth;
+    const actualHeight = videoRef.current.videoHeight || containerHeight;
+    const scaleX = actualWidth / containerWidth;
+    const scaleY = actualHeight / containerHeight;
+
+    return {
+      x: Math.max(0, Math.floor(roiBox.x * scaleX)),
+      y: Math.max(0, Math.floor(roiBox.y * scaleY)),
+      width: Math.min(actualWidth, Math.floor(roiBox.width * scaleX)),
+      height: Math.min(actualHeight, Math.floor(roiBox.height * scaleY)),
+    };
+  }, [roiBox]);
+
+  /* =======================================================
+     DRAW CANDLE OVERLAYS
+     ======================================================= */
+
+  const drawCandleOverlays = useCallback(
+    (candles: DetectedCandle[]) => {
+      if (!overlayCanvasRef.current || !videoRef.current || !videoContainerRef.current) return;
+
+      const canvas = overlayCanvasRef.current;
+      const container = videoContainerRef.current;
+      const width = container.clientWidth || 800;
+      const height = container.clientHeight || 450;
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+
+      ctx.clearRect(0, 0, width, height);
+
+      const roi = getScaledROI();
+      const roiDisplayScaleX = roi.width > 0 ? roiBox.width / roi.width : 1;
+      const roiDisplayScaleY = roi.height > 0 ? roiBox.height / roi.height : 1;
+
+      candles.forEach((candle) => {
+        const displayX = roiBox.x + candle.x * roiDisplayScaleX;
+        const displayWidth = Math.max(3, candle.width * roiDisplayScaleX);
+        const displayTop = roiBox.y + candle.top * roiDisplayScaleY;
+        const displayBottom = roiBox.y + candle.bottom * roiDisplayScaleY;
+
+        ctx.save();
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([3, 3]);
+        ctx.strokeStyle =
+          candle.color === "GREEN"
+            ? "#22c55e"
+            : candle.color === "RED"
+            ? "#ef4444"
+            : "#94a3b8";
+        ctx.strokeRect(displayX, displayTop, displayWidth, Math.max(5, displayBottom - displayTop));
+        ctx.setLineDash([]);
+
+        const numberX = displayX + displayWidth / 2;
+        const numberY = Math.max(16, displayTop - 5);
+        ctx.font = "bold 13px monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "bottom";
+        ctx.fillStyle =
+          candle.color === "GREEN"
+            ? "#84cc16"
+            : candle.color === "RED"
+            ? "#f43f5e"
+            : "#cbd5e1";
+        ctx.fillText(String(candle.id), numberX, numberY);
+
+        if (candle.id >= Math.max(1, nextCandleIdRef.current - 5)) {
+          ctx.font = "9px monospace";
+          ctx.fillText(
+            candle.shape,
+            numberX,
+            Math.min(height - 5, displayBottom + 13)
+          );
+        }
+        ctx.restore();
+      });
+
+      ctx.save();
+      ctx.font = "bold 10px monospace";
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#67e8f9";
+      ctx.fillText(`CANDLES DETECTED: ${candleHistoryRef.current.length}`, 10, 18);
+      ctx.restore();
+    },
+    [getScaledROI, roiBox]
+  );
+
+  /* =======================================================
+     ZIGZAG OVERLAY
+     ======================================================= */
+
+  const drawZigZagOverlays = useCallback(() => {
+    if (!overlayCanvasRef.current || !videoRef.current) return;
+    const canvas = overlayCanvasRef.current;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const levels = brainRef.current.zigzagLevels;
+    if (!levels.length) return;
+
+    levels.slice(-5).forEach((level) => {
+      const y = level.screenY || Math.floor(canvas.height * 0.4);
+      ctx.save();
+      ctx.beginPath();
+      ctx.setLineDash([6, 6]);
+      ctx.strokeStyle = level.type === "HIGH" ? "#f43f5e" : "#10b981";
+      ctx.lineWidth = 1.5;
+      ctx.moveTo(0, y);
+      ctx.lineTo(canvas.width, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = level.type === "HIGH" ? "#f43f5e" : "#10b981";
+      ctx.font = "bold 11px monospace";
+      ctx.fillText(`ZIGZAG ${level.type}: ${level.price.toFixed(5)}`, 10, Math.max(14, y - 5));
+      ctx.restore();
     });
-    return () => unsub();
-  }, [signal]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* =======================================================
+     ZIGZAG LOGIC
+     ======================================================= */
+
+  const processZigZagLogic = useCallback(
+    (currentPrice: number) => {
+      const history = priceHistoryRef.current;
+      history.push({ price: currentPrice, time: Date.now() });
+      if (history.length > 50) history.shift();
+      if (history.length < 10) return;
+
+      const prices = history.map((h) => h.price);
+      const maxPrice = Math.max(...prices);
+      const minPrice = Math.min(...prices);
+      const lastIndex = history.length - 1;
+
+      let detectedPeak: "HIGH" | "LOW" | null = null;
+      let peakPrice = 0;
+
+      if (history[lastIndex].price === maxPrice && maxPrice - history[0].price > 0.0003) {
+        detectedPeak = "HIGH";
+        peakPrice = maxPrice;
+      } else if (history[lastIndex].price === minPrice && history[0].price - minPrice > 0.0003) {
+        detectedPeak = "LOW";
+        peakPrice = minPrice;
+      }
+
+      if (!detectedPeak) return;
+
+      const brain = brainRef.current;
+      const existingLevel = brain.zigzagLevels.find((zl) => Math.abs(zl.price - peakPrice) < 0.0002);
+
+      if (existingLevel) {
+        existingLevel.occurrences++;
+        existingLevel.timestamp = Date.now();
+      } else {
+        brain.zigzagLevels.push({
+          price: peakPrice,
+          type: detectedPeak,
+          occurrences: 1,
+          timestamp: Date.now(),
+          screenY: undefined,
+        });
+      }
+      updateBrainStats();
+    },
+    [updateBrainStats]
+  );
+
+  /* =======================================================
+     MAGIC NUMBER
+     ======================================================= */
+
+  const detectMagicNumber = useCallback(
+    (currentPrice: number, currentColor: CandleColor, lastPrice: number, lastColor: CandleColor) => {
+      if (lastColor === currentColor || currentColor === "NEUTRAL" || lastColor === "NEUTRAL") return;
+      const isRound = checkIsRoundNumber(currentPrice);
+      const priceRange = getPriceRange(currentPrice);
+      const direction = lastColor === "GREEN" ? "GREEN_TO_RED" : "RED_TO_GREEN";
+
+      const existing = brainRef.current.magicNumbers.find(
+        (mn) => Math.abs(mn.priceLevel - currentPrice) < 0.0003 && mn.priceRange === priceRange
+      );
+
+      if (existing) {
+        existing.occurrences++;
+        existing.lastSeen = Date.now();
+        existing.isRoundNumber = isRound;
+      } else {
+        brainRef.current.magicNumbers.push({
+          priceLevel: currentPrice,
+          isRoundNumber: isRound,
+          priceRange,
+          direction,
+          occurrences: 1,
+          successRate: 50,
+          lastSeen: Date.now(),
+        });
+      }
+    },
+    []
+  );
+
+  /* =======================================================
+     TIME ALGORITHM
+     ======================================================= */
+
+  const trackTimeAlgorithm = useCallback(
+    (currentMinute: number, currentSecond: number, color: CandleColor) => {
+      const brain = brainRef.current;
+      const now = new Date();
+      const timeKey24H = `${String(now.getHours()).padStart(2, "0")}:${String(currentMinute).padStart(
+        2,
+        "0"
+      )}:${String(Math.floor(currentSecond / 5) * 5).padStart(2, "0")}`;
+
+      let timeAlgo = brain.timeAlgorithms.find((ta) => ta.timeKey24H === timeKey24H);
+      const direction = color === "GREEN" ? "UP" : color === "RED" ? "DOWN" : "NEUTRAL";
+
+      if (!timeAlgo) {
+        timeAlgo = {
+          timeKey24H,
+          minuteMarker: currentMinute,
+          secondMarker: Math.floor(currentSecond / 5) * 5,
+          direction,
+          frequency: 1,
+          successRate: 50,
+          lastOccurrences: [Date.now()],
+        };
+        brain.timeAlgorithms.push(timeAlgo);
+      } else {
+        timeAlgo.frequency++;
+        timeAlgo.lastOccurrences.push(Date.now());
+        if (timeAlgo.lastOccurrences.length > 30) {
+          timeAlgo.lastOccurrences = timeAlgo.lastOccurrences.slice(-30);
+        }
+      }
+      updateBrainStats();
+    },
+    [updateBrainStats]
+  );
+
+  /* =======================================================
+     OCR PRICE
+     ======================================================= */
+
+  const extractPriceLevelWithOCR = async (
+    ctx: CanvasRenderingContext2D
+  ): Promise<number> => {
+    if (!ocrWorkerRef.current || !ocrCanvasRef.current) {
+      return lastPriceRef.current || 0;
+    }
+
+    const ocrCtx = ocrCanvasRef.current.getContext("2d");
+    if (!ocrCtx) return lastPriceRef.current || 0;
+
+    const targetROI = getScaledROI();
+    ocrCanvasRef.current.width = Math.max(1, targetROI.width);
+    ocrCanvasRef.current.height = Math.max(1, targetROI.height);
+
+    ocrCtx.drawImage(
+      ctx.canvas,
+      targetROI.x,
+      targetROI.y,
+      targetROI.width,
+      targetROI.height,
+      0,
+      0,
+      targetROI.width,
+      targetROI.height
+    );
+
+    try {
+      const result = await ocrWorkerRef.current.recognize(ocrCanvasRef.current);
+      const text = result?.data?.text || "";
+      const matches = text.match(/\d+\.\d{2,5}/g);
+
+      if (matches?.length) {
+        const candidates = matches.map((v) => parseFloat(v)).filter((v) => Number.isFinite(v) && v > 0);
+        if (candidates.length) {
+          const parsedPrice = candidates[candidates.length - 1];
+          const isRound = checkIsRoundNumber(parsedPrice);
+          setOcrPriceText(`${parsedPrice.toFixed(5)} ${isRound ? "[ROUND SNR]" : ""}`);
+          setIsRealRoundNumber(isRound);
+          return parsedPrice;
+        }
+      }
+    } catch {
+      // OCR can temporarily fail when the screen changes
+    }
+
+    return lastPriceRef.current || 0;
+  };
+
+  /* =======================================================
+     FULL FRAME ANALYSIS
+     ======================================================= */
+
+  const analyzeCurrentFrame = useCallback(async () => {
+    if (processingFrameRef.current) return;
+    if (!canvasRef.current || !videoRef.current) return;
+
+    processingFrameRef.current = true;
+
+    try {
+      const ctx = canvasRef.current.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return;
+
+      const vWidth = videoRef.current.videoWidth || 800;
+      const vHeight = videoRef.current.videoHeight || 400;
+      canvasRef.current.width = vWidth;
+      canvasRef.current.height = vHeight;
+
+      ctx.drawImage(videoRef.current, 0, 0, vWidth, vHeight);
+
+      const targetROI = getScaledROI();
+      const roiWidth = Math.max(1, targetROI.width);
+      const roiHeight = Math.max(1, targetROI.height);
+
+      const cropped = ctx.getImageData(targetROI.x, targetROI.y, roiWidth, roiHeight);
+      const analysis = detectCandlesFromPixels(cropped.data, roiWidth, roiHeight);
+
+      mergeDetectedCandlesIntoHistory(analysis.candles);
+      learnFromCandleHistory();
+      drawCandleOverlays(analysis.candles);
+      drawZigZagOverlays();
+
+      const currentPrice = await extractPriceLevelWithOCR(ctx);
+      const latestCandle = candleHistoryRef.current[candleHistoryRef.current.length - 1];
+      const currentColor = latestCandle?.color || "NEUTRAL";
+
+      if (currentPrice > 0) {
+        processZigZagLogic(currentPrice);
+        detectMagicNumber(currentPrice, currentColor, lastPriceRef.current, lastColorRef.current);
+        lastPriceRef.current = currentPrice;
+      }
+
+      const now = new Date();
+      trackTimeAlgorithm(now.getMinutes(), now.getSeconds(), currentColor);
+      lastColorRef.current = currentColor;
+    } finally {
+      processingFrameRef.current = false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    getScaledROI,
+    mergeDetectedCandlesIntoHistory,
+    learnFromCandleHistory,
+    drawCandleOverlays,
+    drawZigZagOverlays,
+    processZigZagLogic,
+    detectMagicNumber,
+    trackTimeAlgorithm,
+  ]);
+
+  /* =======================================================
+     CONTINUOUS LEARNING
+     ======================================================= */
+
+  const startContinuousLearning = useCallback(
+    (mediaStream: MediaStream) => {
+      if (continuousLearningRef.current) {
+        clearInterval(continuousLearningRef.current);
+      }
+
+      continuousLearningRef.current = setInterval(() => {
+        if (!mediaStream.active || !videoRef.current) return;
+        analyzeCurrentFrame();
+      }, 500);
+    },
+    [analyzeCurrentFrame]
+  );
+
+  /* =======================================================
+     CONNECT SCREEN
+     ======================================================= */
+
+  const connectStream = async () => {
+    try {
+      const mediaStream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          displaySurface: "window",
+          width: 1280,
+          height: 720,
+          frameRate: 30,
+        } as any,
+        audio: false,
+      });
+
+      setStream(mediaStream);
+      setIsStreamActive(true);
+      setStatusMessage("Connected! Candle Vision + Pattern Memory is learning...");
+
+      mediaStream.getVideoTracks().forEach((track) => {
+        track.onended = () => disconnectStream();
+      });
+
+      startContinuousLearning(mediaStream);
+    } catch (err) {
+      console.error(err);
+      setStatusMessage("Connection failed. Share the chart screen.");
+    }
+  };
+
+  /* =======================================================
+     DISCONNECT
+     ======================================================= */
+
+  const disconnectStream = () => {
+    if (continuousLearningRef.current) {
+      clearInterval(continuousLearningRef.current);
+      continuousLearningRef.current = null;
+    }
+
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+    }
+
+    setStream(null);
+    setIsStreamActive(false);
+    setIsScanning(false);
+    setAiSignal("WAIT");
+    pendingSignalRef.current = null;
+    setStatusMessage("Engine paused.");
+  };
+
+  /* =======================================================
+     46 SECOND FULL ANALYSIS
+     ======================================================= */
+
+  const execute46sFullAnalysis = async () => {
+    if (isScanning) return;
+    setIsScanning(true);
+    setStatusMessage("46s Deep Candle + Pattern Analysis running...");
+
+    try {
+      await analyzeCurrentFrame();
+
+      const recentCandles = getRecentCandleSequence(20);
+
+      if (recentCandles.length < 3) {
+        setStatusMessage("Not enough candles detected yet. Keep the chart visible and allow the engine to learn.");
+        return;
+      }
+
+      const latest = recentCandles[recentCandles.length - 1];
+      const currentPrice = lastPriceRef.current || 0;
+      const isRound = checkIsRoundNumber(currentPrice);
+      const priceRange = getPriceRange(currentPrice);
+
+      const sequence5 = recentCandles.slice(-PATTERN_SEQUENCE_LENGTH);
+      const sequenceTokens = sequence5.map(candleToShortToken);
+      const matchedCandlePattern = findMatchingCandlePattern(sequence5);
+
+      const matchedZigZag = brainRef.current.zigzagLevels.reduce(
+        (closest, current) => {
+          const currentDiff = Math.abs(current.price - currentPrice);
+          const closestDiff = closest ? Math.abs(closest.price - currentPrice) : Infinity;
+          return currentDiff < closestDiff && currentDiff < 0.0015 ? current : closest;
+        },
+        null as ZigZagLevel | null
+      );
+
+      const relevantMagicNumbers = brainRef.current.magicNumbers.filter(
+        (mn) => mn.priceRange === priceRange && Math.abs(mn.priceLevel - currentPrice) < 0.005
+      );
+
+      const now = new Date();
+      const currentMinute = now.getMinutes();
+      const currentSecond = now.getSeconds();
+      const timeKey24H = `${String(now.getHours()).padStart(2, "0")}:${String(currentMinute).padStart(
+        2,
+        "0"
+      )}:${String(Math.floor(currentSecond / 5) * 5).padStart(2, "0")}`;
+
+      const timeSyncData = brainRef.current.timeAlgorithms.find((ta) => ta.timeKey24H === timeKey24H) || null;
+
+      /* =================================================
+         SIGNAL SCORING
+         ================================================= */
+
+      let callScore = 0;
+      let putScore = 0;
+      const reasons: string[] = [];
+
+      if (latest.color === "GREEN") {
+        callScore += 1;
+        reasons.push("LATEST GREEN");
+      }
+      if (latest.color === "RED") {
+        putScore += 1;
+        reasons.push("LATEST RED");
+      }
+
+      if (latest.bodyClass === "LARGE" || latest.bodyClass === "HUGE") {
+        if (latest.color === "GREEN") callScore += 1.5;
+        if (latest.color === "RED") putScore += 1.5;
+        reasons.push(`STRONG BODY ${latest.bodyClass}`);
+      }
+
+      if (latest.lowerWickRatio >= 1.5) {
+        callScore += 2;
+        reasons.push("LOWER WICK REJECTION");
+      }
+
+      if (latest.upperWickRatio >= 1.5) {
+        putScore += 2;
+        reasons.push("UPPER WICK REJECTION");
+      }
+
+      if (matchedCandlePattern) {
+        const p = matchedCandlePattern;
+        const totalNext = p.nextGreen + p.nextRed + p.nextNeutral;
+        if (totalNext > 0) {
+          const greenProb = p.nextGreen / totalNext;
+          const redProb = p.nextRed / totalNext;
+          if (p.occurrences >= 5 && p.confidence >= 55) {
+            callScore += greenProb * 3;
+            putScore += redProb * 3;
+            reasons.push(`MEMORY ${p.confidence.toFixed(1)}%`);
+          }
+        }
+      }
+
+      if (matchedZigZag) {
+        if (matchedZigZag.type === "HIGH") {
+          putScore += 2;
+          reasons.push("ZIGZAG HIGH");
+        }
+        if (matchedZigZag.type === "LOW") {
+          callScore += 2;
+          reasons.push("ZIGZAG LOW");
+        }
+      }
+
+      if (isRound) {
+        if (latest.upperWickRatio >= 1.3) {
+          putScore += 1;
+          reasons.push("ROUND + UPPER REJECTION");
+        }
+        if (latest.lowerWickRatio >= 1.3) {
+          callScore += 1;
+          reasons.push("ROUND + LOWER REJECTION");
+        }
+      }
+
+      const last3 = recentCandles.slice(-3);
+      const green3 = last3.filter((c) => c.color === "GREEN").length;
+      const red3 = last3.filter((c) => c.color === "RED").length;
+
+      if (green3 >= 2) {
+        callScore += 1;
+        reasons.push("3-CANDLE GREEN MOMENTUM");
+      }
+      if (red3 >= 2) {
+        putScore += 1;
+        reasons.push("3-CANDLE RED MOMENTUM");
+      }
+
+      if (latest.shape === "BULL_REJECTION" && latest.lowerWick > latest.topWick) {
+        callScore += 1.5;
+        reasons.push("BULL REJECTION");
+      }
+
+      if (latest.shape === "BEAR_REJECTION" && latest.topWick > latest.bottomWick) {
+        putScore += 1.5;
+        reasons.push("BEAR REJECTION");
+      }
+
+      let proposedSignal: "CALL" | "PUT";
+      if (callScore > putScore) proposedSignal = "CALL";
+      else if (putScore > callScore) proposedSignal = "PUT";
+      else proposedSignal = latest.color === "GREEN" ? "CALL" : "PUT";
+
+      const totalScore = callScore + putScore;
+      const winningScore = Math.max(callScore, putScore);
+      let confidence = totalScore > 0 ? (winningScore / totalScore) * 100 : 50;
+
+      if (matchedCandlePattern && matchedCandlePattern.occurrences >= 5) {
+        confidence += Math.min(8, matchedCandlePattern.confidence / 20);
+      }
+
+      confidence = Math.min(95, Math.max(50, confidence));
+
+      const patternString = [
+        `46S CANDLE VISION`,
+        `Candles=${recentCandles.length}`,
+        `Latest=#${latest.id}`,
+        `Shape=${latest.shape}`,
+        `Body=${latest.bodyClass}`,
+        `UpperWick=${latest.topWickClass}`,
+        `LowerWick=${latest.bottomWickClass}`,
+        `CALL=${callScore.toFixed(2)}`,
+        `PUT=${putScore.toFixed(2)}`,
+        matchedCandlePattern
+          ? `MEMORY=${matchedCandlePattern.confidence.toFixed(1)}%/${matchedCandlePattern.occurrences}x`
+          : "MEMORY=NO_MATCH",
+        reasons.join(" | "),
+      ].join(" | ");
+
+      const liveData: LiveAnalysis = {
+        pattern: patternString,
+        sequence: sequenceTokens,
+        detectedCandles: recentCandles,
+        dominantColor: latest.color,
+        strength: confidence,
+        priceLevel: currentPrice,
+        isRoundNumber: isRound,
+        bodySize: latest.bodySize,
+        topWick: latest.topWick,
+        bottomWick: latest.bottomWick,
+        detectedMagicNumbers: relevantMagicNumbers,
+        matchedZigZag,
+        matchedCandlePattern,
+        timeKey24H,
+        timestampSecond: currentSecond,
+        currentMinute,
+        timeSyncData,
+        reasons,
+        callScore,
+        putScore,
+      };
+
+      setCurrentAnalysis(liveData);
+      pendingSignalRef.current = { signal: proposedSignal, analysis: liveData };
+
+      setStatusMessage(
+        `Signal prepared [${proposedSignal}] | Evidence ${confidence.toFixed(1)}% | ${latest.shape} | Candle #${latest.id}`
+      );
+    } catch (err) {
+      console.error("46s Analysis Error:", err);
+      setStatusMessage("46s analysis error. Check ROI and chart visibility.");
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  /* =======================================================
+     MANUAL
+     ======================================================= */
+
+  const triggerAnalysis = () => {
+    if (!isStreamActive || !videoRef.current) {
+      setStatusMessage("Error: Connect screen first!");
+      return;
+    }
+    execute46sFullAnalysis();
+  };
+
+  /* =======================================================
+     CANDLE CLOCK
+     ======================================================= */
 
   useEffect(() => {
-    setMemoryCount(memoryBuffer.size());
-    setWinRate(memoryBuffer.getWinRate());
-    subscribeToTimer(selectedTimeframe);
-    return () => {
-      stopSignalLoop(); stopViewportLoop(); stopVisionLoop();
-      if (timerUnsubRef.current) timerUnsubRef.current();
-      if (execUnsubRef.current) execUnsubRef.current();
-      executionTimer.reset();
-    };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    const candleSync = setInterval(() => {
+      const now = new Date();
+      const seconds = now.getSeconds();
+      const milliseconds = now.getMilliseconds();
+      const timeUntilNext = 60 - seconds - milliseconds / 1000;
+      setTimeUntilCandle(Math.ceil(timeUntilNext));
 
-  useEffect(() => { subscribeToTimer(selectedTimeframe); }, [selectedTimeframe, subscribeToTimer]);
+      if (seconds === 0) {
+        hasScannedThisCandle.current = false;
+      }
 
-  // ─── Handlers ────────────────────────────────────────────────────────────
-  const handleStart = useCallback(async () => {
-    observationStart.current = Date.now();
-    screenCaptureController.setMode("OTC");
-    const ok = await screenCaptureController.initializeScreenCapture();
-    if (ok) {
-      setIsAnalyzing(true);
-      isAnalyzingRef.current = true;
-      prevSignalRef.current = "WAIT";
-      executionTimer.reset();
-      visionEngineRef.current?.resetSession();
-      setVisionAnalysis(null);
-      pendingSignalRef.current = null;
-      pendingCandleRef.current = null;
-      lastDeepScanCandleRef.current = null;
-      setDeepScanMessage("Automatic OTC scan arms at 46s.");
-      startSignalLoop();
-      startViewportLoop();
-      startVisionLoop();
-      speak(buildAnalysisStartMessage(assetRef.current, tfRef.current, langRef.current));
+      if (isStreamActive && seconds === 46 && !hasScannedThisCandle.current) {
+        hasScannedThisCandle.current = true;
+        execute46sFullAnalysis();
+      }
+
+      if (pendingSignalRef.current && seconds === 0 && milliseconds < 500) {
+        setAiSignal(pendingSignalRef.current.signal);
+        setStatusMessage(`SIGNAL ACTIVE: ${pendingSignalRef.current.signal} | Entry Time: 00:00`);
+        pendingSignalRef.current = null;
+      }
+    }, 100);
+
+    return () => clearInterval(candleSync);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isStreamActive, isScanning]);
+
+  /* =======================================================
+     TRADE OUTCOME
+     ======================================================= */
+
+  const logTradeOutcome = (result: TradeResult) => {
+    if (aiSignal === "WAIT" || !currentAnalysis) return;
+
+    const brain = brainRef.current;
+    const patternId = `${currentAnalysis.bodySize.toFixed(0)}_${Date.now()}`;
+
+    brain.patterns.push({
+      id: patternId,
+      pattern: currentAnalysis.pattern,
+      sequenceLength: currentAnalysis.sequence.length,
+      priceLevel: currentAnalysis.priceLevel,
+      priceRange: getPriceRange(currentAnalysis.priceLevel),
+      bodySize: currentAnalysis.bodySize,
+      topWickSize: currentAnalysis.topWick,
+      bottomWickSize: currentAnalysis.bottomWick,
+      result,
+      timestamp: Date.now(),
+      timeSync: currentAnalysis.timestampSecond,
+      timeKey24H: currentAnalysis.timeKey24H,
+      minuteMarker: currentAnalysis.currentMinute,
+      confidence: currentAnalysis.strength,
+      candleSequence: currentAnalysis.sequence,
+    });
+
+    brain.totalTrades++;
+    const wins = brain.patterns.filter((p) => p.result === "WIN").length;
+    brain.winRate = brain.patterns.length > 0 ? (wins / brain.patterns.length) * 100 : 0;
+
+    const matchedPattern = currentAnalysis.matchedCandlePattern;
+    if (matchedPattern) {
+      if (result === "WIN") matchedPattern.wins++;
+      else matchedPattern.losses++;
+
+      const total = matchedPattern.wins + matchedPattern.losses;
+      if (total > 0) {
+        const patternSuccess = (matchedPattern.wins / total) * 100;
+        const totalNext =
+          matchedPattern.nextGreen + matchedPattern.nextRed + matchedPattern.nextNeutral;
+        matchedPattern.confidence =
+          totalNext > 0 ? matchedPattern.confidence * 0.7 + patternSuccess * 0.3 : patternSuccess;
+      }
     }
-  }, [startSignalLoop, startViewportLoop, startVisionLoop, speak]);
 
-  const handleStop = useCallback(() => {
-    screenCaptureController.stopScreenCapture();
-    stopSignalLoop(); stopViewportLoop(); stopVisionLoop();
-    executionTimer.reset();
-    setIsAnalyzing(false);
-    isAnalyzingRef.current = false;
-    setSignal(null);
-    setVisionAnalysis(null);
-    pendingSignalRef.current = null;
-    pendingCandleRef.current = null;
-    lastDeepScanCandleRef.current = null;
-    setIsDeepScanning(false);
-    setDeepScanMessage("Automatic OTC scan arms at 46s.");
-    prevSignalRef.current = "WAIT";
-  }, [stopSignalLoop, stopViewportLoop, stopVisionLoop]);
+    saveBrainToDB();
+    setStatusMessage(
+      `Outcome logged [${result}] | System Win Rate: ${brain.winRate.toFixed(1)}% | Candle pattern memory updated.`
+    );
+    setAiSignal("WAIT");
+    setCurrentAnalysis(null);
+  };
 
-  const toggleVoice = useCallback(() => {
-    if (isVoiceMonitorOn) {
-      voiceController.stopListening(); voiceController.stopSpeaking();
-      setIsVoiceMonitorOn(false);
-    } else {
-      const ok = voiceController.startListening();
-      setIsVoiceMonitorOn(ok);
-      if (ok) addVoiceLog(activeLang === "hi" ? "वॉयस मॉनिटर चालू..." : "Voice monitor ON...", "out");
+  /* =======================================================
+     ROI MOUSE
+     ======================================================= */
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (isRoiLocked) return;
+    e.stopPropagation();
+    setIsDragging(true);
+    const bounds = videoContainerRef.current?.getBoundingClientRect();
+    if (!bounds) return;
+    setDragStart({ x: e.clientX - bounds.left - roiBox.x, y: e.clientY - bounds.top - roiBox.y });
+  };
+
+  const handleResizeDown = (e: React.MouseEvent) => {
+    if (isRoiLocked) return;
+    e.stopPropagation();
+    setIsResizing(true);
+    setDragStart({ x: e.clientX, y: e.clientY });
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (isRoiLocked || (!isDragging && !isResizing)) return;
+    if (!videoContainerRef.current) return;
+    const bounds = videoContainerRef.current.getBoundingClientRect();
+
+    if (isDragging) {
+      const newX = Math.max(0, Math.min(bounds.width - roiBox.width, e.clientX - bounds.left - dragStart.x));
+      const newY = Math.max(0, Math.min(bounds.height - roiBox.height, e.clientY - bounds.top - dragStart.y));
+      setRoiBox((prev) => ({ ...prev, x: newX, y: newY }));
     }
-  }, [isVoiceMonitorOn, activeLang, addVoiceLog]);
 
-  // ─── Derived state ───────────────────────────────────────────────────────
-  const currentSignal: SignalType = (signal?.signal as SignalType) || "WAIT";
-  const phase = execState?.phase ?? "IDLE";
-  const isCandleSyncReady = signal?.candleSyncBlocked === false;
-  const isStreamActive = captureStatus?.isStreamActive ?? false;
-  const isMemoryRecall = signal?.isMemoryRecall === true;
-  const isStrictCooldown = execState?.isStrictCooldown === true;
+    if (isResizing) {
+      const deltaX = e.clientX - dragStart.x;
+      const deltaY = e.clientY - dragStart.y;
+      setDragStart({ x: e.clientX, y: e.clientY });
+      setRoiBox((prev) => ({
+        ...prev,
+        width: Math.max(180, Math.min(bounds.width - prev.x, prev.width + deltaX)),
+        height: Math.max(120, Math.min(bounds.height - prev.y, prev.height + deltaY)),
+      }));
+    }
+  };
 
-  const glowDir: "UP" | "DOWN" | null =
-    (currentSignal === "CALL" && phase !== "COOLDOWN") ? "UP" :
-    (currentSignal === "PUT"  && phase !== "COOLDOWN") ? "DOWN" :
-    viewportSignal.dir;
+  const handleMouseUp = () => {
+    setIsDragging(false);
+    setIsResizing(false);
+  };
+
+  /* =======================================================
+     UI
+     ======================================================= */
 
   return (
-    <div className="min-h-screen bg-[#0a0a14] text-white p-4 md:p-6">
-      <div className="max-w-7xl mx-auto space-y-4">
-
-        {/* ── LIVE VIEWPORT BANNER ─────────────────────────────────────────── */}
-        {isStreamActive && (
-          <div className={`relative overflow-hidden rounded-2xl border-2 p-5 transition-all ${
-            viewportSignal.dir === "UP"   ? "border-green-500/70 bg-green-500/5 shadow-[0_0_30px_rgba(34,197,94,0.2)]" :
-            viewportSignal.dir === "DOWN" ? "border-red-500/70 bg-red-500/5 shadow-[0_0_30px_rgba(239,68,68,0.2)]" :
-                                            "border-cyan-500/50 bg-cyan-500/5"
-          }`}>
-            <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-cyan-400 to-transparent animate-pulse" />
-            <div className="flex items-center gap-3 flex-wrap">
-              <span className="w-3 h-3 rounded-full bg-cyan-400 animate-ping flex-shrink-0" />
-              <span className="font-black text-cyan-400 text-sm tracking-widest uppercase">
-                AI LIVE SCREEN SHARING: ANALYZING VIEWPORT
-              </span>
-              <span className="ml-auto text-xs font-mono text-gray-500">{captureStatus?.frameCount ?? 0} frames</span>
-            </div>
-            {viewportSignal.dir ? (
-              <div className="mt-4 flex items-center gap-6">
-                <div className={`text-4xl font-black flex items-center gap-3 ${viewportSignal.dir === "UP" ? "text-green-400" : "text-red-400"}`}>
-                  {viewportSignal.dir === "UP"
-                    ? <><TrendingUp className="w-10 h-10" />CALL (UP) NOW</>
-                    : <><TrendingDown className="w-10 h-10" />PUT (DOWN) NOW</>}
-                </div>
-                <div className="ml-auto text-center">
-                  <div className={`text-3xl font-black ${viewportSignal.dir === "UP" ? "text-green-400" : "text-red-400"}`}>
-                    {viewportSignal.accuracy}%
-                  </div>
-                  <div className="text-xs text-gray-500">Viewport Accuracy</div>
-                </div>
-              </div>
-            ) : (
-              <div className="mt-2 text-sm text-cyan-400/60 font-mono animate-pulse">Scanning viewport for directional signals...</div>
-            )}
-          </div>
-        )}
-
-        {/* ── HIGHER / LOWER PREDICTIVE BUTTONS ───────────────────────────── */}
-        {isStreamActive && (
-          <div className="grid grid-cols-2 gap-4">
-            <button className={`relative overflow-hidden rounded-2xl py-6 text-center font-black text-xl transition-all duration-300 border-2 ${
-              glowDir === "UP"
-                ? "border-green-400 bg-green-500/15 text-green-300 shadow-[0_0_40px_rgba(34,197,94,0.5),inset_0_0_30px_rgba(34,197,94,0.1)] scale-[1.02] animate-pulse"
-                : "border-white/10 bg-[#12121f] text-gray-500"
-            }`}>
-              {glowDir === "UP" && <span className="absolute inset-0 rounded-2xl border-2 border-green-400 animate-ping opacity-20" />}
-              <TrendingUp className="w-7 h-7 mx-auto mb-1" />
-              HIGHER ↑
-              {glowDir === "UP" && <div className="text-sm font-normal mt-1 text-green-400/80">{viewportSignal.accuracy > 0 ? `${viewportSignal.accuracy}% UP` : "CALL Active"}</div>}
-            </button>
-            <button className={`relative overflow-hidden rounded-2xl py-6 text-center font-black text-xl transition-all duration-300 border-2 ${
-              glowDir === "DOWN"
-                ? "border-red-400 bg-red-500/15 text-red-300 shadow-[0_0_40px_rgba(239,68,68,0.5),inset_0_0_30px_rgba(239,68,68,0.1)] scale-[1.02] animate-pulse"
-                : "border-white/10 bg-[#12121f] text-gray-500"
-            }`}>
-              {glowDir === "DOWN" && <span className="absolute inset-0 rounded-2xl border-2 border-red-400 animate-ping opacity-20" />}
-              <TrendingDown className="w-7 h-7 mx-auto mb-1" />
-              LOWER ↓
-              {glowDir === "DOWN" && <div className="text-sm font-normal mt-1 text-red-400/80">{viewportSignal.accuracy > 0 ? `${viewportSignal.accuracy}% DOWN` : "PUT Active"}</div>}
-            </button>
-          </div>
-        )}
-
-        {/* Header */}
-        <header className="flex justify-between items-center bg-[#12121f] p-5 rounded-2xl border border-white/5">
+    <div
+      className="min-h-screen bg-[#030712] text-white"
+      onMouseMove={handleMouseMove}
+      onMouseUp={handleMouseUp}
+      onMouseLeave={handleMouseUp}
+    >
+      {/* HEADER */}
+      <header className="border-b border-slate-800 px-5 py-4">
+        <div className="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           <div>
-            <h1 className="text-xl font-black flex items-center gap-2">
-              <Activity className="text-pink-500 w-5 h-5" />
-              YODHA X — TRADING ARENA · OTC
-            </h1>
-            <p className="text-gray-500 text-xs mt-0.5">
-               2R-1G-2R Core · 46s Deep Scan · 00–05s Entry · Strict {selectedTimeframe === 1 ? "60s" : "5m"} Cooldown
-              {activeLang === "hi" && <span className="ml-2 text-pink-400/70">· हिंदी</span>}
+            <h1 className="text-2xl font-black text-cyan-400 tracking-wider">TRADER YODHA X AI</h1>
+            <p className="text-xs text-slate-500">
+              Candle Vision • Body • Wick • Sequence • Pattern Memory • 46S Analysis • Magic Numbers
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            {isStreamActive && (
-              <span className="flex items-center gap-1.5 text-xs text-cyan-400 bg-cyan-500/10 border border-cyan-500/20 px-2 py-1 rounded-full">
-                <Eye className="w-3 h-3" /> VIEWPORT
-              </span>
-            )}
-            {isAnalyzing && (
-              <span className="flex items-center gap-1.5 text-xs text-green-400 bg-green-500/10 border border-green-500/20 px-2 py-1.5 rounded-full animate-pulse">
-                <span className="w-1.5 h-1.5 rounded-full bg-green-400 inline-block" />LIVE
-              </span>
-            )}
-          </div>
-        </header>
 
-        {/* Failure Analysis */}
-        {failureNote && (
-          <div className="bg-[#12121f] border border-orange-500/30 rounded-2xl p-4 flex items-start gap-3">
-            <AlertCircle className="w-5 h-5 text-orange-400 flex-shrink-0 mt-0.5" />
-            <div className="flex-1">
-              <div className="text-xs font-bold text-orange-400 mb-1">Adaptive Failure Analysis</div>
-              <p className="text-xs text-gray-400 leading-relaxed">{failureNote}</p>
-            </div>
-            <button onClick={() => setFailureNote(null)} className="text-gray-600 hover:text-gray-400 text-lg leading-none flex-shrink-0">×</button>
-          </div>
-        )}
-
-        {/* Execution Timer — STRICT 60s FREEZE banner */}
-        {execState && phase !== "IDLE" && (
-          <div className={`rounded-2xl border-2 p-4 transition-all ${
-            phase === "ACTIVE"
-              ? (currentSignal === "CALL" ? "border-green-500/60 bg-green-500/5" : "border-red-500/60 bg-red-500/5")
-              : isStrictCooldown
-              ? "border-orange-500/60 bg-orange-500/5"
-              : "border-yellow-500/50 bg-yellow-500/5"
-          }`}>
-            <div className="flex items-center justify-between mb-3">
-              <div className="flex items-center gap-3">
-                {phase === "ACTIVE" ? (
-                  <>
-                    <span className={`w-3 h-3 rounded-full animate-pulse ${currentSignal === "CALL" ? "bg-green-400" : "bg-red-400"}`} />
-                    <span className={`font-black text-lg tracking-wide ${currentSignal === "CALL" ? "text-green-400" : "text-red-400"}`}>
-                      SIGNAL ACTIVE — {execState.signal}
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    <Shield className={`w-5 h-5 animate-pulse ${isStrictCooldown ? "text-orange-400" : "text-yellow-400"}`} />
-                    <span className={`font-black text-lg tracking-wide ${isStrictCooldown ? "text-orange-400" : "text-yellow-400"}`}>
-                      {isStrictCooldown ? "⏸ STRICT 60s FREEZE" : "COOLING DOWN..."}
-                    </span>
-                    {isStrictCooldown && (
-                      <span className="text-xs text-gray-500 bg-orange-500/10 border border-orange-500/20 px-2 py-0.5 rounded-full">
-                        Signal generator paused — no overlaps
-                      </span>
-                    )}
-                  </>
-                )}
+          <div className="flex items-center gap-3">
+            <div className="text-right mr-2">
+              <div className="text-xs text-slate-500">AI Brain</div>
+              <div className="text-sm font-mono text-emerald-400">
+                {brainStats.candles} Candles | {brainStats.candlePatterns} Patterns
               </div>
-              <span className={`font-black text-2xl font-mono ${
-                phase === "ACTIVE" ? (currentSignal === "CALL" ? "text-green-400" : "text-red-400")
-                : isStrictCooldown ? "text-orange-400" : "text-yellow-400"
-              }`}>{execState.formattedTime}</span>
-            </div>
-            <div className="h-2.5 bg-white/5 rounded-full overflow-hidden">
-              <div className={`h-full rounded-full transition-all duration-1000 ${
-                phase === "ACTIVE" ? (currentSignal === "CALL" ? "bg-green-400" : "bg-red-400")
-                : isStrictCooldown ? "bg-orange-400" : "bg-yellow-400"
-              }`} style={{ width: `${execState.progressPercent}%` }} />
-            </div>
-            <div className="mt-1.5 text-xs text-gray-600 font-mono">
-              {phase === "ACTIVE"
-                ? `${selectedTimeframe}m trade in progress · ${execState.secondsRemaining}s remaining`
-                : isStrictCooldown
-                ? `Strict 60s freeze · ${execState.secondsRemaining}s · Signal engine completely paused`
-                : `${selectedTimeframe === 1 ? "60s" : "5m"} cooldown · ${execState.secondsRemaining}s remaining`}
-            </div>
-          </div>
-        )}
-
-        {/* Candle Timer + Searching Status */}
-        {timerState && (
-          <div className={`bg-[#12121f] border rounded-2xl p-4 transition-all ${timerState.isAtClose ? "border-yellow-500/40 bg-yellow-500/5" : "border-white/5"}`}>
-            <div className="flex items-center justify-between mb-2">
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <Clock className={`w-4 h-4 flex-shrink-0 ${timerState.isAtClose ? "text-yellow-400 animate-pulse" : "text-gray-500"}`} />
-                  <span className="text-sm font-medium text-gray-300">{selectedTimeframe}m Candle</span>
-                  {timerState.isAtClose && <span className="text-xs text-yellow-400 animate-pulse">⚠️ Closing!</span>}
-                  {/* Live sequence display */}
-                  {signal?.currentSequence && signal.currentSequence !== "—" && (
-                    <span className="text-xs font-mono bg-white/5 px-2 py-0.5 rounded-full text-gray-500">
-                      [{signal.currentSequence}]
-                    </span>
-                  )}
-                </div>
-                {isAnalyzing && signal?.searchingStatus && (
-                  <div className={`text-[11px] font-mono mt-0.5 truncate pl-6 ${
-                    isMemoryRecall ? "text-purple-400" :
-                    isCandleSyncReady ? "text-cyan-400" : "text-gray-600"
-                  }`}>
-                    <Search className="w-2.5 h-2.5 inline mr-1 opacity-60" />
-                    {signal.searchingStatus}
-                  </div>
-                )}
+              <div className="text-xs font-mono text-slate-400">
+                {brainStats.patterns} Trades | WR: {brainStats.winRate.toFixed(1)}%
               </div>
-              <span className={`font-black text-xl font-mono flex-shrink-0 ${timerState.isAtClose ? "text-yellow-400" : "text-white"}`}>
-                {timerState.formattedTime}
-              </span>
             </div>
-            <div className="h-1.5 bg-white/5 rounded-full overflow-hidden">
-              <div className={`h-full rounded-full transition-all duration-1000 ${
-                timerState.isAtClose ? "bg-yellow-400" :
-                isCandleSyncReady ? "bg-cyan-400" :
-                "bg-gradient-to-r from-pink-500 to-purple-500"
-              }`} style={{ width: `${timerState.progressPercent}%` }} />
-            </div>
-          </div>
-        )}
 
-        {/* Controls */}
-        <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-          <div className="relative">
-            <button onClick={() => setIsDropdownOpen(!isDropdownOpen)}
-              className="w-full bg-[#12121f] border border-white/10 p-3.5 rounded-xl flex justify-between items-center text-sm font-medium hover:border-pink-500/30 transition-colors">
-              <span>{selectedAsset}</span>
-              <ChevronDown className={`w-4 h-4 text-gray-400 transition-transform ${isDropdownOpen ? "rotate-180" : ""}`} />
-            </button>
-            {isDropdownOpen && (
-              <div className="absolute w-full mt-2 bg-[#1a1a2e] border border-white/10 rounded-xl z-20 shadow-2xl max-h-64 overflow-y-auto">
-                {OTC_ASSETS.map(asset => (
-                  <button key={asset} onClick={() => { setSelectedAsset(asset); setIsDropdownOpen(false); }}
-                    className={`block w-full px-4 py-2.5 text-left text-sm hover:bg-pink-500/10 transition-colors ${asset === selectedAsset ? "text-pink-400" : "text-gray-300"}`}>
-                    {asset}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-          <div className="flex gap-2">
-            {([1, 5] as const).map(t => (
-              <button key={t} onClick={() => setSelectedTimeframe(t)}
-                className={`flex-1 rounded-xl py-3.5 font-bold text-sm transition-all ${selectedTimeframe === t ? "bg-pink-500/20 border border-pink-500/40 text-pink-400" : "bg-[#12121f] border border-white/10 text-gray-400"}`}>
-                {t}m {t === 1 ? "(60s freeze)" : "(5m CD)"}
+            {!isStreamActive ? (
+              <button
+                onClick={connectStream}
+                className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg transition-all shadow-md shadow-emerald-600/20"
+              >
+                Connect Chart Screen
               </button>
-            ))}
+            ) : (
+              <button
+                onClick={disconnectStream}
+                className="px-5 py-2.5 bg-red-600 hover:bg-red-500 text-white font-bold rounded-lg transition-all"
+              >
+                Disconnect
+              </button>
+            )}
           </div>
-          <button onClick={() => isAnalyzing ? handleStop() : handleStart()}
-            className={`w-full py-3.5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${
-              isAnalyzing
-                ? "bg-red-500/20 border border-red-500/30 text-red-400 hover:bg-red-500/30"
-                : "bg-gradient-to-r from-cyan-500 to-pink-600 text-white shadow-lg shadow-cyan-500/20"
-            }`}>
-            <Monitor className="w-4 h-4" />
-            {isAnalyzing ? "Stop Live Screen" : "START LIVE SCREEN SHARING"}
-          </button>
-          <button
-            onClick={() => void runDeepScan(true)}
-            disabled={!isAnalyzing || isDeepScanning}
-            className={`w-full py-3.5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${
-              isDeepScanning
-                ? "bg-yellow-500/20 border border-yellow-500/40 text-yellow-300"
-                : "bg-[#12121f] border border-yellow-500/30 text-yellow-300 hover:bg-yellow-500/10"
-            } disabled:opacity-40 disabled:cursor-not-allowed`}
-          >
-            <Loader2 className={`w-4 h-4 ${isDeepScanning ? "animate-spin" : ""}`} />
-            {isDeepScanning ? "SCANNING 46s…" : "FORCE MANUAL 46s SCAN"}
-          </button>
         </div>
-        <div className="flex items-center gap-2 px-1 text-xs font-mono text-gray-500">
-          {isDeepScanning && <Loader2 className="w-3.5 h-3.5 text-yellow-300 animate-spin flex-shrink-0" />}
-          <span>{deepScanMessage}</span>
-          {pendingSignalRef.current && pendingSignalRef.current.signal !== "WAIT" && (
-            <span className="text-yellow-300">
-              · Pending {pendingSignalRef.current.signal} until candle transition
-            </span>
-          )}
-        </div>
+      </header>
 
-        {/* Main Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="lg:col-span-2 space-y-4">
-
-            {/* Decision Engine Signal Box */}
-            <div className={`rounded-2xl border-2 p-6 transition-all bg-[#12121f] ${
-              isMemoryRecall && currentSignal !== "WAIT"
-                ? "border-purple-500/60 shadow-[0_0_20px_rgba(168,85,247,0.2)]"
-                : phase === "ACTIVE"
-                ? (currentSignal === "CALL" ? "border-green-500/60" : "border-red-500/60")
-                : phase === "COOLDOWN" ? "border-orange-500/40"
-                 : currentSignal === "CALL" ? "border-green-500/30"
-                : currentSignal === "PUT"  ? "border-red-500/30"
-                 : isCandleSyncReady ? "border-cyan-500/50"
-                : "border-white/10"
-            }`}>
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="font-bold text-yellow-400 text-sm flex items-center gap-2">
-                  <Zap className="w-4 h-4" />
-                  {isMemoryRecall ? "SEQUENCE MEMORY RECALL" : "PATTERN ENGINE · 2R-1G-2R CORE"}
-                </h3>
-                <div className="flex items-center gap-2 flex-wrap justify-end">
-                  {isMemoryRecall && (
-                    <span className="text-xs bg-purple-500/20 text-purple-300 border border-purple-500/30 px-2 py-1 rounded-full flex items-center gap-1 animate-pulse">
-                      <Layers className="w-3 h-3" /> Memory Recall
-                    </span>
-                  )}
-                  {isCandleSyncReady && (
-                    <span className="text-xs bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 px-2 py-1 rounded-full animate-pulse flex items-center gap-1">
-                      <Target className="w-3 h-3" /> Syncing to Close
-                    </span>
-                  )}
-                  {signal?.levelType && (
-                    <span className="text-xs bg-purple-500/20 text-purple-300 border border-purple-500/20 px-2 py-1 rounded-full">
-                      {signal.levelType} Level
-                    </span>
-                  )}
-                  {signal?.isStrongLevel && (
-                    <span className="text-xs bg-yellow-500/20 text-yellow-300 border border-yellow-500/20 px-2 py-1 rounded-full">
-                      50% Strong ✓
-                    </span>
-                  )}
-                </div>
-              </div>
-
-              {/* Pattern / sequence name */}
-              <div className="mb-3 flex items-center gap-2 p-2 bg-white/5 rounded-lg">
-                {isMemoryRecall
-                  ? <Layers className="w-3.5 h-3.5 text-purple-400 flex-shrink-0" />
-                  : <BookOpen className="w-3.5 h-3.5 text-pink-400 flex-shrink-0" />}
-                <span className={`text-xs font-mono font-bold ${
-                  isMemoryRecall ? "text-purple-400" :
-                  signal?.patternName?.includes("2R-1G-2R") ? "text-cyan-400" : "text-pink-400"
-                }`}>
-                  {signal?.patternName || "Scanning..."}
-                </span>
-                {signal?.matchedSequence && (
-                  <>
-                    <ChevronRight className="w-3.5 h-3.5 text-gray-600" />
-                    <span className="text-xs text-purple-400/70 font-mono">
-                      [{signal.matchedSequence}] · {signal.sequenceOccurrences} occurrences
-                    </span>
-                  </>
-                )}
-                {!signal?.matchedSequence && signal?.structureLabel && (
-                  <>
-                    <ChevronRight className="w-3.5 h-3.5 text-gray-600" />
-                    <span className="text-xs text-gray-500 truncate">{signal.structureLabel}</span>
-                  </>
-                )}
-              </div>
-
-              {/* Signal display */}
-              <div className="flex items-center gap-6 mb-4">
-                <div className={`font-black flex items-center ${
-                  currentSignal === "CALL" ? (isMemoryRecall ? "text-purple-300" : "text-green-400") :
-                   currentSignal === "PUT"  ? (isMemoryRecall ? "text-purple-300" : "text-red-400") :
-                   isCandleSyncReady ? "text-cyan-400" : "text-gray-600"
-                }`}>
-                  {currentSignal === "CALL" && <TrendingUp className="w-12 h-12 mr-2" />}
-                  {currentSignal === "PUT"  && <TrendingDown className="w-12 h-12 mr-2" />}
-                  {currentSignal === "WAIT" && !isCandleSyncReady && <Clock className="w-10 h-10 mr-2" />}
-                  {currentSignal === "WAIT" && isCandleSyncReady && <Target className="w-10 h-10 mr-2" />}
-                   <span className="text-5xl">{currentSignal}</span>
-                </div>
-                 {currentSignal !== "WAIT" && (
-                  <div className="flex-1">
-                    <div className="text-2xl font-bold mb-1">{signal?.confidence ? `${signal.confidence}%` : "—"}</div>
-                    <div className="text-xs text-gray-500 mb-2">{isMemoryRecall ? "Memory Confidence" : "Pattern Confidence"}</div>
-                    {(signal?.confidence ?? 0) > 0 && (
-                      <div className="h-2 bg-white/5 rounded-full overflow-hidden">
-                        <div className={`h-full rounded-full transition-all duration-500 ${
-                          isMemoryRecall ? "bg-purple-400" :
-                          (signal?.confidence ?? 0) >= 80 ? "bg-green-400" :
-                          (signal?.confidence ?? 0) >= 60 ? "bg-yellow-400" : "bg-gray-500"
-                        }`} style={{ width: `${signal?.confidence ?? 0}%` }} />
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* Reasoning */}
-              <div className={`p-3 rounded-xl text-xs font-mono flex items-start gap-2 ${
-                isMemoryRecall ? "bg-purple-500/10 border border-purple-500/20" :
-                isCandleSyncReady ? "bg-cyan-500/10 border border-cyan-500/20" : "bg-white/5"
-              }`}>
-                {isMemoryRecall
-                  ? <Layers className="w-3.5 h-3.5 text-purple-400 flex-shrink-0 mt-0.5" />
-                  : isCandleSyncReady
-                  ? <Target className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0 mt-0.5" />
-                  : currentSignal === "WAIT"
-                  ? <Search className="w-3.5 h-3.5 text-gray-500 flex-shrink-0 mt-0.5" />
-                  : <Brain className="w-3.5 h-3.5 text-pink-400 flex-shrink-0 mt-0.5" />}
-                <span className={isMemoryRecall ? "text-purple-300" : isCandleSyncReady ? "text-cyan-300" : "text-gray-400"}>
-                  {signal?.reasoning || "Looking for: [2 Red → 1 Green → 2 Red] + sequence patterns"}
-                </span>
-              </div>
-
-              {/* Cooldown lock */}
-              {phase === "COOLDOWN" && (
-                <div className={`mt-3 flex items-center gap-2 p-2 rounded-lg border ${
-                  isStrictCooldown
-                    ? "bg-orange-500/10 border-orange-500/20"
-                    : "bg-yellow-500/10 border-yellow-500/20"
-                }`}>
-                  <Shield className={`w-3.5 h-3.5 ${isStrictCooldown ? "text-orange-400" : "text-yellow-400"}`} />
-                  <span className={`text-xs ${isStrictCooldown ? "text-orange-400" : "text-yellow-400"}`}>
-                    {isStrictCooldown
-                      ? `⏸ Strict 60s freeze — signal engine paused. ${execState?.secondsRemaining}s remaining.`
-                      : `${selectedTimeframe === 1 ? "60s" : "5m"} cooldown — ${execState?.secondsRemaining}s.`}
+      <main className="max-w-7xl mx-auto p-5">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+          {/* =================================================
+              LEFT PANEL
+              ================================================= */}
+          <div className="space-y-5">
+            {/* MANUAL SCAN + TIMER */}
+            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800 shadow-md">
+              <button
+                onClick={triggerAnalysis}
+                disabled={!isStreamActive || isScanning}
+                className={`w-full py-4 rounded-xl font-bold text-lg transition-all ${
+                  !isStreamActive || isScanning
+                    ? "bg-slate-700 text-slate-500 cursor-not-allowed"
+                    : "bg-cyan-600 hover:bg-cyan-500 text-white shadow-lg shadow-cyan-600/30"
+                }`}
+              >
+                {isScanning ? (
+                  <span className="flex items-center justify-center gap-2">
+                    <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    Analyzing Candles...
                   </span>
-                </div>
-              )}
-            </div>
+                ) : (
+                  "FORCE MANUAL 46S SCAN"
+                )}
+              </button>
 
-            {/* Stats */}
-            <div className="grid grid-cols-4 gap-3">
-              {[
-                { label: "Frames",   value: captureStatus?.frameCount || 0,  color: "text-blue-400" },
-                { label: "Win Rate", value: `${winRate}%`,                    color: "text-green-400" },
-                { label: "Memory",   value: memoryCount,                       color: "text-yellow-400" },
-                { label: "TF",       value: `${selectedTimeframe}m`,           color: "text-pink-400" },
-              ].map(s => (
-                <div key={s.label} className="bg-[#12121f] border border-white/5 p-4 rounded-xl text-center">
-                  <div className="text-[10px] text-gray-600 uppercase mb-1">{s.label}</div>
-                  <div className={`text-xl font-black ${s.color}`}>{s.value}</div>
-                </div>
-              ))}
-            </div>
-
-            {/* Voice Log */}
-            <div className="bg-[#12121f] border border-white/5 rounded-2xl p-5">
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-sm font-bold text-gray-300 flex items-center gap-2">
-                  <Radio className="w-4 h-4 text-pink-400" />
-                  {activeLang === "hi" ? "वॉयस लॉग" : "Voice Log"}
-                </h3>
-                <div className="flex gap-2">
-                  <button onClick={toggleVoice}
-                    className={`px-3 py-1.5 rounded-lg border text-xs font-bold flex items-center gap-1.5 transition-all ${
-                      isVoiceMonitorOn ? "border-pink-500/50 bg-pink-500/15 text-pink-400" : "border-white/10 text-gray-500"
-                    }`}>
-                    {isVoiceMonitorOn ? <><Mic className="w-3.5 h-3.5 animate-pulse" />ON</> : <><MicOff className="w-3.5 h-3.5" />OFF</>}
-                  </button>
-                  <button onClick={() => setIsMuted(!isMuted)}
-                    className={`p-2 rounded-lg border text-xs transition-all ${isMuted ? "border-white/10 text-gray-600" : "border-purple-500/30 bg-purple-500/10 text-purple-400"}`}>
-                    {isMuted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
-                  </button>
-                </div>
-              </div>
-              {isVoiceMonitorOn && (
-                <div className="mb-2 flex items-center gap-2 p-2 bg-pink-500/10 border border-pink-500/20 rounded-lg">
-                  <span className="w-2 h-2 rounded-full bg-pink-400 animate-ping" />
-                  <span className="text-xs text-pink-400">
-                    {activeLang === "hi" ? '"जीत" / "नुकसान" बोलें — sequence memory updates' : '"win" / "loss" — updates sequence memory'}
-                  </span>
-                </div>
-              )}
-              <div className="space-y-1 max-h-28 overflow-y-auto pr-1">
-                {voiceLog.length === 0 ? (
-                  <p className="text-gray-600 text-xs font-mono">
-                    {activeLang === "hi" ? '"जीत" / "नुकसान" / "कॉल" / "पुट"' : '"win" / "loss" / "call" / "put"'}
-                  </p>
-                ) : voiceLog.slice().reverse().map(log => (
-                  <div key={log.ts} className={`flex items-start gap-2 text-xs font-mono ${log.dir === "in" ? "text-blue-300" : "text-purple-300"}`}>
-                    <span className="text-gray-600 flex-shrink-0">{log.dir === "in" ? "YOU" : "AI "}</span>
-                    {log.lang && <span className="text-[10px] text-gray-700">[{log.lang.toUpperCase()}]</span>}
-                    <span>{log.text}</span>
-                  </div>
-                ))}
+              <div className="mt-4 flex items-center justify-between text-sm">
+                <span className="text-slate-500">Next Candle Entry:</span>
+                <span className="font-mono text-xl text-amber-400">{timeUntilCandle}s</span>
               </div>
             </div>
-          </div>
 
-          {/* Right Panel */}
-          <div className="space-y-4">
-
-            {/* Screen Feed */}
-            <div className="bg-[#12121f] border border-white/5 rounded-2xl p-5">
-              <h3 className="text-sm font-bold text-gray-300 mb-3 flex items-center gap-2">
-                <Monitor className="w-4 h-4 text-pink-400" />Screen Feed
+            {/* OCR */}
+            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
+              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">
+                OCR Price Telemetry
               </h3>
-              <div className={`aspect-video rounded-xl border relative overflow-hidden ${isStreamActive ? "border-green-500/20" : "border-white/5"} bg-[#0a0a14]`}>
+              <div className="text-xs space-y-2 font-mono">
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Price:</span>
+                  <span
+                    className={`font-bold ${
+                      isRealRoundNumber ? "text-emerald-400" : "text-cyan-400"
+                    }`}
+                  >
+                    {ocrPriceText}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* BRAIN STATS */}
+            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
+              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">
+                AI Brain Stats
+              </h3>
+              <div className="grid grid-cols-2 gap-2 text-xs font-mono">
+                <div className="bg-[#020617] p-3 rounded">
+                  <div className="text-slate-500">Candles</div>
+                  <div className="text-cyan-400 text-lg font-bold">{brainStats.candles}</div>
+                </div>
+                <div className="bg-[#020617] p-3 rounded">
+                  <div className="text-slate-500">Patterns</div>
+                  <div className="text-purple-400 text-lg font-bold">{brainStats.candlePatterns}</div>
+                </div>
+                <div className="bg-[#020617] p-3 rounded">
+                  <div className="text-slate-500">Magic Numbers</div>
+                  <div className="text-amber-400 text-lg font-bold">{brainStats.magicNumbers}</div>
+                </div>
+                <div className="bg-[#020617] p-3 rounded">
+                  <div className="text-slate-500">Time Syncs</div>
+                  <div className="text-cyan-400 text-lg font-bold">{brainStats.timeSyncs}</div>
+                </div>
+                <div className="bg-[#020617] p-3 rounded">
+                  <div className="text-slate-500">ZigZag</div>
+                  <div className="text-amber-400 text-lg font-bold">{brainStats.zigzag}</div>
+                </div>
+                <div className="bg-[#020617] p-3 rounded">
+                  <div className="text-slate-500">Win Rate</div>
+                  <div className="text-emerald-400 text-lg font-bold">
+                    {brainStats.winRate.toFixed(1)}%
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* LIVE ANALYSIS */}
+            {currentAnalysis && (
+              <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
+                <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">
+                  Candle Pattern Analysis
+                </h3>
+                <div className="text-xs text-slate-300 space-y-2 font-mono">
+                  <div>
+                    <span className="text-slate-500">Latest:</span> Candle #
+                    {currentAnalysis.detectedCandles[currentAnalysis.detectedCandles.length - 1]?.id}
+                  </div>
+                  <div>
+                    <span className="text-slate-500">Shape:</span>{" "}
+                    {currentAnalysis.detectedCandles[currentAnalysis.detectedCandles.length - 1]?.shape}
+                  </div>
+                  <div>
+                    <span className="text-slate-500">Body:</span>{" "}
+                    {currentAnalysis.detectedCandles[currentAnalysis.detectedCandles.length - 1]?.bodyClass}
+                  </div>
+                  <div>
+                    <span className="text-slate-500">Upper Wick:</span>{" "}
+                    {currentAnalysis.detectedCandles[currentAnalysis.detectedCandles.length - 1]?.topWickClass}
+                  </div>
+                  <div>
+                    <span className="text-slate-500">Lower Wick:</span>{" "}
+                    {currentAnalysis.detectedCandles[currentAnalysis.detectedCandles.length - 1]?.bottomWickClass}
+                  </div>
+                  <div>
+                    <span className="text-slate-500">Sequence:</span>
+                  </div>
+                  <div className="break-all text-cyan-300">
+                    {currentAnalysis.sequence.join(" → ")}
+                  </div>
+                  <div className="flex gap-4">
+                    <div>
+                      <span className="text-slate-500">CALL:</span>{" "}
+                      <span className="text-emerald-400 font-bold">
+                        {currentAnalysis.callScore.toFixed(2)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500">PUT:</span>{" "}
+                      <span className="text-red-400 font-bold">
+                        {currentAnalysis.putScore.toFixed(2)}
+                      </span>
+                    </div>
+                  </div>
+                  <div>
+                    <span className="text-slate-500">Evidence:</span>{" "}
+                    <span className="text-emerald-400 font-bold">
+                      {currentAnalysis.strength.toFixed(1)}%
+                    </span>
+                  </div>
+
+                  {currentAnalysis.matchedCandlePattern && (
+                    <div className="mt-3 p-3 bg-purple-900/20 border border-purple-500/20 rounded">
+                      <div className="text-purple-300 font-bold">MEMORY MATCH</div>
+                      <div className="mt-1 text-slate-400">
+                        Occurrences: {currentAnalysis.matchedCandlePattern.occurrences}
+                      </div>
+                      <div className="text-slate-400">
+                        Confidence: {currentAnalysis.matchedCandlePattern.confidence.toFixed(1)}%
+                      </div>
+                    </div>
+                  )}
+
+                  {currentAnalysis.matchedZigZag && (
+                    <div className="mt-2 p-3 bg-amber-900/20 border border-amber-500/20 rounded">
+                      <div className="text-amber-300 font-bold">
+                        ZIGZAG {currentAnalysis.matchedZigZag.type}
+                      </div>
+                      <div className="text-slate-400">
+                        Price: {currentAnalysis.matchedZigZag.price.toFixed(5)}
+                      </div>
+                    </div>
+                  )}
+
+                  {currentAnalysis.detectedMagicNumbers.length > 0 && (
+                    <div className="mt-2 p-3 bg-cyan-900/20 border border-cyan-500/20 rounded">
+                      <div className="text-cyan-300 font-bold">MAGIC NUMBERS</div>
+                      {currentAnalysis.detectedMagicNumbers.slice(0, 3).map((mn, i) => (
+                        <div key={i} className="text-slate-400">
+                          {mn.priceLevel.toFixed(5)} {mn.isRoundNumber ? "[ROUND]" : ""} ({mn.direction} x{mn.occurrences})
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {currentAnalysis.reasons.length > 0 && (
+                    <div className="mt-2">
+                      <span className="text-slate-500">Signal Reasons:</span>
+                      <div className="text-emerald-300 break-all mt-1">
+                        {currentAnalysis.reasons.join(" | ")}
+                      </div>
+                    </div>
+                  )}
+
+                  <p className="break-all pt-2 text-slate-500 text-[10px]">
+                    {currentAnalysis.pattern}
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* =================================================
+              RIGHT PANEL
+              ================================================= */}
+          <div className="lg:col-span-2 space-y-5">
+            {/* CHART */}
+            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <div
+                    className={`w-2 h-2 rounded-full ${
+                      isStreamActive ? "bg-emerald-400 animate-pulse" : "bg-slate-600"
+                    }`}
+                  />
+                  <span className="text-xs font-bold text-slate-400">CHART + CANDLE VISION</span>
+                </div>
+
+                {isStreamActive && (
+                  <button
+                    onClick={() => setIsRoiLocked(!isRoiLocked)}
+                    className={`px-3 py-1 rounded text-xs font-bold transition-all ${
+                      isRoiLocked
+                        ? "bg-red-900/60 text-red-400 border border-red-500/40"
+                        : "bg-cyan-900/60 text-cyan-400 border border-cyan-500/40"
+                    }`}
+                  >
+                    {isRoiLocked ? "ROI Locked" : "Drag / Resize ROI"}
+                  </button>
+                )}
+              </div>
+
+              <div
+                ref={videoContainerRef}
+                className="bg-[#020617] rounded-lg aspect-video flex items-center justify-center overflow-hidden border border-slate-900 relative select-none"
+              >
                 {isStreamActive ? (
                   <>
-                    <canvas ref={screenCanvasRef} className="w-full h-full object-contain" />
-                    <div className="absolute top-2 left-2 flex items-center gap-2 rounded-lg bg-black/65 px-2 py-1 text-[10px] font-mono text-green-300">
-                      <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-                      CAPTURING · {captureStatus?.frameCount ?? 0} frames
-                    </div>
-                    {visionAnalysis && (
-                      <div className="absolute bottom-2 left-2 rounded-lg bg-black/70 px-2 py-1 text-[10px] font-mono text-yellow-300">
-                        ZigZag {visionAnalysis.zigzag.length} points · IDs preserved
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className="w-full h-full object-contain pointer-events-none"
+                    />
+
+                    <canvas
+                      ref={overlayCanvasRef}
+                      className="absolute inset-0 pointer-events-none w-full h-full z-10"
+                    />
+
+                    <div
+                      onMouseDown={handleMouseDown}
+                      style={{
+                        left: `${roiBox.x}px`,
+                        top: `${roiBox.y}px`,
+                        width: `${roiBox.width}px`,
+                        height: `${roiBox.height}px`,
+                      }}
+                      className={`absolute border-2 ${
+                        isRoiLocked
+                          ? "border-amber-400 bg-amber-500/5"
+                          : "border-cyan-400 bg-cyan-500/5 cursor-move"
+                      } flex flex-col justify-between p-1 z-20`}
+                    >
+                      <div className="flex justify-between items-center text-[10px] font-mono text-cyan-300 font-bold bg-slate-950/80 px-1 py-0.5 rounded pointer-events-none">
+                        <span>AI CANDLE TARGET</span>
+                        <span>
+                          {Math.round(roiBox.width)}x{Math.round(roiBox.height)}
+                        </span>
                       </div>
-                    )}
+
+                      {!isRoiLocked && (
+                        <div
+                          onMouseDown={handleResizeDown}
+                          className="w-3.5 h-3.5 bg-cyan-400 absolute bottom-0 right-0 cursor-se-resize rounded-tl shadow-md"
+                        />
+                      )}
+                    </div>
                   </>
                 ) : (
-                  <div className="absolute inset-0 flex items-center justify-center text-center text-gray-600">
-                    <div>
-                      <Monitor className="w-8 h-8 mx-auto mb-2 opacity-30" />
-                      <div className="text-xs">Share your Quotex chart tab</div>
-                    </div>
+                  <div className="text-center space-y-2">
+                    <p className="text-slate-500 font-medium">
+                      Connect chart screen to start Trader Yodha X AI.
+                    </p>
+                    <p className="text-xs text-slate-600">
+                      The AI will number detected candles and learn their sequences.
+                    </p>
                   </div>
                 )}
               </div>
-              {viewportAnalysis && isStreamActive && (
-                <div className="mt-3">
-                  <div className="flex justify-between text-[10px] text-gray-600 mb-1">
-                    <span className="text-red-400">PUT ({Math.round((1 - viewportAnalysis.ratio) * 100)}%)</span>
-                    <span className="text-green-400">CALL ({Math.round(viewportAnalysis.ratio * 100)}%)</span>
-                  </div>
-                  <div className="h-2 bg-red-500/20 rounded-full overflow-hidden">
-                    <div className="h-full bg-green-400/70 rounded-full transition-all duration-500"
-                      style={{ width: `${viewportAnalysis.ratio * 100}%` }} />
-                  </div>
-                </div>
-              )}
-            </div>
 
-            {/* ── SCREEN CANDLE VISION ──────────────────────────────────────── */}
-            {visionAnalysis && (
-              <div className={`bg-[#12121f] border rounded-2xl p-5 ${
-                visionAnalysis.signal === "CALL"
-                  ? "border-green-500/20"
-                  : visionAnalysis.signal === "PUT"
-                  ? "border-red-500/20"
-                  : "border-cyan-500/20"
-              }`}>
-                <div className="flex items-center justify-between mb-3">
-                  <h3 className="text-sm font-bold text-cyan-400 flex items-center gap-2">
-                    <Eye className="w-4 h-4" />Screen Candle Vision
-                  </h3>
-                  <span className={`text-[10px] font-mono ${
-                    visionReady ? "text-green-400" : "text-yellow-400"
-                  }`}>
-                    {visionReady ? "OCR + PIXEL MODEL READY" : "STARTING VISION MODEL"}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between gap-3 mb-3">
-                  <div className={`text-2xl font-black ${
-                    visionAnalysis.signal === "CALL" ? "text-green-400" :
-                    visionAnalysis.signal === "PUT" ? "text-red-400" : "text-gray-500"
-                  }`}>
-                    {visionAnalysis.signal}
-                  </div>
-                  <div className="text-right">
-                    <div className="text-lg font-black text-white">{visionAnalysis.confidence}%</div>
-                    <div className="text-[10px] text-gray-600 uppercase">Vision confidence</div>
-                  </div>
-                </div>
-                {visionAnalysis.sequence !== "—" && (
-                  <div className="flex gap-1 mb-3">
-                    {visionAnalysis.sequence.split("").map((color, index) => (
-                      <div key={`${color}-${index}`} className={`flex-1 h-7 rounded text-[10px] font-black flex items-center justify-center ${
-                        color === "G"
-                          ? "bg-green-500/25 text-green-400 border border-green-500/30"
-                          : "bg-red-500/25 text-red-400 border border-red-500/30"
-                      }`}>
-                        {color}
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
-                  <div className="bg-[#0a0a14] rounded-lg p-2">
-                    <div className="text-gray-600">OCR price</div>
-                    <div className="text-cyan-300">{visionAnalysis.price?.toFixed(5) ?? "—"}</div>
-                  </div>
-                  <div className="bg-[#0a0a14] rounded-lg p-2">
-                    <div className="text-gray-600">Detected candles</div>
-                    <div className="text-purple-300">{visionAnalysis.candles.length}</div>
-                  </div>
-                  <div className="bg-[#0a0a14] rounded-lg p-2">
-                    <div className="text-gray-600">Structure</div>
-                    <div className="text-yellow-300">{visionAnalysis.structure ?? "Building"}</div>
-                  </div>
-                  <div className="bg-[#0a0a14] rounded-lg p-2">
-                    <div className="text-gray-600">Persistent trades</div>
-                    <div className="text-green-300">{visionAnalysis.brain.trades}</div>
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-2 mt-2 text-[11px] font-mono">
-                  <div className="bg-[#0a0a14] rounded-lg p-2">
-                    <div className="text-gray-600">RSI14</div>
-                    <div className="text-blue-300">{visionAnalysis.indicators.rsi14?.toFixed(0) ?? "—"}</div>
-                  </div>
-                  <div className="bg-[#0a0a14] rounded-lg p-2">
-                    <div className="text-gray-600">OTC confluence</div>
-                    <div className="text-yellow-300">{visionAnalysis.advanced.confluence}/3</div>
-                  </div>
-                  <div className="bg-[#0a0a14] rounded-lg p-2">
-                    <div className="text-gray-600">Trap / reverse</div>
-                    <div className={visionAnalysis.advanced.trap || visionAnalysis.advanced.reverse ? "text-orange-300" : "text-gray-500"}>
-                      {visionAnalysis.advanced.trap || visionAnalysis.advanced.reverse ? "ACTIVE" : "CLEAR"}
-                    </div>
-                  </div>
-                  <div className="bg-[#0a0a14] rounded-lg p-2">
-                    <div className="text-gray-600">7-candle model</div>
-                    <div className="text-purple-300">{visionAnalysis.advanced.sequential7 ? "MATCH" : "WATCH"}</div>
-                  </div>
-                </div>
-                <p className="mt-3 text-[11px] text-gray-500 font-mono leading-relaxed">
-                  {visionAnalysis.reasoning}
+              <canvas ref={canvasRef} className="hidden" />
+              <canvas ref={ocrCanvasRef} className="hidden" />
+
+              <div className="mt-3 px-4 py-2 bg-[#020617] rounded-lg border-l-4 border-cyan-500">
+                <p className="text-xs text-slate-400">
+                  <strong className="text-cyan-400">Status:</strong> {statusMessage}
                 </p>
               </div>
-            )}
+            </div>
 
-            {/* ── SEQUENCE MEMORY LOG ─────────────────────────────────────── */}
-            <div className="bg-[#12121f] border border-purple-500/20 rounded-2xl p-5">
-              <h3 className="text-sm font-bold text-purple-400 mb-3 flex items-center gap-2">
-                <Layers className="w-4 h-4" />Sequence Memory
-                <span className="text-xs text-gray-600 font-normal ml-auto">4–5 candle patterns</span>
-              </h3>
+            {/* DETECTED CANDLES TABLE */}
+            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
+              <h2 className="font-bold text-cyan-400 mb-4">DETECTED CANDLES</h2>
+              <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-2">
+                {detectedCandles.slice(-10).map((candle) => (
+                  <div
+                    key={candle.id}
+                    className="rounded-lg bg-black border border-slate-800 p-3"
+                  >
+                    <div
+                      className={`text-2xl font-black ${
+                        candle.color === "GREEN"
+                          ? "text-emerald-400"
+                          : candle.color === "RED"
+                          ? "text-red-400"
+                          : "text-yellow-400"
+                      }`}
+                    >
+                      #{candle.id}
+                    </div>
+                    <div className="text-[10px] text-slate-400">{candle.shape}</div>
+                    <div className="text-[10px] mt-1">Body: {candle.bodyClass}</div>
+                    <div className="text-[10px]">Up Wick: {candle.topWickClass}</div>
+                    <div className="text-[10px]">Dn Wick: {candle.bottomWickClass}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
 
-              {/* Current live sequence */}
-              {signal?.currentSequence && signal.currentSequence !== "—" && (
-                <div className="mb-3 p-2 bg-purple-500/10 border border-purple-500/20 rounded-lg">
-                  <div className="text-[10px] text-gray-500 mb-1">Current sequence (oldest→newest):</div>
-                  <div className="flex gap-1">
-                    {signal.currentSequence.split("").map((c, i) => (
-                      <div key={i} className={`flex-1 h-7 rounded text-[10px] font-black flex items-center justify-center ${
-                        c === "G"
-                          ? "bg-green-500/30 text-green-400 border border-green-500/30"
-                          : "bg-red-500/30 text-red-400 border border-red-500/30"
-                      }`}>{c}</div>
-                    ))}
+            {/* SIGNAL */}
+            <div className="bg-[#0f172a] rounded-xl p-6 border border-slate-800">
+              <div className="flex items-center justify-between mb-4">
+                <span className="px-3 py-1 bg-purple-900/50 text-purple-300 text-xs font-bold rounded tracking-wide">
+                  TRADER YODHA X SIGNAL ENGINE
+                </span>
+                <span className="text-xs text-slate-500 font-mono">1-Min Candle Transition</span>
+              </div>
+
+              <div className="text-center py-8">
+                <div
+                  className={`inline-block px-14 py-6 rounded-2xl text-6xl font-black tracking-widest border-4 transition-all duration-300 ${
+                    aiSignal === "CALL"
+                      ? "bg-emerald-500/10 border-emerald-400 text-emerald-400"
+                      : aiSignal === "PUT"
+                      ? "bg-red-500/10 border-red-400 text-red-400"
+                      : "bg-slate-800 border-slate-700 text-slate-600"
+                  }`}
+                >
+                  {aiSignal}
+                </div>
+              </div>
+
+              {currentAnalysis && (
+                <div className="mb-5 grid grid-cols-3 gap-3">
+                  <div className="bg-[#020617] rounded-lg p-3 text-center">
+                    <div className="text-xs text-slate-500">Candles</div>
+                    <div className="text-cyan-400 font-bold text-lg">
+                      {currentAnalysis.detectedCandles.length}
+                    </div>
+                  </div>
+                  <div className="bg-[#020617] rounded-lg p-3 text-center">
+                    <div className="text-xs text-slate-500">Latest #</div>
+                    <div className="text-purple-400 font-bold text-lg">
+                      {currentAnalysis.detectedCandles[currentAnalysis.detectedCandles.length - 1]?.id}
+                    </div>
+                  </div>
+                  <div className="bg-[#020617] rounded-lg p-3 text-center">
+                    <div className="text-xs text-slate-500">Evidence</div>
+                    <div className="text-emerald-400 font-bold text-lg">
+                      {currentAnalysis.strength.toFixed(1)}%
+                    </div>
                   </div>
                 </div>
               )}
 
-              <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
-                {learnedSequences.length === 0 ? (
-                  <p className="text-xs text-gray-600">No sequences learned yet.<br />Say "win"/"loss" after trades to build memory.</p>
-                ) : learnedSequences.map(seq => (
-                  <div key={seq.sequence} className={`p-2 rounded-lg border text-xs flex items-center gap-2 ${
-                    signal?.matchedSequence === seq.sequence
-                      ? "border-purple-500/50 bg-purple-500/10"
-                      : "border-white/5 bg-[#0a0a14]"
-                  }`}>
-                    <span className="font-mono font-black text-purple-300 w-14 flex-shrink-0">[{seq.sequence}]</span>
-                    <span className={`font-bold flex-shrink-0 ${seq.bestSignal === "CALL" ? "text-green-400" : "text-red-400"}`}>
-                      {seq.bestSignal}
-                    </span>
-                    <span className={`flex-shrink-0 ${seq.winRate >= 65 ? "text-green-400" : seq.winRate >= 50 ? "text-yellow-400" : "text-red-400"}`}>
-                      {seq.winRate}%
-                    </span>
-                    <span className="text-gray-600 text-[10px] truncate">{seq.occurrences}× seen</span>
-                    {signal?.matchedSequence === seq.sequence && (
-                      <span className="text-purple-400 text-[10px] ml-auto flex-shrink-0">← MATCH</span>
-                    )}
+              {aiSignal !== "WAIT" && (
+                <div className="mt-4 pt-4 border-t border-slate-800">
+                  <p className="text-xs text-slate-400 text-center mb-3">
+                    Log outcome to train the candle-pattern brain:
+                  </p>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      onClick={() => logTradeOutcome("WIN")}
+                      className="py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg transition-all tracking-wide"
+                    >
+                      WIN
+                    </button>
+                    <button
+                      onClick={() => logTradeOutcome("LOSS")}
+                      className="py-3 bg-red-600 hover:bg-red-500 text-white font-bold rounded-lg transition-all tracking-wide"
+                    >
+                      LOSS
+                    </button>
                   </div>
-                ))}
-              </div>
+                </div>
+              )}
             </div>
 
-            {/* Core Pattern Guide */}
-            <div className="bg-[#12121f] border border-cyan-500/20 rounded-2xl p-5">
-              <h3 className="text-sm font-bold text-cyan-400 mb-3 flex items-center gap-2">
-                <Target className="w-4 h-4" />Core: 2R-1G-2R
-              </h3>
-              <div className="flex items-center gap-1 mb-2">
-                {["R","R","G","R","R"].map((c, i) => (
-                  <div key={i} className={`flex-1 h-9 rounded flex items-center justify-center text-[9px] font-black ${
-                    c === "G" ? "bg-green-500/30 text-green-400 border border-green-500/30" : "bg-red-500/30 text-red-400 border border-red-500/30"
-                  }`}>{c}</div>
-                ))}
+            {/* ZIGZAG LEVELS */}
+            {brainStats.zigzag > 0 && (
+              <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
+                <h2 className="font-bold text-amber-400 mb-4">ZIGZAG LEVELS (Support / Resistance)</h2>
+                <div className="space-y-2">
+                  {brainRef.current.zigzagLevels.slice(-5).map((level, i) => (
+                    <div
+                      key={i}
+                      className="flex justify-between items-center bg-black rounded-lg p-3 border border-slate-800"
+                    >
+                      <span
+                        className={`font-bold text-sm ${
+                          level.type === "HIGH" ? "text-red-400" : "text-emerald-400"
+                        }`}
+                      >
+                        {level.type === "HIGH" ? "RESISTANCE" : "SUPPORT"}
+                      </span>
+                      <span className="font-mono text-amber-400 text-sm">
+                        {level.price.toFixed(5)}
+                      </span>
+                      <span className="text-xs text-slate-500">x{level.occurrences}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
-              <p className="text-[11px] text-gray-500">
-                2R→1G→2R = <span className="text-green-400 font-bold">CALL ↑</span> · Fires in last <span className="text-yellow-400 font-bold">5s</span> of candle.<br />
-                After signal: <span className="text-orange-400 font-bold">strict 60s freeze</span> for 1m trades.
-              </p>
-            </div>
-
-            {/* Memory stats */}
-            <div className="bg-[#12121f] border border-white/5 rounded-2xl p-5">
-              <h3 className="text-sm font-bold text-gray-300 mb-3 flex items-center gap-2">
-                <Database className="w-4 h-4 text-yellow-400" />Adaptive Memory
-              </h3>
-              <div className="space-y-2 text-xs">
-                <div className="flex justify-between"><span className="text-gray-500">Entries</span><span className="text-yellow-400 font-bold">{memoryCount}</span></div>
-                <div className="flex justify-between"><span className="text-gray-500">Win rate</span><span className="text-green-400 font-bold">{winRate}%</span></div>
-                <div className="flex justify-between"><span className="text-gray-500">Sequences</span><span className="text-purple-400 font-bold">{learnedSequences.length}</span></div>
-                <div className="h-px bg-white/5 my-1" />
-                <div className="text-gray-600 font-mono text-[11px]">{memoryBuffer.getContextSummary().slice(0, 80)}</div>
-              </div>
-            </div>
+            )}
           </div>
         </div>
-      </div>
+      </main>
     </div>
   );
 }
