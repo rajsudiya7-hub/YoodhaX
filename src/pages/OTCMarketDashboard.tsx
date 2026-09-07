@@ -1,55 +1,46 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { createWorker } from 'tesseract.js';
+import React, {
+  useCallback,
+  useEffect,
+  useRef,
+  useState
+} from "react";
+import { createWorker, Worker } from "tesseract.js";
 
 /* =========================================================
-   TRADER YODHA X AI
-   Candle Vision + Sequence Memory + Pattern Discovery
+   TRADER YODHA X
+   Candle Vision + Candle Numbering + Pattern Memory
+   + 46 Second Analysis + 00:00 Signal
    ========================================================= */
 
-type CandleColor = 'GREEN' | 'RED' | 'NEUTRAL';
-type Signal = 'WAIT' | 'CALL' | 'PUT';
-type TradeResult = 'WIN' | 'LOSS';
-type CandleSize = 'TINY' | 'SMALL' | 'MEDIUM' | 'LARGE' | 'HUGE';
-type WickSize = 'NONE' | 'SMALL' | 'MEDIUM' | 'LARGE';
-type CandleShape =
-  | 'BULL_STRONG'
-  | 'BEAR_STRONG'
-  | 'BULL_REJECTION'
-  | 'BEAR_REJECTION'
-  | 'DOJI'
-  | 'SMALL_BULL'
-  | 'SMALL_BEAR'
-  | 'INDECISION';
+type CandleColor = "GREEN" | "RED" | "NEUTRAL";
+type Signal = "WAIT" | "CALL" | "PUT";
 
-interface DetectedCandle {
-  id: number;
+interface CandleFeature {
+  number: number;
+
+  color: CandleColor;
+
+  // Pixel coordinates inside ROI
   x: number;
-  width: number;
-
-  top: number;
-  bottom: number;
-
-  bodyTop: number;
-  bodyBottom: number;
+  centerX: number;
 
   highY: number;
   lowY: number;
 
-  color: CandleColor;
+  bodyTopY: number;
+  bodyBottomY: number;
 
   bodySize: number;
-  topWick: number;
-  bottomWick: number;
+  upperWick: number;
+  lowerWick: number;
 
+  // Normalized values
   bodyRatio: number;
   upperWickRatio: number;
   lowerWickRatio: number;
 
-  bodyClass: CandleSize;
-  topWickClass: WickSize;
-  bottomWickClass: WickSize;
-
-  shape: CandleShape;
+  // Human-readable candle classification
+  type: string;
 
   timestamp: number;
 }
@@ -57,106 +48,62 @@ interface DetectedCandle {
 interface CandlePatternMemory {
   id: string;
 
-  sequenceKey: string;
+  sequence: string;
+
   sequenceLength: number;
 
-  nextGreen: number;
-  nextRed: number;
-  nextNeutral: number;
+  lastCandle: string;
 
-  wins: number;
-  losses: number;
+  patternType: string;
 
-  occurrences: number;
+  bodyProfile: string;
+
+  wickProfile: string;
+
+  direction: "UP" | "DOWN" | "NEUTRAL";
+
+  result: "WIN" | "LOSS";
+
   confidence: number;
 
-  lastSeen: number;
-
-  description: string;
-}
-
-interface PatternMemory {
-  id: string;
-  pattern: string;
-  sequenceLength: number;
-  priceLevel: number;
-  priceRange: string;
-
-  bodySize: number;
-  topWickSize: number;
-  bottomWickSize: number;
-
-  result: TradeResult;
   timestamp: number;
 
-  timeSync?: number;
-  timeKey24H: string;
-  minuteMarker: number;
-
-  confidence: number;
-
-  candleSequence?: string[];
-}
-
-interface MagicNumber {
-  priceLevel: number;
-  isRoundNumber: boolean;
-  priceRange: string;
-
-  direction: 'GREEN_TO_RED' | 'RED_TO_GREEN';
-
   occurrences: number;
-  successRate: number;
-
-  lastSeen: number;
-}
-
-interface TimeAlgorithm {
-  timeKey24H: string;
-  minuteMarker: number;
-  secondMarker: number;
-
-  direction: 'UP' | 'DOWN' | 'NEUTRAL';
-
-  frequency: number;
-  successRate: number;
-
-  lastOccurrences: number[];
 }
 
 interface ZigZagLevel {
   price: number;
-  type: 'HIGH' | 'LOW';
-
+  type: "HIGH" | "LOW";
   occurrences: number;
   timestamp: number;
-
-  screenY?: number;
 }
 
 interface BrainState {
-  patterns: PatternMemory[];
-
-  candlePatterns: CandlePatternMemory[];
-
-  magicNumbers: MagicNumber[];
-
-  timeAlgorithms: TimeAlgorithm[];
+  patterns: CandlePatternMemory[];
 
   zigzagLevels: ZigZagLevel[];
 
   totalTrades: number;
+
+  wins: number;
+
+  losses: number;
+
   winRate: number;
 
   lastUpdated: number;
 }
 
 interface LiveAnalysis {
-  pattern: string;
+  candles: CandleFeature[];
 
   sequence: string[];
 
-  detectedCandles: DetectedCandle[];
+  patternName: string;
+
+  bodyProfile: string;
+
+  wickProfile: string;
 
   dominantColor: CandleColor;
 
@@ -166,106 +113,45 @@ interface LiveAnalysis {
 
   isRoundNumber: boolean;
 
-  bodySize: number;
-  topWick: number;
-  bottomWick: number;
-
-  detectedMagicNumbers: MagicNumber[];
+  matchedPattern: CandlePatternMemory | null;
 
   matchedZigZag: ZigZagLevel | null;
 
-  matchedCandlePattern: CandlePatternMemory | null;
-
-  timeKey24H: string;
-
-  timestampSecond: number;
-  currentMinute: number;
-
-  timeSyncData: TimeAlgorithm | null;
+  timestamp: number;
 }
 
-interface CropRegion {
+interface ROI {
   x: number;
   y: number;
   width: number;
   height: number;
 }
 
-interface PixelAnalysis {
-  greenPixels: number;
-  redPixels: number;
+const DB_NAME = "TraderYodhaX_CandleBrain";
 
-  candles: DetectedCandle[];
-
-  actualBodySize: number;
-  actualTopWickSize: number;
-  actualBottomWickSize: number;
-}
-
-const DB_NAME = 'TraderYodhaX_AI_Database';
 const DB_VERSION = 2;
-const STORE_NAME = 'trader_yodha_x_brain_store';
 
-const MAX_CANDLE_HISTORY = 120;
-const PATTERN_SEQUENCE_LENGTH = 5;
+const STORE_NAME = "brain";
 
 /* =========================================================
-   MAIN ENGINE
+   MAIN COMPONENT
    ========================================================= */
 
 export default function TraderYodhaXEngine() {
+  /* ---------------- STREAM ---------------- */
+
   const [stream, setStream] = useState<MediaStream | null>(null);
 
-  const [isStreamActive, setIsStreamActive] = useState(false);
-  const [isScanning, setIsScanning] = useState(false);
+  const [isStreamActive, setIsStreamActive] =
+    useState(false);
 
-  const [aiSignal, setAiSignal] = useState<Signal>('WAIT');
+  const videoRef =
+    useRef<HTMLVideoElement>(null);
 
-  const [statusMessage, setStatusMessage] = useState(
-    'Trader Yodha X OTC Engine Ready. Connect Quotex Screen.'
-  );
+  /* ---------------- CANVAS ---------------- */
 
-  const [brainStats, setBrainStats] = useState({
-    patterns: 0,
-    candlePatterns: 0,
-    candles: 0,
-    magicNumbers: 0,
-    timeSyncs: 0,
-    zigzag: 0,
-    winRate: 0
-  });
-
-  const [currentAnalysis, setCurrentAnalysis] =
-    useState<LiveAnalysis | null>(null);
-
-  const [timeUntilCandle, setTimeUntilCandle] = useState(60);
-
-  const [ocrPriceText, setOcrPriceText] =
-    useState<string>('Searching...');
-
-  const [isRealRoundNumber, setIsRealRoundNumber] =
-    useState<boolean>(false);
-
-  const [roiBox, setRoiBox] = useState<CropRegion>({
-    x: 100,
-    y: 50,
-    width: 500,
-    height: 350
-  });
-
-  const [isRoiLocked, setIsRoiLocked] = useState(false);
-
-  const [isDragging, setIsDragging] = useState(false);
-  const [isResizing, setIsResizing] = useState(false);
-
-  const [dragStart, setDragStart] = useState({
-    x: 0,
-    y: 0
-  });
-
-  const videoRef = useRef<HTMLVideoElement>(null);
-
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasRef =
+    useRef<HTMLCanvasElement>(null);
 
   const overlayCanvasRef =
     useRef<HTMLCanvasElement>(null);
@@ -273,680 +159,861 @@ export default function TraderYodhaXEngine() {
   const ocrCanvasRef =
     useRef<HTMLCanvasElement>(null);
 
+  /* ---------------- OCR ---------------- */
+
+  const ocrWorkerRef =
+    useRef<Worker | null>(null);
+
+  const ocrBusyRef =
+    useRef(false);
+
+  /* ---------------- ROI ---------------- */
+
   const videoContainerRef =
     useRef<HTMLDivElement>(null);
 
-  const ocrWorkerRef = useRef<any>(null);
+  const [roi, setRoi] = useState<ROI>({
+    x: 50,
+    y: 30,
+    width: 650,
+    height: 350
+  });
 
-  /* =======================================================
+  const [roiLocked, setRoiLocked] =
+    useState(false);
+
+  const [dragging, setDragging] =
+    useState(false);
+
+  const [resizing, setResizing] =
+    useState(false);
+
+  const dragOffsetRef =
+    useRef({ x: 0, y: 0 });
+
+  /* ---------------- ENGINE ---------------- */
+
+  const [signal, setSignal] =
+    useState<Signal>("WAIT");
+
+  const [status, setStatus] =
+    useState("Trader Yodha X ready.");
+
+  const [isAnalyzing, setIsAnalyzing] =
+    useState(false);
+
+  const [secondsToCandle, setSecondsToCandle] =
+    useState(60);
+
+  /* ---------------- UI ---------------- */
+
+  const [ocrPrice, setOcrPrice] =
+    useState("Searching...");
+
+  const [currentAnalysis, setCurrentAnalysis] =
+    useState<LiveAnalysis | null>(null);
+
+  const [detectedCandles, setDetectedCandles] =
+    useState<CandleFeature[]>([]);
+
+  const [brainStats, setBrainStats] =
+    useState({
+      patterns: 0,
+      zigzag: 0,
+      winRate: 0
+    });
+
+  /* =========================================================
      BRAIN
-     ======================================================= */
+     ========================================================= */
 
   const brainRef = useRef<BrainState>({
     patterns: [],
-    candlePatterns: [],
-    magicNumbers: [],
-    timeAlgorithms: [],
     zigzagLevels: [],
-
     totalTrades: 0,
+    wins: 0,
+    losses: 0,
     winRate: 0,
-
     lastUpdated: Date.now()
   });
 
-  /*
-    IMPORTANT:
-    This is the actual candle history.
-
-    The AI does not depend only on the current frame.
-    It keeps the detected candle sequence here.
-  */
-  const candleHistoryRef =
-    useRef<DetectedCandle[]>([]);
-
-  const nextCandleIdRef =
-    useRef(1);
+  const lastSignalRef =
+    useRef<LiveAnalysis | null>(null);
 
   const pendingSignalRef =
-    useRef<{
-      signal: 'CALL' | 'PUT';
-      analysis: LiveAnalysis;
-    } | null>(null);
+    useRef<Signal>("WAIT");
 
-  const continuousLearningRef =
+  const learningTimerRef =
     useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const lastPriceRef =
-    useRef<number>(0);
+  const lastScanMinuteRef =
+    useRef<number>(-1);
 
-  const lastColorRef =
-    useRef<CandleColor>('NEUTRAL');
+  /* =========================================================
+     DATABASE
+     ========================================================= */
 
-  const priceHistoryRef =
-    useRef<{ price: number; time: number }[]>([]);
+  const openDB = useCallback((): Promise<IDBDatabase> => {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(
+        DB_NAME,
+        DB_VERSION
+      );
 
-  const hasScannedThisCandle =
-    useRef(false);
+      request.onupgradeneeded = () => {
+        const db = request.result;
 
-  /*
-    Prevent overlapping OCR calls.
-  */
-  const processingFrameRef =
-    useRef(false);
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          db.createObjectStore(STORE_NAME);
+        }
+      };
 
-  /*
-    Last detected candle signature.
-    Used to prevent adding the same candle every 500ms.
-  */
-  const lastCandleSignatureRef =
-    useRef('');
+      request.onsuccess = () => {
+        resolve(request.result);
+      };
 
-  /* =======================================================
-     VIDEO
-     ======================================================= */
+      request.onerror = () => {
+        reject(request.error);
+      };
+    });
+  }, []);
 
-  useEffect(() => {
-    if (
-      isStreamActive &&
-      stream &&
-      videoRef.current
-    ) {
-      videoRef.current.srcObject = stream;
+  const updateStats = useCallback(() => {
+    const brain = brainRef.current;
+
+    setBrainStats({
+      patterns: brain.patterns.length,
+      zigzag: brain.zigzagLevels.length,
+      winRate: brain.winRate
+    });
+  }, []);
+
+  const saveBrain = useCallback(async () => {
+    try {
+      const db = await openDB();
+
+      const tx =
+        db.transaction(STORE_NAME, "readwrite");
+
+      tx.objectStore(STORE_NAME).put(
+        brainRef.current,
+        "main"
+      );
+
+      brainRef.current.lastUpdated =
+        Date.now();
+
+      updateStats();
+    } catch (error) {
+      console.error("Brain save error:", error);
     }
-  }, [isStreamActive, stream]);
+  }, [openDB, updateStats]);
 
-  /* =======================================================
-     OCR
-     ======================================================= */
+  const loadBrain = useCallback(async () => {
+    try {
+      const db = await openDB();
+
+      const tx =
+        db.transaction(STORE_NAME, "readonly");
+
+      const request =
+        tx.objectStore(STORE_NAME).get("main");
+
+      request.onsuccess = () => {
+        if (request.result) {
+          brainRef.current =
+            request.result as BrainState;
+
+          updateStats();
+
+          setStatus(
+            `Brain loaded: ${brainRef.current.patterns.length} learned patterns`
+          );
+        }
+      };
+    } catch (error) {
+      console.error("Brain load error:", error);
+    }
+  }, [openDB, updateStats]);
+
+  /* =========================================================
+     OCR INITIALIZATION
+     ========================================================= */
 
   useEffect(() => {
+    let cancelled = false;
+
     const initOCR = async () => {
       try {
-        const worker = await createWorker('eng');
+        setStatus("Starting OCR engine...");
+
+        const worker =
+          await createWorker("eng");
+
+        if (cancelled) {
+          await worker.terminate();
+          return;
+        }
 
         ocrWorkerRef.current = worker;
 
-        setStatusMessage(
-          'Trader Yodha X Vision Engine Initialized.'
+        setStatus(
+          "Vision engine ready. Connect chart."
         );
-      } catch (err) {
-        console.error('OCR Init Error:', err);
+      } catch (error) {
+        console.error("OCR error:", error);
+
+        setStatus(
+          "Vision engine ready without OCR."
+        );
       }
     };
 
     initOCR();
 
+    loadBrain();
+
     return () => {
+      cancelled = true;
+
       if (ocrWorkerRef.current) {
-        ocrWorkerRef.current.terminate();
+        ocrWorkerRef.current
+          .terminate()
+          .catch(() => {});
+
         ocrWorkerRef.current = null;
       }
     };
-  }, []);
+  }, [loadBrain]);
 
-  /* =======================================================
-     BRAIN STATS
-     ======================================================= */
-
-  const updateBrainStats = useCallback(() => {
-    const brain = brainRef.current;
-
-    setBrainStats({
-      patterns: brain.patterns.length,
-
-      candlePatterns:
-        brain.candlePatterns.length,
-
-      candles:
-        candleHistoryRef.current.length,
-
-      magicNumbers:
-        brain.magicNumbers.length,
-
-      timeSyncs:
-        brain.timeAlgorithms.length,
-
-      zigzag:
-        brain.zigzagLevels.length,
-
-      winRate:
-        brain.winRate
-    });
-  }, []);
-
-  /* =======================================================
-     INDEXED DB
-     ======================================================= */
-
-  const initIndexedDB =
-    useCallback((): Promise<IDBDatabase> => {
-      return new Promise((resolve, reject) => {
-        const request =
-          indexedDB.open(
-            DB_NAME,
-            DB_VERSION
-          );
-
-        request.onupgradeneeded = (event) => {
-          const db =
-            (event.target as IDBOpenDBRequest).result;
-
-          if (
-            !db.objectStoreNames.contains(
-              STORE_NAME
-            )
-          ) {
-            db.createObjectStore(
-              STORE_NAME
-            );
-          }
-        };
-
-        request.onsuccess = (event) => {
-          resolve(
-            (event.target as IDBOpenDBRequest).result
-          );
-        };
-
-        request.onerror = (event) => {
-          reject(
-            (event.target as IDBOpenDBRequest).error
-          );
-        };
-      });
-    }, []);
-
-  const saveBrainToDB =
-    useCallback(async () => {
-      try {
-        const db =
-          await initIndexedDB();
-
-        const transaction =
-          db.transaction(
-            STORE_NAME,
-            'readwrite'
-          );
-
-        const store =
-          transaction.objectStore(
-            STORE_NAME
-          );
-
-        brainRef.current.lastUpdated =
-          Date.now();
-
-        store.put(
-          brainRef.current,
-          'trader_yodha_x_brain_state'
-        );
-
-        updateBrainStats();
-      } catch (err) {
-        console.error(
-          'IndexedDB Save Failure:',
-          err
-        );
-      }
-    }, [
-      initIndexedDB,
-      updateBrainStats
-    ]);
-
-  const loadBrainFromDB =
-    useCallback(async () => {
-      try {
-        const db =
-          await initIndexedDB();
-
-        const transaction =
-          db.transaction(
-            STORE_NAME,
-            'readonly'
-          );
-
-        const store =
-          transaction.objectStore(
-            STORE_NAME
-          );
-
-        const request =
-          store.get(
-            'trader_yodha_x_brain_state'
-          );
-
-        request.onsuccess = () => {
-          if (!request.result) return;
-
-          const parsed =
-            request.result as BrainState;
-
-          if (!parsed.patterns)
-            parsed.patterns = [];
-
-          if (!parsed.candlePatterns)
-            parsed.candlePatterns = [];
-
-          if (!parsed.magicNumbers)
-            parsed.magicNumbers = [];
-
-          if (!parsed.timeAlgorithms)
-            parsed.timeAlgorithms = [];
-
-          if (!parsed.zigzagLevels)
-            parsed.zigzagLevels = [];
-
-          brainRef.current = parsed;
-
-          updateBrainStats();
-
-          setStatusMessage(
-            `Trader Yodha X Brain Active: ${parsed.patterns.length} trade memories + ${parsed.candlePatterns.length} candle patterns loaded.`
-          );
-        };
-      } catch (err) {
-        console.error(
-          'IndexedDB Load Failure:',
-          err
-        );
-      }
-    }, [
-      initIndexedDB,
-      updateBrainStats
-    ]);
+  /* =========================================================
+     VIDEO CONNECTION
+     ========================================================= */
 
   useEffect(() => {
-    loadBrainFromDB();
-  }, [loadBrainFromDB]);
+    if (
+      videoRef.current &&
+      stream
+    ) {
+      videoRef.current.srcObject =
+        stream;
 
-  /* =======================================================
-     PRICE HELPERS
-     ======================================================= */
+      videoRef.current
+        .play()
+        .catch(() => {});
+    }
+  }, [stream]);
 
-  const getPriceRange =
-    (price: number): string => {
-      const base =
-        Math.floor(price * 1000);
+  const connectScreen = async () => {
+    try {
+      if (
+        !navigator.mediaDevices ||
+        !navigator.mediaDevices.getDisplayMedia
+      ) {
+        setStatus(
+          "Screen sharing is not supported in this browser."
+        );
 
-      return `${(base / 1000).toFixed(
-        3
-      )}-${((base + 1) / 1000).toFixed(
-        3
-      )}`;
-    };
+        return;
+      }
 
-  const checkIsRoundNumber =
-    (price: number): boolean => {
-      if (!price || price <= 0)
-        return false;
-
-      const priceStr =
-        price.toFixed(5);
-
-      return (
-        priceStr.endsWith('000') ||
-        priceStr.endsWith('500') ||
-        priceStr.endsWith('0000') ||
-        priceStr.endsWith('5000')
+      setStatus(
+        "Select the chart/window to share..."
       );
-    };
 
-  /* =======================================================
-     CANDLE CLASSIFICATION
-     ======================================================= */
+      const media =
+        await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            frameRate: {
+              ideal: 15,
+              max: 30
+            }
+          },
+          audio: false
+        });
 
-  const classifyBodySize =
-    (
-      body: number,
-      totalRange: number
-    ): CandleSize => {
-      if (totalRange <= 0)
-        return 'TINY';
+      media.getVideoTracks()[0].addEventListener(
+        "ended",
+        () => {
+          disconnectScreen();
+        }
+      );
 
-      const ratio =
-        body / totalRange;
+      setStream(media);
+      setIsStreamActive(true);
 
-      if (ratio < 0.10)
-        return 'TINY';
+      setStatus(
+        "Chart connected. Position ROI over candles."
+      );
+    } catch (error) {
+      console.error(error);
 
-      if (ratio < 0.25)
-        return 'SMALL';
+      setStatus(
+        "Screen sharing cancelled/failed."
+      );
+    }
+  };
 
-      if (ratio < 0.50)
-        return 'MEDIUM';
+  const disconnectScreen = () => {
+    if (learningTimerRef.current) {
+      clearInterval(
+        learningTimerRef.current
+      );
 
-      if (ratio < 0.75)
-        return 'LARGE';
+      learningTimerRef.current = null;
+    }
 
-      return 'HUGE';
-    };
+    if (stream) {
+      stream
+        .getTracks()
+        .forEach(track => track.stop());
+    }
 
-  const classifyWick =
-    (
-      wick: number,
-      body: number
-    ): WickSize => {
-      if (wick <= 1)
-        return 'NONE';
+    setStream(null);
 
-      if (body <= 1) {
-        return wick < 8
-          ? 'SMALL'
-          : wick < 20
-          ? 'MEDIUM'
-          : 'LARGE';
+    setIsStreamActive(false);
+
+    setSignal("WAIT");
+
+    setCurrentAnalysis(null);
+
+    setDetectedCandles([]);
+
+    setStatus("Engine paused.");
+  };
+
+  /* =========================================================
+     PRICE HELPERS
+     ========================================================= */
+
+  const getPriceRange = (
+    price: number
+  ) => {
+    if (!price) return "UNKNOWN";
+
+    const base =
+      Math.floor(price * 1000) / 1000;
+
+    return `${base.toFixed(3)}-${(
+      base + 0.001
+    ).toFixed(3)}`;
+  };
+
+  const isRoundNumber = (
+    price: number
+  ) => {
+    if (!price) return false;
+
+    const scaled =
+      Math.round(price * 10000);
+
+    return (
+      scaled % 1000 === 0 ||
+      scaled % 500 === 0
+    );
+  };
+
+  /* =========================================================
+     OCR
+     ========================================================= */
+
+  const readPrice = async (
+    ctx: CanvasRenderingContext2D
+  ): Promise<number> => {
+    const worker =
+      ocrWorkerRef.current;
+
+    const ocrCanvas =
+      ocrCanvasRef.current;
+
+    if (
+      !worker ||
+      !ocrCanvas ||
+      ocrBusyRef.current
+    ) {
+      return 0;
+    }
+
+    ocrBusyRef.current = true;
+
+    try {
+      const width =
+        Math.min(500, ctx.canvas.width);
+
+      const height =
+        Math.min(180, ctx.canvas.height);
+
+      ocrCanvas.width = width;
+      ocrCanvas.height = height;
+
+      const ocrCtx =
+        ocrCanvas.getContext("2d");
+
+      if (!ocrCtx) return 0;
+
+      ocrCtx.filter =
+        "contrast(180%) brightness(130%)";
+
+      ocrCtx.drawImage(
+        ctx.canvas,
+        0,
+        0,
+        width,
+        height,
+        0,
+        0,
+        width,
+        height
+      );
+
+      const result =
+        await worker.recognize(
+          ocrCanvas
+        );
+
+      const text =
+        result.data.text
+          .replace(/,/g, "")
+          .replace(/\s+/g, " ");
+
+      const matches =
+        text.match(
+          /\d+\.\d{2,6}/g
+        );
+
+      if (!matches?.length) {
+        return 0;
       }
 
-      const ratio =
-        wick / body;
+      const prices =
+        matches
+          .map(Number)
+          .filter(
+            n =>
+              Number.isFinite(n) &&
+              n > 0
+          );
 
-      if (ratio < 0.35)
-        return 'SMALL';
+      if (!prices.length) {
+        return 0;
+      }
 
-      if (ratio < 0.90)
-        return 'MEDIUM';
+      const price =
+        prices[prices.length - 1];
 
-      return 'LARGE';
-    };
+      setOcrPrice(
+        `${price.toFixed(5)} ${
+          isRoundNumber(price)
+            ? "🎯 ROUND"
+            : ""
+        }`
+      );
 
-  const classifyCandleShape =
-    (
-      color: CandleColor,
-      body: number,
-      topWick: number,
-      bottomWick: number
-    ): CandleShape => {
-      if (color === 'NEUTRAL')
-        return 'INDECISION';
+      return price;
+    } catch (error) {
+      console.warn(
+        "OCR read failed",
+        error
+      );
 
-      const range =
-        body + topWick + bottomWick;
+      return 0;
+    } finally {
+      ocrBusyRef.current = false;
+    }
+  };
 
-      if (range <= 0)
-        return 'INDECISION';
+  /* =========================================================
+     FRAME CAPTURE
+     ========================================================= */
 
-      const bodyRatio =
-        body / range;
+  const captureROI =
+    useCallback((): {
+      imageData: ImageData;
+      ctx: CanvasRenderingContext2D;
+    } | null => {
+      const video =
+        videoRef.current;
 
-      const topRatio =
-        topWick / Math.max(body, 1);
-
-      const bottomRatio =
-        bottomWick / Math.max(body, 1);
-
-      if (bodyRatio < 0.12)
-        return 'DOJI';
+      const canvas =
+        canvasRef.current;
 
       if (
-        bottomRatio >= 1.5 &&
-        bottomWick > topWick
+        !video ||
+        !canvas ||
+        video.readyState < 2
       ) {
-        return color === 'GREEN'
-          ? 'BULL_REJECTION'
-          : 'BEAR_REJECTION';
+        return null;
       }
 
-      if (
-        topRatio >= 1.5 &&
-        topWick > bottomWick
-      ) {
-        return color === 'GREEN'
-          ? 'BULL_REJECTION'
-          : 'BEAR_REJECTION';
+      const width =
+        video.videoWidth;
+
+      const height =
+        video.videoHeight;
+
+      if (!width || !height) {
+        return null;
       }
 
-      if (bodyRatio >= 0.70) {
-        return color === 'GREEN'
-          ? 'BULL_STRONG'
-          : 'BEAR_STRONG';
-      }
+      canvas.width = width;
+      canvas.height = height;
 
-      return color === 'GREEN'
-        ? 'SMALL_BULL'
-        : 'SMALL_BEAR';
-    };
+      const ctx =
+        canvas.getContext(
+          "2d",
+          {
+            willReadFrequently: true
+          }
+        );
 
-  /* =======================================================
-     CANDLE DETECTION ENGINE
-     ======================================================= */
+      if (!ctx) return null;
 
-  const detectCandlesFromPixels =
-    (
-      frameData: Uint8ClampedArray,
-      width: number,
-      height: number
-    ): PixelAnalysis => {
-      if (
-        width <= 0 ||
-        height <= 0
-      ) {
-        return {
-          greenPixels: 0,
-          redPixels: 0,
-          candles: [],
-          actualBodySize: 0,
-          actualTopWickSize: 0,
-          actualBottomWickSize: 0
-        };
-      }
+      ctx.drawImage(
+        video,
+        0,
+        0,
+        width,
+        height
+      );
 
-      /*
-        1. Find colored pixels.
+      const container =
+        videoContainerRef.current;
 
-        Instead of dividing screen into 20 chunks,
-        we calculate a true X projection.
-      */
+      if (!container) return null;
 
-      const greenX =
-        new Uint32Array(width);
+      const cw =
+        container.clientWidth;
 
-      const redX =
-        new Uint32Array(width);
+      const ch =
+        container.clientHeight;
 
-      const greenPixelsByY =
-        new Uint32Array(height);
+      const scaleX =
+        width / cw;
 
-      const redPixelsByY =
-        new Uint32Array(height);
+      const scaleY =
+        height / ch;
 
-      let greenPixels = 0;
-      let redPixels = 0;
+      const x =
+        Math.max(
+          0,
+          Math.min(
+            width - 1,
+            roi.x * scaleX
+          )
+        );
 
-      for (
-        let y = 0;
-        y < height;
-        y++
-      ) {
-        for (
-          let x = 0;
-          x < width;
-          x++
+      const y =
+        Math.max(
+          0,
+          Math.min(
+            height - 1,
+            roi.y * scaleY
+          )
+        );
+
+      const rw =
+        Math.max(
+          10,
+          Math.min(
+            width - x,
+            roi.width * scaleX
+          )
+        );
+
+      const rh =
+        Math.max(
+          10,
+          Math.min(
+            height - y,
+            roi.height * scaleY
+          )
+        );
+
+      const imageData =
+        ctx.getImageData(
+          Math.floor(x),
+          Math.floor(y),
+          Math.floor(rw),
+          Math.floor(rh)
+        );
+
+      return {
+        imageData,
+        ctx
+      };
+    }, [roi]);
+
+  /* =========================================================
+     COLOR CLASSIFICATION
+     ========================================================= */
+
+  const getPixelColor = (
+    r: number,
+    g: number,
+    b: number
+  ): CandleColor => {
+    const green =
+      g > r * 1.18 &&
+      g > b * 1.05 &&
+      g - r > 20;
+
+    const red =
+      r > g * 1.18 &&
+      r > b * 1.05 &&
+      r - g > 20;
+
+    if (green) return "GREEN";
+
+    if (red) return "RED";
+
+    return "NEUTRAL";
+  };
+
+  /* =========================================================
+     CANDLE DETECTION
+     
+     IMPORTANT:
+     Instead of looking at whole ROI as one candle,
+     divide it into X columns and find individual candle
+     bodies/wicks.
+     ========================================================= */
+
+  const detectCandles = (
+    data: Uint8ClampedArray,
+    width: number,
+    height: number
+  ): CandleFeature[] => {
+    const columnStats = Array.from(
+      { length: width },
+      () => ({
+        green: 0,
+        red: 0,
+        minY: height,
+        maxY: -1,
+        bodyCandidates: [] as number[]
+      })
+    );
+
+    /* -------- scan pixels -------- */
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i =
+          (y * width + x) * 4;
+
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+
+        const color =
+          getPixelColor(r, g, b);
+
+        if (color === "GREEN") {
+          columnStats[x].green++;
+        }
+
+        if (color === "RED") {
+          columnStats[x].red++;
+        }
+
+        if (
+          color !== "NEUTRAL"
         ) {
-          const i =
-            (y * width + x) * 4;
+          columnStats[x].minY =
+            Math.min(
+              columnStats[x].minY,
+              y
+            );
 
-          const r =
-            frameData[i];
-
-          const g =
-            frameData[i + 1];
-
-          const b =
-            frameData[i + 2];
-
-          /*
-            Stronger color separation
-            reduces chart-grid false positives.
-          */
-
-          const green =
-            g > r + 35 &&
-            g > b + 25 &&
-            g > 80;
-
-          const red =
-            r > g + 35 &&
-            r > b + 25 &&
-            r > 80;
-
-          if (green) {
-            greenX[x]++;
-            greenPixelsByY[y]++;
-            greenPixels++;
-          }
-
-          if (red) {
-            redX[x]++;
-            redPixelsByY[y]++;
-            redPixels++;
-          }
+          columnStats[x].maxY =
+            Math.max(
+              columnStats[x].maxY,
+              y
+            );
         }
       }
+    }
 
-      /*
-        2. Build candidate candle X columns.
-      */
+    /* -------- identify active columns -------- */
 
-      const activeColumns =
-        new Array<boolean>(
-          width
-        ).fill(false);
+    const active =
+      columnStats.map(s => {
+        const color =
+          s.green > s.red * 1.12
+            ? "GREEN"
+            : s.red > s.green * 1.12
+            ? "RED"
+            : "NEUTRAL";
 
-      for (
-        let x = 0;
-        x < width;
-        x++
+        const pixels =
+          s.green + s.red;
+
+        return {
+          color: color as CandleColor,
+          pixels
+        };
+      });
+
+    /*
+      Merge neighboring active columns into candle bodies.
+      This makes detection much more stable than treating
+      every X column as a candle.
+    */
+
+    const groups: {
+      start: number;
+      end: number;
+      color: CandleColor;
+    }[] = [];
+
+    let start = -1;
+    let lastColor: CandleColor =
+      "NEUTRAL";
+
+    for (
+      let x = 0;
+      x < width;
+      x++
+    ) {
+      const current =
+        active[x];
+
+      const usable =
+        current.pixels > height * 0.025 &&
+        current.color !== "NEUTRAL";
+
+      if (
+        usable &&
+        start === -1
       ) {
-        const total =
-          greenX[x] +
-          redX[x];
-
+        start = x;
+        lastColor =
+          current.color;
+      } else if (
+        usable &&
+        start !== -1
+      ) {
         /*
-          Candle wick may be only 1-3 px,
-          therefore threshold is intentionally low.
+          If color changes or gap becomes large,
+          close current group.
         */
 
-        if (total >= 2) {
-          activeColumns[x] = true;
+        if (
+          current.color !==
+          lastColor
+        ) {
+          if (
+            x - start >= 3
+          ) {
+            groups.push({
+              start,
+              end: x - 1,
+              color: lastColor
+            });
+          }
+
+          start = x;
+          lastColor =
+            current.color;
         }
-      }
-
-      /*
-        3. Group neighboring X columns.
-
-        Small gaps are merged because anti-aliasing
-        can break the candle body.
-      */
-
-      const groups: {
-        start: number;
-        end: number;
-      }[] = [];
-
-      let start = -1;
-      let gap = 0;
-
-      for (
-        let x = 0;
-        x < width;
-        x++
+      } else if (
+        !usable &&
+        start !== -1
       ) {
-        if (activeColumns[x]) {
-          if (start === -1) {
-            start = x;
-          }
-
-          gap = 0;
-        } else if (start !== -1) {
-          gap++;
-
-          if (gap > 3) {
-            const end =
-              x - gap;
-
-            if (
-              end - start >= 2
-            ) {
-              groups.push({
-                start,
-                end
-              });
-            }
-
-            start = -1;
-            gap = 0;
-          }
+        if (
+          x - start >= 3
+        ) {
+          groups.push({
+            start,
+            end: x - 1,
+            color: lastColor
+          });
         }
+
+        start = -1;
+        lastColor =
+          "NEUTRAL";
       }
+    }
+
+    if (
+      start !== -1 &&
+      width - start >= 3
+    ) {
+      groups.push({
+        start,
+        end: width - 1,
+        color: lastColor
+      });
+    }
+
+    /* -------- filter realistic candle groups -------- */
+
+    const realistic =
+      groups.filter(g => {
+        const w =
+          g.end - g.start + 1;
+
+        return (
+          w >= 3 &&
+          w <= Math.max(40, width * 0.16)
+        );
+      });
+
+    /*
+      If there are too many tiny pieces, merge close groups.
+    */
+
+    const merged: typeof realistic =
+      [];
+
+    for (const group of realistic) {
+      const previous =
+        merged[merged.length - 1];
 
       if (
-        start !== -1 &&
-        width - start >= 2
+        previous &&
+        group.start -
+          previous.end <= 3 &&
+        group.color ===
+          previous.color
       ) {
-        groups.push({
-          start,
-          end: width - 1
+        previous.end =
+          group.end;
+      } else {
+        merged.push({
+          ...group
         });
       }
+    }
 
-      /*
-        4. Filter groups.
+    const candles: CandleFeature[] =
+      [];
 
-        A normal candle is relatively narrow.
-        Very wide colored regions are usually
-        UI elements or accidental detection.
-      */
-
-      const filteredGroups =
-        groups.filter((group) => {
-          const w =
-            group.end -
-            group.start +
-            1;
-
-          return (
-            w >= 2 &&
-            w <= Math.max(
-              40,
-              Math.floor(width * 0.10)
-            )
+    merged.forEach(
+      (group, index) => {
+        const centerX =
+          Math.floor(
+            (group.start +
+              group.end) /
+              2
           );
-        });
 
-      const candles: DetectedCandle[] = [];
+        let minY = height;
+        let maxY = 0;
 
-      /*
-        5. Build candle geometry.
-      */
-
-      for (
-        const group of filteredGroups
-      ) {
-        const candleWidth =
-          group.end -
-          group.start +
-          1;
-
-        let top =
+        let bodyTop =
           height;
 
-        let bottom = 0;
+        let bodyBottom = 0;
 
-        let greenCount = 0;
-        let redCount = 0;
-
-        const rowOccupancy =
-          new Uint16Array(height);
-
-        const rowGreen =
-          new Uint16Array(height);
-
-        const rowRed =
-          new Uint16Array(height);
+        /*
+          Find vertical candle pixels around center.
+        */
 
         for (
-          let x = group.start;
+          let x =
+            group.start;
           x <= group.end;
           x++
         ) {
@@ -956,2779 +1023,1202 @@ export default function TraderYodhaXEngine() {
             y++
           ) {
             const i =
-              (y * width + x) * 4;
+              (y * width +
+                x) *
+              4;
 
             const r =
-              frameData[i];
+              data[i];
 
             const g =
-              frameData[i + 1];
+              data[i + 1];
 
             const b =
-              frameData[i + 2];
+              data[i + 2];
 
-            const isGreen =
-              g > r + 35 &&
-              g > b + 25 &&
-              g > 80;
-
-            const isRed =
-              r > g + 35 &&
-              r > b + 25 &&
-              r > 80;
+            const c =
+              getPixelColor(
+                r,
+                g,
+                b
+              );
 
             if (
-              isGreen ||
-              isRed
+              c !== "NEUTRAL"
             ) {
-              rowOccupancy[y]++;
+              minY =
+                Math.min(
+                  minY,
+                  y
+                );
 
-              if (isGreen) {
-                greenCount++;
-                rowGreen[y]++;
-              }
-
-              if (isRed) {
-                redCount++;
-                rowRed[y]++;
-              }
-
-              if (y < top)
-                top = y;
-
-              if (y > bottom)
-                bottom = y;
+              maxY =
+                Math.max(
+                  maxY,
+                  y
+                );
             }
           }
         }
 
         if (
-          top >= height ||
-          bottom <= top
+          minY >= height ||
+          maxY <= 0
         ) {
-          continue;
+          return;
         }
 
-        const color: CandleColor =
-          greenCount >
-          redCount * 1.15
-            ? 'GREEN'
-            : redCount >
-              greenCount * 1.15
-            ? 'RED'
-            : 'NEUTRAL';
-
         /*
-          6. Estimate body.
-
-          Body rows occupy a large percentage
-          of candle width.
-
-          Wick rows normally occupy only a small
-          portion of the candle width.
+          Body is estimated from dense horizontal
+          colored pixels.
         */
 
-        const bodyThreshold =
-          Math.max(
-            2,
-            candleWidth * 0.45
-          );
-
-        let bodyTop =
-          bottom;
-
-        let bodyBottom =
-          top;
+        const rowDensity: number[] =
+          [];
 
         for (
-          let y = top;
-          y <= bottom;
+          let y = minY;
+          y <= maxY;
           y++
         ) {
-          if (
-            rowOccupancy[y] >=
-            bodyThreshold
-          ) {
-            bodyTop =
-              Math.min(
-                bodyTop,
-                y
-              );
-
-            bodyBottom =
-              Math.max(
-                bodyBottom,
-                y
-              );
-          }
-        }
-
-        /*
-          If body couldn't be separated,
-          use densest rows.
-        */
-
-        if (
-          bodyBottom <= bodyTop
-        ) {
-          let bestY = top;
-          let bestValue = 0;
+          let count = 0;
 
           for (
-            let y = top;
-            y <= bottom;
-            y++
+            let x =
+              group.start;
+            x <= group.end;
+            x++
           ) {
-            if (
-              rowOccupancy[y] >
-              bestValue
-            ) {
-              bestValue =
-                rowOccupancy[y];
+            const i =
+              (y * width +
+                x) *
+              4;
 
-              bestY = y;
+            const c =
+              getPixelColor(
+                data[i],
+                data[i + 1],
+                data[i + 2]
+              );
+
+            if (
+              c !== "NEUTRAL"
+            ) {
+              count++;
             }
           }
 
-          bodyTop =
-            Math.max(
-              top,
-              bestY - 2
+          rowDensity.push(
+            count
+          );
+        }
+
+        const threshold =
+          Math.max(
+            2,
+            Math.floor(
+              (group.end -
+                group.start +
+                1) *
+                0.35
+            )
+          );
+
+        const denseRows =
+          rowDensity
+            .map(
+              (v, i) =>
+                ({
+                  value: v,
+                  y: minY + i
+                })
+            )
+            .filter(
+              r =>
+                r.value >=
+                threshold
             );
 
+        if (
+          denseRows.length
+        ) {
+          bodyTop =
+            denseRows[0].y;
+
           bodyBottom =
-            Math.min(
-              bottom,
-              bestY + 2
-            );
+            denseRows[
+              denseRows.length -
+                1
+            ].y;
+        } else {
+          bodyTop = minY;
+          bodyBottom = maxY;
         }
 
         const bodySize =
           Math.max(
             1,
             bodyBottom -
-              bodyTop +
-              1
+              bodyTop
+          );
+
+        const upperWick =
+          Math.max(
+            0,
+            bodyTop - minY
+          );
+
+        const lowerWick =
+          Math.max(
+            0,
+            maxY -
+              bodyBottom
           );
 
         const totalRange =
           Math.max(
             1,
-            bottom - top + 1
+            maxY - minY
           );
 
-        const topWick =
-          Math.max(
-            0,
-            bodyTop - top
-          );
+        let type =
+          "NORMAL";
 
-        const bottomWick =
-          Math.max(
-            0,
-            bottom - bodyBottom
-          );
-
-        const bodyClass =
-          classifyBodySize(
-            bodySize,
-            totalRange
-          );
-
-        const topWickClass =
-          classifyWick(
-            topWick,
-            bodySize
-          );
-
-        const bottomWickClass =
-          classifyWick(
-            bottomWick,
-            bodySize
-          );
-
-        const shape =
-          classifyCandleShape(
-            color,
-            bodySize,
-            topWick,
-            bottomWick
-          );
+        if (
+          bodySize <
+          totalRange * 0.15
+        ) {
+          type =
+            "DOJI / INDECISION";
+        } else if (
+          lowerWick >
+            bodySize * 1.8 &&
+          upperWick <
+            bodySize * 0.8
+        ) {
+          type =
+            "HAMMER / LOWER REJECTION";
+        } else if (
+          upperWick >
+            bodySize * 1.8 &&
+          lowerWick <
+            bodySize * 0.8
+        ) {
+          type =
+            "SHOOTING STAR / UPPER REJECTION";
+        } else if (
+          upperWick >
+              bodySize &&
+          lowerWick >
+              bodySize
+        ) {
+          type =
+            "SPINNING TOP";
+        } else if (
+          bodySize >
+            totalRange * 0.70
+        ) {
+          type =
+            "STRONG BODY";
+        }
 
         candles.push({
-          id: 0,
+          number: index + 1,
+
+          color:
+            group.color,
 
           x: group.start,
 
-          width: candleWidth,
+          centerX,
 
-          top,
-          bottom,
+          highY: minY,
 
-          bodyTop,
-          bodyBottom,
+          lowY: maxY,
 
-          highY: top,
-          lowY: bottom,
+          bodyTopY: bodyTop,
 
-          color,
+          bodyBottomY:
+            bodyBottom,
 
           bodySize,
 
-          topWick,
-          bottomWick,
+          upperWick,
+
+          lowerWick,
 
           bodyRatio:
             bodySize /
             totalRange,
 
           upperWickRatio:
-            topWick /
-            Math.max(
-              bodySize,
-              1
-            ),
+            upperWick /
+            totalRange,
 
           lowerWickRatio:
-            bottomWick /
-            Math.max(
-              bodySize,
-              1
-            ),
+            lowerWick /
+            totalRange,
 
-          bodyClass,
-          topWickClass,
-          bottomWickClass,
+          type,
 
-          shape,
-
-          timestamp: Date.now()
+          timestamp:
+            Date.now()
         });
       }
+    );
 
-      /*
-        Remove overlapping candles.
-        Keep the stronger / wider candidate.
-      */
+    return candles;
+  };
 
-      candles.sort(
-        (a, b) =>
-          a.x - b.x
-      );
+  /* =========================================================
+     CANDLE PROFILE
+     ========================================================= */
 
-      const cleanCandles: DetectedCandle[] = [];
+  const getBodyProfile = (
+    candle: CandleFeature
+  ) => {
+    if (
+      candle.bodyRatio >= 0.7
+    )
+      return "LARGE_BODY";
+
+    if (
+      candle.bodyRatio >= 0.45
+    )
+      return "MEDIUM_BODY";
+
+    if (
+      candle.bodyRatio >= 0.2
+    )
+      return "SMALL_BODY";
+
+    return "TINY_BODY";
+  };
+
+  const getWickProfile = (
+    candle: CandleFeature
+  ) => {
+    const upper =
+      candle.upperWickRatio;
+
+    const lower =
+      candle.lowerWickRatio;
+
+    if (
+      upper >
+        candle.bodyRatio * 1.5 &&
+      lower >
+        candle.bodyRatio * 1.5
+    ) {
+      return "BOTH_WICKS";
+    }
+
+    if (
+      upper >
+      candle.bodyRatio * 1.5
+    ) {
+      return "UPPER_REJECTION";
+    }
+
+    if (
+      lower >
+      candle.bodyRatio * 1.5
+    ) {
+      return "LOWER_REJECTION";
+    }
+
+    return "BALANCED";
+  };
+
+  /* =========================================================
+     CANDLE SEQUENCE
+     ========================================================= */
+
+  const makeCandleCode = (
+    candle: CandleFeature
+  ) => {
+    const color =
+      candle.color === "GREEN"
+        ? "G"
+        : candle.color === "RED"
+        ? "R"
+        : "N";
+
+    const body =
+      getBodyProfile(candle);
+
+    const wick =
+      getWickProfile(candle);
+
+    return `${color}-${body}-${wick}`;
+  };
+
+  const makeSequence = (
+    candles: CandleFeature[],
+    count = 5
+  ) => {
+    return candles
+      .slice(-count)
+      .map(makeCandleCode);
+  };
+
+  /* =========================================================
+     PATTERN RECOGNITION
+     ========================================================= */
+
+  const recognizePattern = (
+    candles: CandleFeature[]
+  ) => {
+    if (candles.length < 2) {
+      return "INSUFFICIENT CANDLES";
+    }
+
+    const last =
+      candles[candles.length - 1];
+
+    const prev =
+      candles[candles.length - 2];
+
+    const lastBody =
+      getBodyProfile(last);
+
+    const lastWick =
+      getWickProfile(last);
+
+    /* Hammer */
+    if (
+      last.lowerWick >
+        last.bodySize * 1.8 &&
+      last.upperWick <
+        last.bodySize
+    ) {
+      return "LOWER REJECTION";
+    }
+
+    /* Shooting star */
+    if (
+      last.upperWick >
+        last.bodySize * 1.8 &&
+      last.lowerWick <
+        last.bodySize
+    ) {
+      return "UPPER REJECTION";
+    }
+
+    /* Green after strong red */
+    if (
+      prev.color === "RED" &&
+      last.color === "GREEN" &&
+      last.bodySize >
+        prev.bodySize * 0.7
+    ) {
+      return "BULLISH REVERSAL ATTEMPT";
+    }
+
+    /* Red after strong green */
+    if (
+      prev.color === "GREEN" &&
+      last.color === "RED" &&
+      last.bodySize >
+        prev.bodySize * 0.7
+    ) {
+      return "BEARISH REVERSAL ATTEMPT";
+    }
+
+    /* Same direction momentum */
+    if (
+      prev.color === last.color &&
+      lastBody === "LARGE_BODY"
+    ) {
+      return last.color === "GREEN"
+        ? "BULLISH MOMENTUM"
+        : "BEARISH MOMENTUM";
+    }
+
+    if (
+      lastBody === "TINY_BODY"
+    ) {
+      return "INDECISION";
+    }
+
+    if (
+      lastWick ===
+      "BOTH_WICKS"
+    ) {
+      return "HIGH VOLATILITY / INDECISION";
+    }
+
+    return `${last.color} ${lastBody}`;
+  };
+
+  /* =========================================================
+     MATCH LEARNED PATTERN
+     ========================================================= */
+
+  const findMatchingPattern = (
+    sequence: string[]
+  ) => {
+    const key =
+      sequence.join("|");
+
+    const patterns =
+      brainRef.current.patterns;
+
+    let best:
+      CandlePatternMemory | null =
+      null;
+
+    let bestScore = 0;
+
+    for (const pattern of patterns) {
+      const learned =
+        pattern.sequence.split("|");
+
+      let same = 0;
+
+      const length =
+        Math.min(
+          learned.length,
+          sequence.length
+        );
 
       for (
-        const candle of candles
+        let i = 0;
+        i < length;
+        i++
       ) {
-        const previous =
-          cleanCandles[
-            cleanCandles.length - 1
-          ];
-
-        if (!previous) {
-          cleanCandles.push(
-            candle
-          );
-          continue;
-        }
-
-        const overlap =
-          previous.x +
-            previous.width -
-            candle.x;
-
         if (
-          overlap >
-          Math.min(
-            previous.width,
-            candle.width
-          ) *
-            0.5
+          learned[
+            learned.length -
+              length +
+              i
+          ] ===
+          sequence[
+            sequence.length -
+              length +
+              i
+          ]
         ) {
-          const prevScore =
-            previous.bottom -
-            previous.top;
-
-          const currentScore =
-            candle.bottom -
-            candle.top;
-
-          if (
-            currentScore >
-            prevScore
-          ) {
-            cleanCandles[
-              cleanCandles.length - 1
-            ] = candle;
-          }
-        } else {
-          cleanCandles.push(
-            candle
-          );
+          same++;
         }
       }
 
-      /*
-        Current visible candles are normally
-        left -> right.
-      */
+      const score =
+        length
+          ? same / length
+          : 0;
 
-      return {
-        greenPixels,
-        redPixels,
+      if (
+        score > bestScore &&
+        score >= 0.60
+      ) {
+        bestScore = score;
+        best = pattern;
+      }
+    }
 
-        candles:
-          cleanCandles,
+    return best;
+  };
 
-        actualBodySize:
-          cleanCandles.length
-            ? cleanCandles[
-                cleanCandles.length -
-                  1
-              ].bodySize
-            : 0,
+  /* =========================================================
+     ZIGZAG
+     ========================================================= */
 
-        actualTopWickSize:
-          cleanCandles.length
-            ? cleanCandles[
-                cleanCandles.length -
-                  1
-              ].topWick
-            : 0,
+  const updateZigZag = (
+    candles: CandleFeature[]
+  ) => {
+    if (
+      candles.length < 3
+    )
+      return;
 
-        actualBottomWickSize:
-          cleanCandles.length
-            ? cleanCandles[
-                cleanCandles.length -
-                  1
-              ].bottomWick
-            : 0
-      };
-    };
+    const last =
+      candles[
+        candles.length - 1
+      ];
 
-  /* =======================================================
-     CANDLE NUMBERING + MEMORY
-     ======================================================= */
+    const prev =
+      candles[
+        candles.length - 2
+      ];
 
-  const makeCandleSignature =
-    (
-      candle: DetectedCandle
-    ) => {
-      return [
-        candle.color,
-        Math.round(candle.x / 4),
-        Math.round(
-          candle.top / 4
-        ),
-        Math.round(
-          candle.bottom / 4
-        ),
-        candle.shape
-      ].join('|');
-    };
+    const prev2 =
+      candles[
+        candles.length - 3
+      ];
 
-  const mergeDetectedCandlesIntoHistory =
-    useCallback(
-      (
-        detected: DetectedCandle[]
-      ) => {
-        if (!detected.length)
-          return;
+    /*
+      Local high
+    */
 
-        const sorted =
-          [...detected].sort(
-            (a, b) =>
-              a.x - b.x
-          );
+    if (
+      prev.highY <
+        prev2.highY &&
+      prev.highY <
+        last.highY
+    ) {
+      addZigZag(
+        prev,
+        "HIGH"
+      );
+    }
 
-        /*
-          Use right-most candle as the
-          currently forming/latest candle.
-        */
+    /*
+      Local low
+    */
 
-        for (
-          const detectedCandle of sorted
-        ) {
-          const signature =
-            makeCandleSignature(
-              detectedCandle
-            );
+    if (
+      prev.lowY >
+        prev2.lowY &&
+      prev.lowY >
+        last.lowY
+    ) {
+      addZigZag(
+        prev,
+        "LOW"
+      );
+    }
+  };
 
-          /*
-            Same frame / same candle.
-          */
+  const addZigZag = (
+    candle: CandleFeature,
+    type: "HIGH" | "LOW"
+  ) => {
+    /*
+      Without reliable OCR price for every candle,
+      use candle geometry as temporary level ID.
+    */
 
-          if (
-            signature ===
-            lastCandleSignatureRef.current
-          ) {
-            continue;
-          }
+    const levelValue =
+      type === "HIGH"
+        ? candle.highY
+        : candle.lowY;
 
-          /*
-            Match by approximate X.
-          */
+    const existing =
+      brainRef.current.zigzagLevels.find(
+        z =>
+          z.type === type &&
+          Math.abs(
+            z.price -
+              levelValue
+          ) < 5
+      );
 
-          const existing =
-            candleHistoryRef.current.find(
-              c =>
-                Math.abs(
-                  c.x -
-                    detectedCandle.x
-                ) < 8
-            );
-
-          if (existing) {
-            /*
-              Update the existing candle.
-              This is important because the latest
-              candle changes while it is forming.
-            */
-
-            existing.color =
-              detectedCandle.color;
-
-            existing.top =
-              Math.min(
-                existing.top,
-                detectedCandle.top
-              );
-
-            existing.bottom =
-              Math.max(
-                existing.bottom,
-                detectedCandle.bottom
-              );
-
-            existing.bodyTop =
-              detectedCandle.bodyTop;
-
-            existing.bodyBottom =
-              detectedCandle.bodyBottom;
-
-            existing.bodySize =
-              detectedCandle.bodySize;
-
-            existing.topWick =
-              detectedCandle.topWick;
-
-            existing.bottomWick =
-              detectedCandle.bottomWick;
-
-            existing.bodyClass =
-              detectedCandle.bodyClass;
-
-            existing.topWickClass =
-              detectedCandle.topWickClass;
-
-            existing.bottomWickClass =
-              detectedCandle.bottomWickClass;
-
-            existing.shape =
-              detectedCandle.shape;
-
-            existing.timestamp =
-              Date.now();
-
-            continue;
-          }
-
-          /*
-            New candle.
-          */
-
-          const newCandle: DetectedCandle =
-            {
-              ...detectedCandle,
-
-              id:
-                nextCandleIdRef.current++
-            };
-
-          candleHistoryRef.current.push(
-            newCandle
-          );
+    if (existing) {
+      existing.occurrences++;
+      existing.timestamp =
+        Date.now();
+    } else {
+      brainRef.current.zigzagLevels.push(
+        {
+          price: levelValue,
+          type,
+          occurrences: 1,
+          timestamp:
+            Date.now()
         }
+      );
+    }
 
-        /*
-          Keep only recent memory.
-        */
+    if (
+      brainRef.current
+        .zigzagLevels.length >
+      100
+    ) {
+      brainRef.current.zigzagLevels =
+        brainRef.current.zigzagLevels.slice(
+          -100
+        );
+    }
+  };
 
-        if (
-          candleHistoryRef.current.length >
-          MAX_CANDLE_HISTORY
-        ) {
-          candleHistoryRef.current =
-            candleHistoryRef.current.slice(
-              -MAX_CANDLE_HISTORY
-            );
-        }
+  /* =========================================================
+     DRAW CANDLE NUMBERS
+     ========================================================= */
 
-        lastCandleSignatureRef.current =
-          makeCandleSignature(
-            sorted[
-              sorted.length - 1
-            ]
-          );
+  const drawCandleOverlay = (
+    candles: CandleFeature[]
+  ) => {
+    const overlay =
+      overlayCanvasRef.current;
 
-        updateBrainStats();
-      },
-      [updateBrainStats]
+    const container =
+      videoContainerRef.current;
+
+    const video =
+      videoRef.current;
+
+    if (
+      !overlay ||
+      !container ||
+      !video
+    ) {
+      return;
+    }
+
+    const cw =
+      container.clientWidth;
+
+    const ch =
+      container.clientHeight;
+
+    overlay.width = cw;
+    overlay.height = ch;
+
+    const ctx =
+      overlay.getContext("2d");
+
+    if (!ctx) return;
+
+    ctx.clearRect(
+      0,
+      0,
+      cw,
+      ch
     );
 
-  /* =======================================================
-     CANDLE TOKEN
-     ======================================================= */
+    if (
+      !candles.length
+    )
+      return;
 
-  const candleToToken =
-    (
-      candle: DetectedCandle
-    ): string => {
-      return [
-        candle.color === 'GREEN'
-          ? 'G'
-          : candle.color === 'RED'
-          ? 'R'
-          : 'N',
+    /*
+      The candle coordinates are inside ROI.
+      Convert ROI coordinates to displayed coordinates.
+    */
 
-        candle.shape,
+    const sx =
+      roi.width /
+      video.videoWidth;
 
-        candle.bodyClass,
+    const sy =
+      roi.height /
+      video.videoHeight;
 
-        `U${candle.topWickClass}`,
+    /*
+      candles are ROI image coordinates.
+      Need normalize based on ROI canvas dimensions.
+      */
 
-        `L${candle.bottomWickClass}`
-      ].join('_');
-    };
-
-  /*
-    Short readable token.
-    Used for UI / pattern matching.
-  */
-
-  const candleToShortToken =
-    (
-      candle: DetectedCandle
-    ): string => {
-      const color =
-        candle.color === 'GREEN'
-          ? 'G'
-          : candle.color === 'RED'
-          ? 'R'
-          : 'N';
-
-      return `${color}-${candle.shape}`;
-    };
-
-  /* =======================================================
-     PATTERN DISCOVERY
-     ======================================================= */
-
-  const getRecentCandleSequence =
-    (
-      length = PATTERN_SEQUENCE_LENGTH
-    ): DetectedCandle[] => {
-      return candleHistoryRef.current.slice(
-        -length
+    const videoROIWidth =
+      Math.max(
+        1,
+        video.videoWidth *
+          (roi.width /
+            cw)
       );
-    };
 
-  const buildSequenceKey =
-    (
-      candles: DetectedCandle[]
-    ): string => {
-      return candles
-        .map(
-          candleToToken
+    const videoROIHeight =
+      Math.max(
+        1,
+        video.videoHeight *
+          (roi.height /
+            ch)
+      );
+
+    /*
+      Better direct mapping from detected ROI
+      to visible ROI.
+    */
+
+    const ratioX =
+      roi.width /
+      Math.max(
+        1,
+        candles.reduce(
+          (m, c) =>
+            Math.max(
+              m,
+              c.centerX
+            ),
+          1
         )
-        .join('>');
-    };
+      );
 
-  /*
-    Learn:
+    void sx;
+    void sy;
+    void videoROIWidth;
+    void videoROIHeight;
+    void ratioX;
 
-    A B C D E
-          ↓
-       next candle
+    candles.forEach(
+      candle => {
+        const x =
+          roi.x +
+          (candle.centerX /
+            Math.max(
+              1,
+              video.videoWidth
+            )) *
+            roi.width;
 
-    We store what the next candle became.
-  */
+        /*
+          Because ROI image width is proportional
+          to source video ROI, this approximation
+          keeps labels aligned on normal object-fit.
+        */
 
-  const learnNextCandlePattern =
+        const y =
+          roi.y +
+          (candle.highY /
+            Math.max(
+              1,
+              video.videoHeight
+            )) *
+            roi.height;
+
+        const isGreen =
+          candle.color ===
+          "GREEN";
+
+        ctx.font =
+          "bold 13px Arial";
+
+        ctx.textAlign =
+          "center";
+
+        ctx.fillStyle =
+          isGreen
+            ? "#22c55e"
+            : candle.color ===
+              "RED"
+            ? "#ef4444"
+            : "#facc15";
+
+        ctx.fillText(
+          String(candle.number),
+          x,
+          Math.max(
+            16,
+            y - 5
+          )
+        );
+      }
+    );
+  };
+
+  /* =========================================================
+     ANALYZE CURRENT FRAME
+     ========================================================= */
+
+  const analyzeCurrentFrame =
     useCallback(
-      (
-        sequenceBeforeNext: DetectedCandle[],
-        nextCandle: DetectedCandle
+      async (
+        fullAnalysis = false
       ) => {
-        if (
-          sequenceBeforeNext.length <
-          PATTERN_SEQUENCE_LENGTH
-        ) {
-          return;
-        }
+        const captured =
+          captureROI();
 
-        const sequence =
-          sequenceBeforeNext.slice(
-            -PATTERN_SEQUENCE_LENGTH
+        if (!captured) {
+          setStatus(
+            "Waiting for chart video..."
           );
 
-        const sequenceKey =
-          buildSequenceKey(
+          return null;
+        }
+
+        const {
+          imageData,
+          ctx
+        } = captured;
+
+        const candles =
+          detectCandles(
+            imageData.data,
+            imageData.width,
+            imageData.height
+          );
+
+        setDetectedCandles(
+          candles
+        );
+
+        drawCandleOverlay(
+          candles
+        );
+
+        if (
+          candles.length <
+          2
+        ) {
+          setStatus(
+            "ROI me candles clearly detect nahi ho rahi. ROI ko candles ke upar rakho."
+          );
+
+          return null;
+        }
+
+        updateZigZag(
+          candles
+        );
+
+        const sequence =
+          makeSequence(
+            candles,
+            5
+          );
+
+        const patternName =
+          recognizePattern(
+            candles
+          );
+
+        const last =
+          candles[
+            candles.length - 1
+          ];
+
+        const matchedPattern =
+          findMatchingPattern(
             sequence
           );
 
-        let memory =
-          brainRef.current.candlePatterns.find(
-            p =>
-              p.sequenceKey ===
-              sequenceKey
+        const dominantColor =
+          last.color;
+
+        const bodyProfile =
+          getBodyProfile(
+            last
           );
 
-        if (!memory) {
-          memory = {
-            id:
-              `CP_${Date.now()}_${Math.random()
-                .toString(36)
-                .slice(2, 8)}`,
+        const wickProfile =
+          getWickProfile(
+            last
+          );
 
-            sequenceKey,
+        /*
+          OCR is used only during deep analysis,
+          NOT every 500ms.
+        */
 
-            sequenceLength:
-              sequence.length,
+        let price = 0;
 
-            nextGreen: 0,
-            nextRed: 0,
-            nextNeutral: 0,
+        if (fullAnalysis) {
+          price =
+            await readPrice(
+              ctx
+            );
+        }
 
-            wins: 0,
-            losses: 0,
+        const round =
+          isRoundNumber(
+            price
+          );
 
-            occurrences: 0,
+        /*
+          Base confidence comes from visual agreement,
+          not fake 90% confidence.
+        */
 
-            confidence: 0,
+        let score = 50;
 
-            lastSeen:
-              Date.now(),
+        if (
+          dominantColor !==
+          "NEUTRAL"
+        ) {
+          score += 10;
+        }
 
-            description:
-              sequence
-                .map(
-                  candleToShortToken
-                )
-                .join(' → ')
+        if (
+          patternName.includes(
+            "REVERSAL"
+          ) ||
+          patternName.includes(
+            "REJECTION"
+          )
+        ) {
+          score += 12;
+        }
+
+        if (
+          matchedPattern
+        ) {
+          score +=
+            Math.min(
+              20,
+              matchedPattern.confidence *
+                0.20
+            );
+        }
+
+        if (
+          round
+        ) {
+          score += 5;
+        }
+
+        score =
+          Math.min(
+            95,
+            Math.max(
+              0,
+              score
+            )
+          );
+
+        const analysis: LiveAnalysis =
+          {
+            candles,
+            sequence,
+            patternName,
+            bodyProfile,
+            wickProfile,
+            dominantColor,
+            strength: score,
+            priceLevel: price,
+            isRoundNumber: round,
+            matchedPattern,
+            matchedZigZag:
+              null,
+            timestamp:
+              Date.now()
           };
 
-          brainRef.current.candlePatterns.push(
-            memory
-          );
-        }
+        /*
+          Decide direction from candle structure.
+        */
 
-        memory.occurrences++;
+        let proposed:
+          Signal =
+          "WAIT";
 
         if (
-          nextCandle.color ===
-          'GREEN'
+          patternName ===
+          "LOWER REJECTION"
         ) {
-          memory.nextGreen++;
+          proposed =
+            "CALL";
         } else if (
-          nextCandle.color ===
-          'RED'
+          patternName ===
+          "UPPER REJECTION"
         ) {
-          memory.nextRed++;
-        } else {
-          memory.nextNeutral++;
+          proposed =
+            "PUT";
+        } else if (
+          patternName.includes(
+            "BULLISH"
+          ) ||
+          patternName.includes(
+            "BULLISH MOMENTUM"
+          )
+        ) {
+          proposed =
+            "CALL";
+        } else if (
+          patternName.includes(
+            "BEARISH"
+          ) ||
+          patternName.includes(
+            "BEARISH MOMENTUM"
+          )
+        ) {
+          proposed =
+            "PUT";
+        } else if (
+          dominantColor ===
+          "GREEN"
+        ) {
+          proposed =
+            "CALL";
+        } else if (
+          dominantColor ===
+          "RED"
+        ) {
+          proposed =
+            "PUT";
         }
 
-        memory.lastSeen =
-          Date.now();
-
-        const total =
-          memory.nextGreen +
-          memory.nextRed +
-          memory.nextNeutral;
-
-        const maxCount =
-          Math.max(
-            memory.nextGreen,
-            memory.nextRed,
-            memory.nextNeutral
-          );
-
-        memory.confidence =
-          total > 0
-            ? (maxCount / total) *
-              100
-            : 0;
-
         /*
-          Prevent unlimited growth.
+          If learned pattern has history,
+          let historical result influence direction.
         */
 
         if (
-          brainRef.current.candlePatterns
-            .length > 5000
-        ) {
-          brainRef.current.candlePatterns =
-            brainRef.current.candlePatterns.slice(
-              -5000
-            );
-        }
-      },
-      []
-    );
-
-  /*
-    Run pattern learning when a new candle appears.
-  */
-
-  const learnFromCandleHistory =
-    useCallback(() => {
-      const history =
-        candleHistoryRef.current;
-
-      if (
-        history.length <
-        PATTERN_SEQUENCE_LENGTH + 1
-      ) {
-        return;
-      }
-
-      /*
-        Learn the most recent completed transition.
-      */
-
-      const nextCandle =
-        history[
-          history.length - 1
-        ];
-
-      const sequence =
-        history.slice(
-          -(
-            PATTERN_SEQUENCE_LENGTH +
-            1
-          ),
-          -1
-        );
-
-      learnNextCandlePattern(
-        sequence,
-        nextCandle
-      );
-
-      updateBrainStats();
-    }, [
-      learnNextCandlePattern,
-      updateBrainStats
-    ]);
-
-  /* =======================================================
-     MATCH CANDLE PATTERN
-     ======================================================= */
-
-  const findMatchingCandlePattern =
-    (
-      candles: DetectedCandle[]
-    ): CandlePatternMemory | null => {
-      if (
-        candles.length <
-        PATTERN_SEQUENCE_LENGTH
-      ) {
-        return null;
-      }
-
-      const sequence =
-        candles.slice(
-          -PATTERN_SEQUENCE_LENGTH
-        );
-
-      const key =
-        buildSequenceKey(
-          sequence
-        );
-
-      const exact =
-        brainRef.current.candlePatterns.find(
-          p =>
-            p.sequenceKey ===
-            key
-        );
-
-      if (exact) {
-        return exact;
-      }
-
-      /*
-        Fallback:
-        match color + shape only.
-
-        This makes the memory slightly more
-        tolerant to small visual differences.
-      */
-
-      const shortKey =
-        sequence
-          .map(
-            candleToShortToken
-          )
-          .join('>');
-
-      let best:
-        CandlePatternMemory | null =
-        null;
-
-      let bestScore = 0;
-
-      for (
-        const memory of
-          brainRef.current
-            .candlePatterns
-      ) {
-        const memoryShort =
-          memory.description;
-
-        const parts =
-          memoryShort.split(
-            ' → '
-          );
-
-        const target =
-          shortKey.split('>');
-
-        if (
-          parts.length !==
-          target.length
-        ) {
-          continue;
-        }
-
-        let matches = 0;
-
-        for (
-          let i = 0;
-          i < target.length;
-          i++
+          matchedPattern
         ) {
           if (
-            parts[i] ===
-            target[i]
+            matchedPattern.result ===
+            "WIN"
           ) {
-            matches++;
+            proposed =
+              matchedPattern.direction ===
+              "UP"
+                ? "CALL"
+                : matchedPattern.direction ===
+                  "DOWN"
+                ? "PUT"
+                : proposed;
           }
         }
 
-        const score =
-          matches /
-          target.length;
+        lastSignalRef.current =
+          analysis;
+
+        pendingSignalRef.current =
+          proposed;
+
+        setCurrentAnalysis(
+          analysis
+        );
 
         if (
-          score >
-            bestScore &&
-          score >= 0.60
+          fullAnalysis
         ) {
-          bestScore = score;
-          best = memory;
-        }
-      }
-
-      return best;
-    };
-
-  /* =======================================================
-     DRAW CANDLE NUMBERS
-     ======================================================= */
-
-  const drawCandleOverlays =
-    useCallback(
-      (
-        candles: DetectedCandle[]
-      ) => {
-        if (
-          !overlayCanvasRef.current ||
-          !videoRef.current ||
-          !videoContainerRef.current
-        ) {
-          return;
-        }
-
-        const canvas =
-          overlayCanvasRef.current;
-
-        const container =
-          videoContainerRef.current;
-
-        const width =
-          container.clientWidth ||
-          800;
-
-        const height =
-          container.clientHeight ||
-          450;
-
-        canvas.width =
-          width;
-
-        canvas.height =
-          height;
-
-        const ctx =
-          canvas.getContext(
-            '2d'
+          setStatus(
+            `46s analysis complete | ${candles.length} candles | ${patternName} | ${proposed}`
           );
+        }
 
-        if (!ctx) return;
-
-        ctx.clearRect(
-          0,
-          0,
-          width,
-          height
-        );
-
-        const videoWidth =
-          videoRef.current
-            .videoWidth ||
-          width;
-
-        const videoHeight =
-          videoRef.current
-            .videoHeight ||
-          height;
-
-        /*
-          ROI coordinates are in video space.
-          Convert detected ROI pixels to displayed
-          container coordinates.
-        */
-
-        const roi =
-          getScaledROI();
-
-        const roiDisplayScaleX =
-          roi.width > 0
-            ? roiBox.width /
-              roi.width
-            : 1;
-
-        const roiDisplayScaleY =
-          roi.height > 0
-            ? roiBox.height /
-              roi.height
-            : 1;
-
-        candles.forEach(
-          (candle) => {
-            /*
-              Candle x/y is relative to ROI.
-            */
-
-            const displayX =
-              roiBox.x +
-              candle.x *
-                roiDisplayScaleX;
-
-            const displayWidth =
-              Math.max(
-                3,
-                candle.width *
-                  roiDisplayScaleX
-              );
-
-            const displayTop =
-              roiBox.y +
-              candle.top *
-                roiDisplayScaleY;
-
-            const displayBottom =
-              roiBox.y +
-              candle.bottom *
-                roiDisplayScaleY;
-
-            /*
-              Candle outline.
-            */
-
-            ctx.save();
-
-            ctx.lineWidth = 1.5;
-
-            ctx.setLineDash([
-              3,
-              3
-            ]);
-
-            ctx.strokeStyle =
-              candle.color ===
-              'GREEN'
-                ? '#22c55e'
-                : candle.color ===
-                  'RED'
-                ? '#ef4444'
-                : '#94a3b8';
-
-            ctx.strokeRect(
-              displayX,
-              displayTop,
-              displayWidth,
-              Math.max(
-                5,
-                displayBottom -
-                  displayTop
-              )
-            );
-
-            ctx.setLineDash([]);
-
-            /*
-              Number above candle.
-            */
-
-            const numberX =
-              displayX +
-              displayWidth / 2;
-
-            const numberY =
-              Math.max(
-                16,
-                displayTop - 5
-              );
-
-            ctx.font =
-              'bold 13px monospace';
-
-            ctx.textAlign =
-              'center';
-
-            ctx.textBaseline =
-              'bottom';
-
-            ctx.fillStyle =
-              candle.color ===
-              'GREEN'
-                ? '#84cc16'
-                : candle.color ===
-                  'RED'
-                ? '#f43f5e'
-                : '#cbd5e1';
-
-            ctx.fillText(
-              String(candle.id),
-              numberX,
-              numberY
-            );
-
-            /*
-              Small body/wick information
-              on latest candles only.
-            */
-
-            if (
-              candle.id >=
-              Math.max(
-                1,
-                nextCandleIdRef.current -
-                  5
-              )
-            ) {
-              ctx.font =
-                '9px monospace';
-
-              ctx.fillText(
-                `${candle.shape}`,
-                numberX,
-                Math.min(
-                  height - 5,
-                  displayBottom +
-                    13
-                )
-              );
-            }
-
-            ctx.restore();
-          }
-        );
-
-        /*
-          Draw a small legend.
-        */
-
-        ctx.save();
-
-        ctx.font =
-          'bold 10px monospace';
-
-        ctx.textAlign =
-          'left';
-
-        ctx.fillStyle =
-          '#67e8f9';
-
-        ctx.fillText(
-          `CANDLES DETECTED: ${candleHistoryRef.current.length}`,
-          10,
-          18
-        );
-
-        ctx.restore();
+        return {
+          analysis,
+          proposed
+        };
       },
       [
-        getScaledROI,
-        roiBox,
-        nextCandleIdRef
+        captureROI,
+        drawCandleOverlay,
+        updateZigZag
       ]
     );
 
-  /* =======================================================
-     ZIGZAG OVERLAY
-     ======================================================= */
+  /* =========================================================
+     CONTINUOUS CANDLE MONITOR
+     ========================================================= */
 
-  const drawZigZagOverlays =
+  const startLearning =
     useCallback(() => {
+      if (
+        learningTimerRef.current
+      ) {
+        clearInterval(
+          learningTimerRef.current
+        );
+      }
+
       /*
-        Candle drawing is handled separately.
-        This function now only draws historical
-        ZigZag levels.
+        1000ms instead of 500ms.
+        OCR is NOT called here.
       */
 
-      if (
-        !overlayCanvasRef.current ||
-        !videoRef.current
-      ) {
-        return;
-      }
-
-      const canvas =
-        overlayCanvasRef.current;
-
-      const ctx =
-        canvas.getContext(
-          '2d'
-        );
-
-      if (!ctx) return;
-
-      const levels =
-        brainRef.current
-          .zigzagLevels;
-
-      if (!levels.length)
-        return;
-
-      levels
-        .slice(-5)
-        .forEach(
-          (level) => {
-            const y =
-              level.screenY ||
-              Math.floor(
-                canvas.height *
-                  0.4
-              );
-
-            ctx.save();
-
-            ctx.beginPath();
-
-            ctx.setLineDash([
-              6,
-              6
-            ]);
-
-            ctx.strokeStyle =
-              level.type ===
-              'HIGH'
-                ? '#f43f5e'
-                : '#10b981';
-
-            ctx.lineWidth = 1.5;
-
-            ctx.moveTo(
-              0,
-              y
-            );
-
-            ctx.lineTo(
-              canvas.width,
-              y
-            );
-
-            ctx.stroke();
-
-            ctx.setLineDash([]);
-
-            ctx.fillStyle =
-              level.type ===
-              'HIGH'
-                ? '#f43f5e'
-                : '#10b981';
-
-            ctx.font =
-              'bold 11px monospace';
-
-            ctx.fillText(
-              `ZIGZAG ${level.type}: ${level.price.toFixed(
-                5
-              )}`,
-              10,
-              Math.max(
-                14,
-                y - 5
-              )
-            );
-
-            ctx.restore();
-          }
-        );
-    },
-    []
-  );
-
-  /* =======================================================
-     ZIGZAG LOGIC
-     ======================================================= */
-
-  const processZigZagLogic =
-    useCallback(
-      (currentPrice: number) => {
-        const history =
-          priceHistoryRef.current;
-
-        history.push({
-          price: currentPrice,
-          time: Date.now()
-        });
-
-        if (
-          history.length > 50
-        ) {
-          history.shift();
-        }
-
-        if (
-          history.length < 10
-        ) {
-          return;
-        }
-
-        const prices =
-          history.map(
-            h => h.price
-          );
-
-        const maxPrice =
-          Math.max(
-            ...prices
-          );
-
-        const minPrice =
-          Math.min(
-            ...prices
-          );
-
-        const lastIndex =
-          history.length - 1;
-
-        let detectedPeak:
-          | 'HIGH'
-          | 'LOW'
-          | null = null;
-
-        let peakPrice = 0;
-
-        if (
-          history[lastIndex]
-            .price ===
-            maxPrice &&
-          maxPrice -
-            history[0]
-              .price >
-            0.00030
-        ) {
-          detectedPeak =
-            'HIGH';
-
-          peakPrice =
-            maxPrice;
-        } else if (
-          history[lastIndex]
-            .price ===
-            minPrice &&
-          history[0]
-            .price -
-            minPrice >
-            0.00030
-        ) {
-          detectedPeak =
-            'LOW';
-
-          peakPrice =
-            minPrice;
-        }
-
-        if (!detectedPeak)
-          return;
-
-        const brain =
-          brainRef.current;
-
-        const existingLevel =
-          brain.zigzagLevels.find(
-            zl =>
-              Math.abs(
-                zl.price -
-                  peakPrice
-              ) <
-              0.00020
-          );
-
-        if (existingLevel) {
-          existingLevel.occurrences++;
-
-          existingLevel.timestamp =
-            Date.now();
-        } else {
-          brain.zigzagLevels.push(
-            {
-              price:
-                peakPrice,
-
-              type:
-                detectedPeak,
-
-              occurrences: 1,
-
-              timestamp:
-                Date.now(),
-
-              /*
-                No random Y now.
-                It will be updated only if
-                a reliable screen mapping is available.
-              */
-              screenY:
-                undefined
-            }
-          );
-        }
-
-        updateBrainStats();
-      },
-      [updateBrainStats]
-    );
-
-  /* =======================================================
-     MAGIC NUMBER
-     ======================================================= */
-
-  const detectMagicNumber =
-    useCallback(
-      (
-        currentPrice: number,
-        currentColor: CandleColor,
-        lastPrice: number,
-        lastColor: CandleColor
-      ) => {
-        if (
-          lastColor ===
-            currentColor ||
-          currentColor ===
-            'NEUTRAL' ||
-          lastColor ===
-            'NEUTRAL'
-        ) {
-          return;
-        }
-
-        const isRound =
-          checkIsRoundNumber(
-            currentPrice
-          );
-
-        const priceRange =
-          getPriceRange(
-            currentPrice
-          );
-
-        const direction =
-          lastColor === 'GREEN'
-            ? 'GREEN_TO_RED'
-            : 'RED_TO_GREEN';
-
-        const existing =
-          brainRef.current.magicNumbers.find(
-            mn =>
-              Math.abs(
-                mn.priceLevel -
-                  currentPrice
-              ) <
-                0.0003 &&
-              mn.priceRange ===
-                priceRange
-          );
-
-        if (existing) {
-          existing.occurrences++;
-
-          existing.lastSeen =
-            Date.now();
-
-          existing.isRoundNumber =
-            isRound;
-        } else {
-          brainRef.current.magicNumbers.push(
-            {
-              priceLevel:
-                currentPrice,
-
-              isRoundNumber:
-                isRound,
-
-              priceRange,
-
-              direction,
-
-              occurrences: 1,
-
-              successRate: 50,
-
-              lastSeen:
-                Date.now()
-            }
-          );
-        }
-      },
-      []
-    );
-
-  /* =======================================================
-     TIME ALGORITHM
-     ======================================================= */
-
-  const trackTimeAlgorithm =
-    useCallback(
-      (
-        currentMinute: number,
-        currentSecond: number,
-        color: CandleColor
-      ) => {
-        const brain =
-          brainRef.current;
-
-        const now =
-          new Date();
-
-        /*
-          Store minute + second bucket.
-          Exact hour:minute:second is too sparse.
-        */
-
-        const timeKey24H =
-          `${String(
-            now.getHours()
-          ).padStart(
-            2,
-            '0'
-          )}:${String(
-            currentMinute
-          ).padStart(
-            2,
-            '0'
-          )}:${String(
-            Math.floor(
-              currentSecond /
-                5
-            ) * 5
-          ).padStart(
-            2,
-            '0'
-          )}`;
-
-        let timeAlgo =
-          brain.timeAlgorithms.find(
-            ta =>
-              ta.timeKey24H ===
-              timeKey24H
-          );
-
-        const direction =
-          color === 'GREEN'
-            ? 'UP'
-            : color === 'RED'
-            ? 'DOWN'
-            : 'NEUTRAL';
-
-        if (!timeAlgo) {
-          timeAlgo = {
-            timeKey24H,
-
-            minuteMarker:
-              currentMinute,
-
-            secondMarker:
-              Math.floor(
-                currentSecond /
-                  5
-              ) * 5,
-
-            direction,
-
-            frequency: 1,
-
-            successRate: 50,
-
-            lastOccurrences: [
-              Date.now()
-            ]
-          };
-
-          brain.timeAlgorithms.push(
-            timeAlgo
-          );
-        } else {
-          timeAlgo.frequency++;
-
-          timeAlgo.lastOccurrences.push(
-            Date.now()
-          );
-
+      learningTimerRef.current =
+        setInterval(() => {
           if (
-            timeAlgo.lastOccurrences
-              .length > 30
+            !isStreamActive
           ) {
-            timeAlgo.lastOccurrences =
-              timeAlgo.lastOccurrences.slice(
-                -30
-              );
+            return;
           }
-        }
 
-        updateBrainStats();
-      },
-      [updateBrainStats]
-    );
+          analyzeCurrentFrame(
+            false
+          ).catch(error => {
+            console.error(
+              "Frame analysis:",
+              error
+            );
+          });
+        }, 1000);
+    }, [
+      isStreamActive,
+      analyzeCurrentFrame
+    ]);
 
-  /* =======================================================
-     ROI
-     ======================================================= */
+  useEffect(() => {
+    if (
+      isStreamActive
+    ) {
+      startLearning();
+    }
 
-  const getScaledROI =
-    useCallback(() => {
+    return () => {
       if (
-        !videoRef.current ||
-        !videoContainerRef.current
+        learningTimerRef.current
       ) {
-        return roiBox;
+        clearInterval(
+          learningTimerRef.current
+        );
+
+        learningTimerRef.current =
+          null;
       }
+    };
+  }, [
+    isStreamActive,
+    startLearning
+  ]);
 
-      const containerWidth =
-        videoContainerRef.current
-          .clientWidth ||
-        800;
+  /* =========================================================
+     46 SECOND DEEP ANALYSIS
+     ========================================================= */
 
-      const containerHeight =
-        videoContainerRef.current
-          .clientHeight ||
-        450;
-
-      const actualWidth =
-        videoRef.current
-          .videoWidth ||
-        containerWidth;
-
-      const actualHeight =
-        videoRef.current
-          .videoHeight ||
-        containerHeight;
-
-      const scaleX =
-        actualWidth /
-        containerWidth;
-
-      const scaleY =
-        actualHeight /
-        containerHeight;
-
-      return {
-        x: Math.max(
-          0,
-          Math.floor(
-            roiBox.x *
-              scaleX
-          )
-        ),
-
-        y: Math.max(
-          0,
-          Math.floor(
-            roiBox.y *
-              scaleY
-          )
-        ),
-
-        width: Math.min(
-          actualWidth,
-          Math.floor(
-            roiBox.width *
-              scaleX
-          )
-        ),
-
-        height: Math.min(
-          actualHeight,
-          Math.floor(
-            roiBox.height *
-              scaleY
-          )
-        )
-      };
-    }, [roiBox]);
-
-  /* =======================================================
-     OCR PRICE
-     ======================================================= */
-
-  const extractPriceLevelWithOCR =
-    async (
-      ctx: CanvasRenderingContext2D
-    ): Promise<number> => {
+  const run46SecondAnalysis =
+    useCallback(async () => {
       if (
-        !ocrWorkerRef.current ||
-        !ocrCanvasRef.current
+        !isStreamActive ||
+        isAnalyzing
       ) {
-        return (
-          lastPriceRef.current ||
-          0
-        );
+        return;
       }
 
-      const ocrCtx =
-        ocrCanvasRef.current.getContext(
-          '2d'
-        );
+      setIsAnalyzing(true);
 
-      if (!ocrCtx) {
-        return (
-          lastPriceRef.current ||
-          0
-        );
-      }
-
-      const targetROI =
-        getScaledROI();
-
-      ocrCanvasRef.current.width =
-        Math.max(
-          1,
-          targetROI.width
-        );
-
-      ocrCanvasRef.current.height =
-        Math.max(
-          1,
-          targetROI.height
-        );
-
-      ocrCtx.drawImage(
-        ctx.canvas,
-
-        targetROI.x,
-        targetROI.y,
-
-        targetROI.width,
-        targetROI.height,
-
-        0,
-        0,
-
-        targetROI.width,
-        targetROI.height
+      setStatus(
+        "🔎 46-second deep candle analysis..."
       );
 
       try {
         const result =
-          await ocrWorkerRef.current.recognize(
-            ocrCanvasRef.current
+          await analyzeCurrentFrame(
+            true
           );
 
-        const text =
-          result?.data?.text ||
-          '';
-
-        const matches =
-          text.match(
-            /\d+\.\d{2,5}/g
-          );
-
-        if (matches?.length) {
-          /*
-            Prefer the largest plausible numeric
-            price candidate.
-          */
-
-          const candidates =
-            matches
-              .map(
-                v =>
-                  parseFloat(v)
-              )
-              .filter(
-                v =>
-                  Number.isFinite(
-                    v
-                  ) &&
-                  v > 0
-              );
-
-          if (
-            candidates.length
-          ) {
-            const parsedPrice =
-              candidates[
-                candidates.length -
-                  1
-              ];
-
-            const isRound =
-              checkIsRoundNumber(
-                parsedPrice
-              );
-
-            setOcrPriceText(
-              `${parsedPrice.toFixed(
-                5
-              )} ${
-                isRound
-                  ? '🎯 [ROUND SNR]'
-                  : ''
-              }`
-            );
-
-            setIsRealRoundNumber(
-              isRound
-            );
-
-            return parsedPrice;
-          }
-        }
-      } catch (e) {
-        /*
-          OCR can temporarily fail when the screen
-          changes. Keep previous price.
-        */
-      }
-
-      return (
-        lastPriceRef.current ||
-        0
-      );
-    };
-
-  /* =======================================================
-     FULL FRAME ANALYSIS
-     ======================================================= */
-
-  const analyzeCurrentFrame =
-    useCallback(
-      async () => {
-        if (
-          processingFrameRef.current
-        ) {
+        if (!result) {
           return;
         }
 
-        if (
-          !canvasRef.current ||
-          !videoRef.current
-        ) {
-          return;
-        }
-
-        processingFrameRef.current =
-          true;
-
-        try {
-          const ctx =
-            canvasRef.current.getContext(
-              '2d',
-              {
-                willReadFrequently:
-                  true
-              }
-            );
-
-          if (!ctx) return;
-
-          const vWidth =
-            videoRef.current
-              .videoWidth ||
-            800;
-
-          const vHeight =
-            videoRef.current
-              .videoHeight ||
-            400;
-
-          canvasRef.current.width =
-            vWidth;
-
-          canvasRef.current.height =
-            vHeight;
-
-          ctx.drawImage(
-            videoRef.current,
-            0,
-            0,
-            vWidth,
-            vHeight
-          );
-
-          const targetROI =
-            getScaledROI();
-
-          const roiWidth =
-            Math.max(
-              1,
-              targetROI.width
-            );
-
-          const roiHeight =
-            Math.max(
-              1,
-              targetROI.height
-            );
-
-          const cropped =
-            ctx.getImageData(
-              targetROI.x,
-              targetROI.y,
-              roiWidth,
-              roiHeight
-            );
-
-          const analysis =
-            detectCandlesFromPixels(
-              cropped.data,
-              roiWidth,
-              roiHeight
-            );
-
-          /*
-            Add detected candles to history.
-          */
-
-          mergeDetectedCandlesIntoHistory(
-            analysis.candles
-          );
-
-          /*
-            Learn transitions when enough candles
-            are available.
-          */
-
-          learnFromCandleHistory();
-
-          /*
-            Draw numbered candles.
-          */
-
-          drawCandleOverlays(
-            analysis.candles
-          );
-
-          /*
-            Draw ZigZag after candle layer.
-          */
-
-          drawZigZagOverlays();
-
-          const currentPrice =
-            await extractPriceLevelWithOCR(
-              ctx
-            );
-
-          const latestCandle =
-            candleHistoryRef.current[
-              candleHistoryRef.current
-                .length - 1
-            ];
-
-          const currentColor =
-            latestCandle?.color ||
-            'NEUTRAL';
-
-          if (
-            currentPrice > 0
-          ) {
-            processZigZagLogic(
-              currentPrice
-            );
-
-            detectMagicNumber(
-              currentPrice,
-              currentColor,
-              lastPriceRef.current,
-              lastColorRef.current
-            );
-
-            lastPriceRef.current =
-              currentPrice;
-          }
-
-          const now =
-            new Date();
-
-          trackTimeAlgorithm(
-            now.getMinutes(),
-            now.getSeconds(),
-            currentColor
-          );
-
-          lastColorRef.current =
-            currentColor;
-        } finally {
-          processingFrameRef.current =
-            false;
-        }
-      },
-      [
-        getScaledROI,
-        detectCandlesFromPixels,
-        mergeDetectedCandlesIntoHistory,
-        learnFromCandleHistory,
-        drawCandleOverlays,
-        drawZigZagOverlays,
-        processZigZagLogic,
-        detectMagicNumber,
-        trackTimeAlgorithm
-      ]
-    );
-
-  /* =======================================================
-     CONTINUOUS LEARNING
-     ======================================================= */
-
-  const startContinuousLearning =
-    useCallback(
-      (
-        mediaStream: MediaStream
-      ) => {
-        /*
-          Stop previous loop first.
-        */
-
-        if (
-          continuousLearningRef.current
-        ) {
-          clearInterval(
-            continuousLearningRef.current
-          );
-        }
-
-        const learnInterval =
-          setInterval(() => {
-            if (
-              !mediaStream.active ||
-              !videoRef.current
-            ) {
-              return;
-            }
-
-            /*
-              500ms vision cycle.
-              OCR itself is protected against overlap.
-            */
-
-            analyzeCurrentFrame();
-          }, 500);
-
-        continuousLearningRef.current =
-          learnInterval;
-      },
-      [analyzeCurrentFrame]
-    );
-
-  /* =======================================================
-     CONNECT SCREEN
-     ======================================================= */
-
-  const connectStream =
-    async () => {
-      try {
-        const mediaStream =
-          await navigator.mediaDevices.getDisplayMedia(
-            {
-              video: {
-                displaySurface:
-                  'window',
-
-                width: 1280,
-
-                height: 720,
-
-                frameRate: 30
-              } as any,
-
-              audio: false
-            }
-          );
-
-        setStream(
-          mediaStream
-        );
-
-        setIsStreamActive(
-          true
-        );
-
-        setStatusMessage(
-          'Connected! Candle Vision + Pattern Memory is learning...'
-        );
+        const {
+          analysis,
+          proposed
+        } = result;
 
         /*
-          If user stops sharing from browser UI.
+          Keep signal pending until 00:00.
         */
-
-        mediaStream
-          .getVideoTracks()
-          .forEach(
-            track => {
-              track.onended =
-                () => {
-                  disconnectStream();
-                };
-            }
-          );
-
-        startContinuousLearning(
-          mediaStream
-        );
-      } catch (err) {
-        console.error(err);
-
-        setStatusMessage(
-          'Connection failed. Share the chart screen.'
-        );
-      }
-    };
-
-  /* =======================================================
-     DISCONNECT
-     ======================================================= */
-
-  const disconnectStream =
-    () => {
-      if (
-        continuousLearningRef.current
-      ) {
-        clearInterval(
-          continuousLearningRef.current
-        );
-
-        continuousLearningRef.current =
-          null;
-      }
-
-      if (stream) {
-        stream
-          .getTracks()
-          .forEach(
-            track =>
-              track.stop()
-          );
-      }
-
-      setStream(null);
-
-      setIsStreamActive(
-        false
-      );
-
-      setIsScanning(false);
-
-      setAiSignal('WAIT');
-
-      pendingSignalRef.current =
-        null;
-
-      setStatusMessage(
-        'Engine paused.'
-      );
-    };
-
-  /* =======================================================
-     46 SECOND ANALYSIS
-     ======================================================= */
-
-  const execute46sFullAnalysis =
-    async () => {
-      if (isScanning)
-        return;
-
-      setIsScanning(
-        true
-      );
-
-      setStatusMessage(
-        '46s Deep Candle + Pattern Analysis running...'
-      );
-
-      try {
-        /*
-          Force one fresh frame.
-        */
-
-        await analyzeCurrentFrame();
-
-        const recentCandles =
-          getRecentCandleSequence(
-            20
-          );
-
-        if (
-          recentCandles.length <
-          3
-        ) {
-          setStatusMessage(
-            'Not enough candles detected yet. Keep the chart visible and allow the engine to learn.'
-          );
-
-          return;
-        }
-
-        const latest =
-          recentCandles[
-            recentCandles.length -
-              1
-          ];
-
-        const currentPrice =
-          lastPriceRef.current ||
-          0;
-
-        const isRound =
-          checkIsRoundNumber(
-            currentPrice
-          );
-
-        const priceRange =
-          getPriceRange(
-            currentPrice
-          );
-
-        /*
-          Recent 5-candle pattern.
-        */
-
-        const sequence5 =
-          recentCandles.slice(
-            -PATTERN_SEQUENCE_LENGTH
-          );
-
-        const sequenceTokens =
-          sequence5.map(
-            candleToShortToken
-          );
-
-        const matchedCandlePattern =
-          findMatchingCandlePattern(
-            sequence5
-          );
-
-        /*
-          ZigZag match.
-        */
-
-        const matchedZigZag =
-          brainRef.current.zigzagLevels.reduce(
-            (
-              closest,
-              current
-            ) => {
-              const currentDiff =
-                Math.abs(
-                  current.price -
-                    currentPrice
-                );
-
-              const closestDiff =
-                closest
-                  ? Math.abs(
-                      closest.price -
-                        currentPrice
-                    )
-                  : Infinity;
-
-              return currentDiff <
-                closestDiff &&
-                currentDiff <
-                  0.00150
-                ? current
-                : closest;
-            },
-            null as
-              | ZigZagLevel
-              | null
-          );
-
-        /*
-          Magic levels.
-        */
-
-        const relevantMagicNumbers =
-          brainRef.current.magicNumbers.filter(
-            mn =>
-              mn.priceRange ===
-                priceRange &&
-              Math.abs(
-                mn.priceLevel -
-                  currentPrice
-              ) <
-                0.005
-          );
-
-        const now =
-          new Date();
-
-        const currentMinute =
-          now.getMinutes();
-
-        const currentSecond =
-          now.getSeconds();
-
-        const timeKey24H =
-          `${String(
-            now.getHours()
-          ).padStart(
-            2,
-            '0'
-          )}:${String(
-            currentMinute
-          ).padStart(
-            2,
-            '0'
-          )}:${String(
-            Math.floor(
-              currentSecond /
-                5
-            ) * 5
-          ).padStart(
-            2,
-            '0'
-          )}`;
-
-        const timeSyncData =
-          brainRef.current.timeAlgorithms.find(
-            ta =>
-              ta.timeKey24H ===
-              timeKey24H
-          ) || null;
-
-        /* =================================================
-           SIGNAL SCORING
-           ================================================= */
-
-        let callScore = 0;
-        let putScore = 0;
-
-        const reasons: string[] =
-          [];
-
-        /*
-          A. Latest candle color.
-        */
-
-        if (
-          latest.color ===
-          'GREEN'
-        ) {
-          callScore += 1;
-          reasons.push(
-            'LATEST GREEN'
-          );
-        }
-
-        if (
-          latest.color ===
-          'RED'
-        ) {
-          putScore += 1;
-          reasons.push(
-            'LATEST RED'
-          );
-        }
-
-        /*
-          B. Strong body.
-        */
-
-        if (
-          latest.bodyClass ===
-          'LARGE' ||
-          latest.bodyClass ===
-          'HUGE'
-        ) {
-          if (
-            latest.color ===
-            'GREEN'
-          ) {
-            callScore += 1.5;
-          }
-
-          if (
-            latest.color ===
-            'RED'
-          ) {
-            putScore += 1.5;
-          }
-
-          reasons.push(
-            `STRONG BODY ${latest.bodyClass}`
-          );
-        }
-
-        /*
-          C. Lower wick rejection.
-        */
-
-        if (
-          latest.lowerWickRatio >=
-          1.5
-        ) {
-          callScore += 2;
-
-          reasons.push(
-            'LOWER WICK REJECTION'
-          );
-        }
-
-        /*
-          D. Upper wick rejection.
-        */
-
-        if (
-          latest.upperWickRatio >=
-          1.5
-        ) {
-          putScore += 2;
-
-          reasons.push(
-            'UPPER WICK REJECTION'
-          );
-        }
-
-        /*
-          E. Candle pattern memory.
-        */
-
-        if (
-          matchedCandlePattern
-        ) {
-          const p =
-            matchedCandlePattern;
-
-          const totalNext =
-            p.nextGreen +
-            p.nextRed +
-            p.nextNeutral;
-
-          if (
-            totalNext > 0
-          ) {
-            const greenProb =
-              p.nextGreen /
-              totalNext;
-
-            const redProb =
-              p.nextRed /
-              totalNext;
-
-            /*
-              Only use historical pattern
-              strongly when enough observations exist.
-            */
-
-            if (
-              p.occurrences >=
-                5 &&
-              p.confidence >=
-                55
-            ) {
-              callScore +=
-                greenProb * 3;
-
-              putScore +=
-                redProb * 3;
-
-              reasons.push(
-                `MEMORY ${p.confidence.toFixed(
-                  1
-                )}%`
-              );
-            }
-          }
-        }
-
-        /*
-          F. ZigZag rejection.
-        */
-
-        if (
-          matchedZigZag
-        ) {
-          if (
-            matchedZigZag.type ===
-            'HIGH'
-          ) {
-            putScore += 2;
-
-            reasons.push(
-              'ZIGZAG HIGH'
-            );
-          }
-
-          if (
-            matchedZigZag.type ===
-            'LOW'
-          ) {
-            callScore += 2;
-
-            reasons.push(
-              'ZIGZAG LOW'
-            );
-          }
-        }
-
-        /*
-          G. Round number.
-        */
-
-        if (isRound) {
-          /*
-            Round number by itself is not direction.
-            It only becomes meaningful when rejection
-            evidence exists.
-          */
-
-          if (
-            latest.upperWickRatio >=
-            1.3
-          ) {
-            putScore += 1;
-
-            reasons.push(
-              'ROUND + UPPER REJECTION'
-            );
-          }
-
-          if (
-            latest.lowerWickRatio >=
-            1.3
-          ) {
-            callScore += 1;
-
-            reasons.push(
-              'ROUND + LOWER REJECTION'
-            );
-          }
-        }
-
-        /*
-          H. Recent candle momentum.
-        */
-
-        const last3 =
-          recentCandles.slice(
-            -3
-          );
-
-        const green3 =
-          last3.filter(
-            c =>
-              c.color ===
-              'GREEN'
-          ).length;
-
-        const red3 =
-          last3.filter(
-            c =>
-              c.color ===
-              'RED'
-          ).length;
-
-        if (
-          green3 >= 2
-        ) {
-          callScore += 1;
-
-          reasons.push(
-            '3-CANDLE GREEN MOMENTUM'
-          );
-        }
-
-        if (
-          red3 >= 2
-        ) {
-          putScore += 1;
-
-          reasons.push(
-            '3-CANDLE RED MOMENTUM'
-          );
-        }
-
-        /*
-          I. Recent reversal.
-        */
-
-        if (
-          latest.shape ===
-            'BULL_REJECTION' &&
-          latest.lowerWick >
-            latest.topWick
-        ) {
-          callScore += 1.5;
-
-          reasons.push(
-            'BULL REJECTION'
-          );
-        }
-
-        if (
-          latest.shape ===
-            'BEAR_REJECTION' &&
-          latest.topWick >
-            latest.bottomWick
-        ) {
-          putScore += 1.5;
-
-          reasons.push(
-            'BEAR REJECTION'
-          );
-        }
-
-        /*
-          Final direction.
-        */
-
-        let proposedSignal:
-          | 'CALL'
-          | 'PUT';
-
-        if (
-          callScore >
-          putScore
-        ) {
-          proposedSignal =
-            'CALL';
-        } else if (
-          putScore >
-          callScore
-        ) {
-          proposedSignal =
-            'PUT';
-        } else {
-          /*
-            If scores are exactly equal,
-            use latest candle only as tie breaker.
-          */
-
-          proposedSignal =
-            latest.color ===
-            'GREEN'
-              ? 'CALL'
-              : 'PUT';
-        }
-
-        /*
-          Evidence-based confidence.
-
-          This is NOT a guaranteed probability of
-          winning a trade. It is an internal evidence
-          score.
-        */
-
-        const totalScore =
-          callScore +
-          putScore;
-
-        const winningScore =
-          Math.max(
-            callScore,
-            putScore
-          );
-
-        let confidence =
-          totalScore > 0
-            ? (winningScore /
-                totalScore) *
-              100
-            : 50;
-
-        /*
-          Historical pattern can increase confidence,
-          but we cap it to avoid fake 100%.
-        */
-
-        if (
-          matchedCandlePattern &&
-          matchedCandlePattern.occurrences >=
-            5
-        ) {
-          confidence +=
-            Math.min(
-              8,
-              matchedCandlePattern.confidence /
-                20
-            );
-        }
-
-        confidence =
-          Math.min(
-            95,
-            Math.max(
-              50,
-              confidence
-            )
-          );
-
-        const dominantColor =
-          latest.color;
-
-        const patternString =
-          [
-            `46S CANDLE VISION`,
-            `Candles=${recentCandles.length}`,
-            `Latest=#${latest.id}`,
-            `Shape=${latest.shape}`,
-            `Body=${latest.bodyClass}`,
-            `UpperWick=${latest.topWickClass}`,
-            `LowerWick=${latest.bottomWickClass}`,
-            `CALL=${callScore.toFixed(
-              2
-            )}`,
-            `PUT=${putScore.toFixed(
-              2
-            )}`,
-            matchedCandlePattern
-              ? `MEMORY=${matchedCandlePattern.confidence.toFixed(
-                  1
-                )}%/${matchedCandlePattern.occurrences}x`
-              : 'MEMORY=NO_MATCH',
-            reasons.join(
-              ' | '
-            )
-          ].join(
-            ' | '
-          );
-
-        const liveData:
-          LiveAnalysis = {
-            pattern:
-              patternString,
-
-            sequence:
-              sequenceTokens,
-
-            detectedCandles:
-              recentCandles,
-
-            dominantColor,
-
-            strength:
-              confidence,
-
-            priceLevel:
-              currentPrice,
-
-            isRoundNumber:
-              isRound,
-
-            bodySize:
-              latest.bodySize,
-
-            topWick:
-              latest.topWick,
-
-            bottomWick:
-              latest.bottomWick,
-
-            detectedMagicNumbers:
-              relevantMagicNumbers,
-
-            matchedZigZag,
-
-            matchedCandlePattern,
-
-            timeKey24H,
-
-            timestampSecond:
-              currentSecond,
-
-            currentMinute,
-
-            timeSyncData
-          };
-
-        setCurrentAnalysis(
-          liveData
-        );
 
         pendingSignalRef.current =
-          {
-            signal:
-              proposedSignal,
+          proposed;
 
-            analysis:
-              liveData
-          };
-
-        setStatusMessage(
-          `Signal prepared [${proposedSignal}] | Evidence ${confidence.toFixed(
-            1
-          )}% | ${latest.shape} | Candle #${latest.id}`
+        setStatus(
+          `🧠 46s LOCKED | ${analysis.sequence.join(
+            " → "
+          )} | ${analysis.patternName} | ${proposed}`
         );
-      } catch (err) {
+
+        await saveBrain();
+      } catch (error) {
         console.error(
-          '46s Analysis Error:',
-          err
+          "46s analysis:",
+          error
         );
 
-        setStatusMessage(
-          '46s analysis error. Check ROI and chart visibility.'
+        setStatus(
+          "46s analysis error."
         );
       } finally {
-        setIsScanning(
-          false
-        );
+        setIsAnalyzing(false);
       }
-    };
+    }, [
+      isStreamActive,
+      isAnalyzing,
+      analyzeCurrentFrame,
+      saveBrain
+    ]);
 
-  /* =======================================================
-     MANUAL
-     ======================================================= */
-
-  const triggerAnalysis =
-    () => {
-      if (
-        !isStreamActive ||
-        !videoRef.current
-      ) {
-        setStatusMessage(
-          'Error: Connect screen first!'
-        );
-
-        return;
-      }
-
-      execute46sFullAnalysis();
-    };
-
-  /* =======================================================
-     CANDLE CLOCK
-     ======================================================= */
+  /* =========================================================
+     CLOCK + EXACT CANDLE TRANSITION
+     ========================================================= */
 
   useEffect(() => {
-    const candleSync =
+    const timer =
       setInterval(() => {
         const now =
           new Date();
@@ -3739,809 +2229,599 @@ export default function TraderYodhaXEngine() {
         const milliseconds =
           now.getMilliseconds();
 
-        const timeUntilNext =
+        const remaining =
           60 -
           seconds -
           milliseconds /
             1000;
 
-        setTimeUntilCandle(
+        setSecondsToCandle(
           Math.ceil(
-            timeUntilNext
+            remaining
           )
         );
 
         /*
-          New minute.
+          Automatic 46s analysis.
         */
 
         if (
-          seconds === 0
-        ) {
-          hasScannedThisCandle.current =
-            false;
-        }
-
-        /*
-          Automatic 46-second analysis.
-        */
-
-        if (
-          isStreamActive &&
           seconds === 46 &&
-          !hasScannedThisCandle.current
+          lastScanMinuteRef.current !==
+            now.getMinutes()
         ) {
-          hasScannedThisCandle.current =
-            true;
+          lastScanMinuteRef.current =
+            now.getMinutes();
 
-          execute46sFullAnalysis();
+          run46SecondAnalysis();
         }
 
         /*
-          Exact 00:00 entry window.
-
-          We intentionally do NOT use 59 seconds.
+          EXACT transition.
         */
 
         if (
-          pendingSignalRef.current &&
           seconds === 0 &&
-          milliseconds < 500
+          milliseconds < 500 &&
+          pendingSignalRef.current !==
+            "WAIT"
         ) {
-          setAiSignal(
-            pendingSignalRef.current
-              .signal
+          const nextSignal =
+            pendingSignalRef.current;
+
+          setSignal(
+            nextSignal
           );
 
-          setStatusMessage(
-            `🚀 SIGNAL ACTIVE: ${pendingSignalRef.current.signal} | Entry Time: 00:00`
+          setStatus(
+            `🚀 SIGNAL ACTIVE: ${nextSignal} | Entry: 00:00`
           );
 
           pendingSignalRef.current =
-            null;
+            "WAIT";
         }
       }, 100);
 
     return () =>
       clearInterval(
-        candleSync
+        timer
       );
   }, [
-    isStreamActive,
-    isScanning
+    run46SecondAnalysis
   ]);
 
-  /* =======================================================
-     TRADE OUTCOME
-     ======================================================= */
+  /* =========================================================
+     MANUAL SCAN
+     ========================================================= */
 
-  const logTradeOutcome =
-    (
-      result: TradeResult
-    ) => {
-      if (
-        aiSignal === 'WAIT' ||
-        !currentAnalysis
-      ) {
-        return;
-      }
+  const manualScan = () => {
+    if (
+      !isStreamActive
+    ) {
+      setStatus(
+        "Pehle Connect Chart Screen karo."
+      );
 
-      const brain =
-        brainRef.current;
+      return;
+    }
 
-      const patternId =
-        `${currentAnalysis.bodySize.toFixed(
-          0
-        )}_${Date.now()}`;
+    run46SecondAnalysis();
+  };
 
-      /*
-        Save trade pattern.
-      */
+  /* =========================================================
+     TRADE RESULT LEARNING
+     ========================================================= */
 
-      brain.patterns.push({
-        id: patternId,
+  const logOutcome = (
+    result: "WIN" | "LOSS"
+  ) => {
+    const analysis =
+      lastSignalRef.current;
 
-        pattern:
-          currentAnalysis.pattern,
+    if (
+      !analysis ||
+      signal === "WAIT"
+    ) {
+      return;
+    }
 
-        sequenceLength:
-          currentAnalysis.sequence
-            .length,
+    const sequence =
+      analysis.sequence.join(
+        "|"
+      );
 
-        priceLevel:
-          currentAnalysis.priceLevel,
-
-        priceRange:
-          getPriceRange(
-            currentAnalysis.priceLevel
-          ),
-
-        bodySize:
-          currentAnalysis.bodySize,
-
-        topWickSize:
-          currentAnalysis.topWick,
-
-        bottomWickSize:
-          currentAnalysis.bottomWick,
-
-        result,
-
-        timestamp:
-          Date.now(),
-
-        timeSync:
-          currentAnalysis.timestampSecond,
-
-        timeKey24H:
-          currentAnalysis.timeKey24H,
-
-        minuteMarker:
-          currentAnalysis.currentMinute,
-
-        confidence:
-          currentAnalysis.strength,
-
-        candleSequence:
-          currentAnalysis.sequence
-      });
-
-      /*
-        Update total trade stats.
-      */
-
-      brain.totalTrades++;
-
-      const wins =
-        brain.patterns.filter(
-          p =>
-            p.result ===
-            'WIN'
-        ).length;
-
-      brain.winRate =
-        brain.patterns.length >
-        0
-          ? (wins /
-              brain.patterns.length) *
-            100
-          : 0;
-
-      /*
-        IMPORTANT:
-        Connect trade outcome to the candle pattern.
-
-        This allows the brain to learn:
-        "This candle sequence was followed by a
-        successful/unsuccessful signal."
-      */
-
-      const matchedPattern =
-        currentAnalysis.matchedCandlePattern;
-
-      if (
-        matchedPattern
-      ) {
-        if (
-          result ===
-          'WIN'
-        ) {
-          matchedPattern.wins++;
-        } else {
-          matchedPattern.losses++;
-        }
-
-        const total =
-          matchedPattern.wins +
-          matchedPattern.losses;
-
-        /*
-          Pattern trade success rate is stored
-          indirectly through wins/losses.
-        */
-
-        if (total > 0) {
-          const patternSuccess =
-            (matchedPattern.wins /
-              total) *
-            100;
-
-          /*
-            Blend next-candle confidence and
-            trade success into the internal confidence.
-          */
-
-          matchedPattern.confidence =
-            matchedPattern
-              .nextGreen +
-              matchedPattern
-                .nextRed +
-              matchedPattern
-                .nextNeutral >
-            0
-              ? (
-                  matchedPattern
-                    .confidence *
-                    0.70 +
-                  patternSuccess *
-                    0.30
-                )
-              : patternSuccess;
-        }
-      }
-
-      saveBrainToDB();
-
-      setStatusMessage(
-        `Outcome logged [${result}] | System Win Rate: ${brain.winRate.toFixed(
+    const last =
+      analysis.candles[
+        analysis.candles.length -
           1
-        )}% | Candle pattern memory updated.`
+      ];
+
+    const direction =
+      signal === "CALL"
+        ? "UP"
+        : "DOWN";
+
+    const existing =
+      brainRef.current.patterns.find(
+        p =>
+          p.sequence ===
+            sequence &&
+          p.patternType ===
+            analysis.patternName &&
+          p.direction ===
+            direction
       );
 
-      setAiSignal(
-        'WAIT'
+    if (existing) {
+      existing.occurrences++;
+
+      /*
+        Keep latest outcome.
+      */
+
+      existing.result =
+        result;
+
+      existing.timestamp =
+        Date.now();
+
+      existing.confidence =
+        analysis.strength;
+    } else {
+      brainRef.current.patterns.push(
+        {
+          id:
+            `${Date.now()}_${Math.random()
+              .toString(36)
+              .slice(2)}`,
+
+          sequence,
+
+          sequenceLength:
+            analysis.sequence
+              .length,
+
+          lastCandle:
+            makeCandleCode(
+              last
+            ),
+
+          patternType:
+            analysis.patternName,
+
+          bodyProfile:
+            analysis.bodyProfile,
+
+          wickProfile:
+            analysis.wickProfile,
+
+          direction,
+
+          result,
+
+          confidence:
+            analysis.strength,
+
+          timestamp:
+            Date.now(),
+
+          occurrences: 1
+        }
       );
+    }
 
-      setCurrentAnalysis(
-        null
-      );
-    };
+    const brain =
+      brainRef.current;
 
-  /* =======================================================
-     ROI MOUSE
-     ======================================================= */
+    brain.totalTrades++;
 
-  const handleMouseDown =
-    (
-      e: React.MouseEvent
-    ) => {
-      if (isRoiLocked)
-        return;
+    if (
+      result === "WIN"
+    ) {
+      brain.wins++;
+    } else {
+      brain.losses++;
+    }
 
-      e.stopPropagation();
+    brain.winRate =
+      brain.totalTrades >
+      0
+        ? (brain.wins /
+            brain.totalTrades) *
+          100
+        : 0;
 
-      setIsDragging(
-        true
-      );
+    brain.lastUpdated =
+      Date.now();
 
-      const bounds =
-        videoContainerRef.current?.getBoundingClientRect();
+    saveBrain();
 
-      if (!bounds) return;
+    setStatus(
+      `🧠 ${result} learned | Pattern: ${analysis.patternName} | Sequence: ${sequence}`
+    );
 
-      setDragStart({
+    setSignal("WAIT");
+
+    lastSignalRef.current =
+      null;
+  };
+
+  /* =========================================================
+     ROI MOUSE CONTROLS
+     ========================================================= */
+
+  const handleMouseDown = (
+    e: React.MouseEvent
+  ) => {
+    if (roiLocked) return;
+
+    const bounds =
+      videoContainerRef.current?.getBoundingClientRect();
+
+    if (!bounds) return;
+
+    dragOffsetRef.current =
+      {
         x:
           e.clientX -
           bounds.left -
-          roiBox.x,
+          roi.x,
 
         y:
           e.clientY -
           bounds.top -
-          roiBox.y
-      });
-    };
+          roi.y
+      };
 
-  const handleResizeDown =
-    (
-      e: React.MouseEvent
-    ) => {
-      if (isRoiLocked)
-        return;
+    setDragging(true);
+  };
 
-      e.stopPropagation();
+  const handleResizeMouseDown = (
+    e: React.MouseEvent
+  ) => {
+    if (roiLocked) return;
 
-      setIsResizing(
-        true
-      );
+    e.stopPropagation();
 
-      setDragStart({
-        x: e.clientX,
-        y: e.clientY
-      });
-    };
+    setResizing(true);
+  };
 
-  const handleMouseMove =
-    (
-      e: React.MouseEvent
-    ) => {
-      if (
-        isRoiLocked ||
-        (!isDragging &&
-          !isResizing)
-      ) {
-        return;
-      }
+  const handleMouseMove = (
+    e: React.MouseEvent
+  ) => {
+    if (
+      roiLocked ||
+      (!dragging &&
+        !resizing)
+    ) {
+      return;
+    }
 
-      if (
-        !videoContainerRef.current
-      ) {
-        return;
-      }
+    const bounds =
+      videoContainerRef.current?.getBoundingClientRect();
 
-      const bounds =
-        videoContainerRef.current.getBoundingClientRect();
+    if (!bounds) return;
 
-      if (isDragging) {
-        const newX =
-          Math.max(
-            0,
-            Math.min(
-              bounds.width -
-                roiBox.width,
-              e.clientX -
-                bounds.left -
-                dragStart.x
-            )
-          );
-
-        const newY =
-          Math.max(
-            0,
-            Math.min(
-              bounds.height -
-                roiBox.height,
-              e.clientY -
-                bounds.top -
-                dragStart.y
-            )
-          );
-
-        setRoiBox(
-          prev => ({
-            ...prev,
-            x: newX,
-            y: newY
-          })
+    if (dragging) {
+      const x =
+        Math.max(
+          0,
+          Math.min(
+            bounds.width -
+              roi.width,
+            e.clientX -
+              bounds.left -
+              dragOffsetRef.current
+                .x
+          )
         );
-      }
 
-      if (isResizing) {
-        const deltaX =
-          e.clientX -
-          dragStart.x;
-
-        const deltaY =
-          e.clientY -
-          dragStart.y;
-
-        setDragStart({
-          x: e.clientX,
-          y: e.clientY
-        });
-
-        setRoiBox(
-          prev => ({
-            ...prev,
-
-            width:
-              Math.max(
-                180,
-                Math.min(
-                  bounds.width -
-                    prev.x,
-                  prev.width +
-                    deltaX
-                )
-              ),
-
-            height:
-              Math.max(
-                120,
-                Math.min(
-                  bounds.height -
-                    prev.y,
-                  prev.height +
-                    deltaY
-                )
-              )
-          })
+      const y =
+        Math.max(
+          0,
+          Math.min(
+            bounds.height -
+              roi.height,
+            e.clientY -
+              bounds.top -
+              dragOffsetRef.current
+                .y
+          )
         );
-      }
-    };
 
-  const handleMouseUp =
+      setRoi(prev => ({
+        ...prev,
+        x,
+        y
+      }));
+    }
+
+    if (resizing) {
+      const newWidth =
+        Math.max(
+          150,
+          Math.min(
+            bounds.width -
+              roi.x,
+            e.clientX -
+              bounds.left -
+              roi.x
+          )
+        );
+
+      const newHeight =
+        Math.max(
+          120,
+          Math.min(
+            bounds.height -
+              roi.y,
+            e.clientY -
+              bounds.top -
+              roi.y
+          )
+        );
+
+      setRoi(prev => ({
+        ...prev,
+        width:
+          newWidth,
+        height:
+          newHeight
+      }));
+    }
+  };
+
+  const stopMouse =
     () => {
-      setIsDragging(
-        false
-      );
-
-      setIsResizing(
-        false
-      );
+      setDragging(false);
+      setResizing(false);
     };
 
-  /* =======================================================
+  /* =========================================================
      UI
-     ======================================================= */
+     ========================================================= */
 
   return (
     <div
-      className="min-h-screen bg-[#040814] text-slate-100 font-sans"
+      className="min-h-screen bg-[#030712] text-white"
       onMouseMove={
         handleMouseMove
       }
       onMouseUp={
-        handleMouseUp
+        stopMouse
+      }
+      onMouseLeave={
+        stopMouse
       }
     >
-      <header className="border-b border-slate-800 px-6 py-4">
-        <div className="max-w-7xl mx-auto flex items-center justify-between">
+      {/* HEADER */}
+
+      <header className="border-b border-slate-800 px-5 py-4">
+        <div className="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-bold text-cyan-400 tracking-wider">
+            <h1 className="text-2xl font-black text-cyan-400">
               TRADER YODHA X AI
             </h1>
 
-            <p className="text-slate-500 text-sm">
-              Candle Vision + Body/Wick Intelligence + Pattern Memory + 46S Engine
+            <p className="text-xs text-slate-500">
+              Candle Vision • Body • Wick •
+              Sequence • Pattern Memory •
+              46S Analysis
             </p>
           </div>
 
-          <div className="flex items-center gap-3">
-            <div className="text-right mr-4">
-              <div className="text-xs text-slate-500">
-                AI Brain
-              </div>
+          <div className="flex gap-3">
+            <button
+              onClick={
+                connectScreen
+              }
+              disabled={
+                isStreamActive
+              }
+              className="px-4 py-2 rounded-lg bg-emerald-600 disabled:bg-slate-700 font-bold"
+            >
+              CONNECT SCREEN
+            </button>
 
-              <div className="text-sm font-mono text-emerald-400">
-                {brainStats.candles} Candles |{' '}
-                {brainStats.candlePatterns}{' '}
-                Patterns
-              </div>
-
-              <div className="text-xs font-mono text-slate-400">
-                {brainStats.patterns} Trades | WR:{' '}
-                {brainStats.winRate.toFixed(
-                  1
-                )}%
-              </div>
-            </div>
-
-            {!isStreamActive ? (
-              <button
-                onClick={
-                  connectStream
-                }
-                className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg transition-all shadow-md shadow-emerald-600/20"
-              >
-                Connect Chart Screen
-              </button>
-            ) : (
-              <button
-                onClick={
-                  disconnectStream
-                }
-                className="px-5 py-2.5 bg-red-600 hover:bg-red-500 text-white font-bold rounded-lg transition-all"
-              >
-                Disconnect
-              </button>
-            )}
+            <button
+              onClick={
+                disconnectScreen
+              }
+              disabled={
+                !isStreamActive
+              }
+              className="px-4 py-2 rounded-lg bg-red-600 disabled:bg-slate-700 font-bold"
+            >
+              DISCONNECT
+            </button>
           </div>
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-6 py-6">
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <main className="max-w-7xl mx-auto p-5">
+        <div className="grid lg:grid-cols-3 gap-5">
+          {/* LEFT */}
 
-          {/* =================================================
-              LEFT PANEL
-             ================================================= */}
-
-          <div className="space-y-4">
-
-            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800 shadow-md">
-
+          <div className="space-y-5">
+            <div className="bg-[#0f172a] border border-slate-800 rounded-xl p-5">
               <button
                 onClick={
-                  triggerAnalysis
+                  manualScan
                 }
                 disabled={
                   !isStreamActive ||
-                  isScanning
+                  isAnalyzing
                 }
-                className={`w-full py-4 rounded-xl font-bold text-lg transition-all ${
-                  !isStreamActive ||
-                  isScanning
-                    ? 'bg-slate-700 text-slate-500 cursor-not-allowed'
-                    : 'bg-cyan-600 hover:bg-cyan-500 text-white shadow-lg shadow-cyan-600/30'
-                }`}
+                className="w-full py-4 rounded-xl bg-cyan-600 disabled:bg-slate-700 font-black"
               >
-                {isScanning ? (
-                  <span className="flex items-center justify-center gap-2">
-                    <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                    Analyzing Candles...
-                  </span>
-                ) : (
-                  'FORCE MANUAL 46S SCAN'
-                )}
+                {isAnalyzing
+                  ? "ANALYZING..."
+                  : "FORCE 46S ANALYSIS"}
               </button>
 
-              <div className="mt-4 flex items-center justify-between text-sm">
+              <div className="mt-4 flex justify-between">
                 <span className="text-slate-500">
-                  Next Candle Entry:
+                  Next candle:
                 </span>
 
-                <span className="font-mono text-xl text-amber-400">
-                  {timeUntilCandle}s
+                <span className="text-amber-400 font-mono text-xl">
+                  {
+                    secondsToCandle
+                  }
+                  s
                 </span>
+              </div>
+            </div>
+
+            {/* BRAIN */}
+
+            <div className="bg-[#0f172a] border border-slate-800 rounded-xl p-5">
+              <h2 className="font-bold text-cyan-400 mb-4">
+                🧠 AI BRAIN
+              </h2>
+
+              <div className="grid grid-cols-3 gap-2 text-center">
+                <div>
+                  <div className="text-xl font-bold">
+                    {
+                      brainStats.patterns
+                    }
+                  </div>
+
+                  <div className="text-[10px] text-slate-500">
+                    PATTERNS
+                  </div>
+                </div>
+
+                <div>
+                  <div className="text-xl font-bold">
+                    {
+                      brainStats.zigzag
+                    }
+                  </div>
+
+                  <div className="text-[10px] text-slate-500">
+                    ZIGZAG
+                  </div>
+                </div>
+
+                <div>
+                  <div className="text-xl font-bold text-emerald-400">
+                    {brainStats.winRate.toFixed(
+                      1
+                    )}
+                    %
+                  </div>
+
+                  <div className="text-[10px] text-slate-500">
+                    WIN RATE
+                  </div>
+                </div>
               </div>
             </div>
 
             {/* OCR */}
 
-            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
+            <div className="bg-[#0f172a] border border-slate-800 rounded-xl p-5">
+              <div className="text-xs text-slate-500">
+                OCR PRICE
+              </div>
 
-              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">
-                OCR Telemetry
-              </h3>
-
-              <div className="text-xs space-y-2 font-mono">
-
-                <div className="flex justify-between">
-                  <span className="text-slate-500">
-                    Price:
-                  </span>
-
-                  <span
-                    className={`font-bold ${
-                      isRealRoundNumber
-                        ? 'text-emerald-400'
-                        : 'text-cyan-400'
-                    }`}
-                  >
-                    {ocrPriceText}
-                  </span>
-                </div>
-
+              <div className="font-mono text-cyan-400 mt-1">
+                {ocrPrice}
               </div>
             </div>
 
-            {/* BRAIN STATS */}
-
-            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
-
-              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">
-                Candle Brain
-              </h3>
-
-              <div className="grid grid-cols-2 gap-2 text-xs font-mono">
-
-                <div className="bg-[#020617] p-3 rounded">
-                  <div className="text-slate-500">
-                    Candles
-                  </div>
-
-                  <div className="text-cyan-400 text-lg font-bold">
-                    {brainStats.candles}
-                  </div>
-                </div>
-
-                <div className="bg-[#020617] p-3 rounded">
-                  <div className="text-slate-500">
-                    Patterns
-                  </div>
-
-                  <div className="text-purple-400 text-lg font-bold">
-                    {brainStats.candlePatterns}
-                  </div>
-                </div>
-
-                <div className="bg-[#020617] p-3 rounded">
-                  <div className="text-slate-500">
-                    ZigZag
-                  </div>
-
-                  <div className="text-amber-400 text-lg font-bold">
-                    {brainStats.zigzag}
-                  </div>
-                </div>
-
-                <div className="bg-[#020617] p-3 rounded">
-                  <div className="text-slate-500">
-                    Win Rate
-                  </div>
-
-                  <div className="text-emerald-400 text-lg font-bold">
-                    {brainStats.winRate.toFixed(
-                      1
-                    )}%
-                  </div>
-                </div>
-
-              </div>
-            </div>
-
-            {/* LIVE ANALYSIS */}
+            {/* CANDLE DATA */}
 
             {currentAnalysis && (
-              <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
+              <div className="bg-[#0f172a] border border-slate-800 rounded-xl p-5">
+                <h2 className="font-bold text-purple-400 mb-3">
+                  CANDLE ANALYSIS
+                </h2>
 
-                <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">
-                  Candle Pattern Analysis
-                </h3>
-
-                <div className="text-xs text-slate-300 space-y-2 font-mono">
+                <div className="text-xs space-y-2 font-mono">
+                  <div>
+                    Pattern:{" "}
+                    <b>
+                      {
+                        currentAnalysis.patternName
+                      }
+                    </b>
+                  </div>
 
                   <div>
-                    <span className="text-slate-500">
-                      Latest:
-                    </span>{' '}
-                    Candle #
+                    Body:{" "}
                     {
-                      currentAnalysis
-                        .detectedCandles[
-                        currentAnalysis
-                          .detectedCandles
-                          .length -
-                          1
-                      ]?.id
+                      currentAnalysis.bodyProfile
                     }
                   </div>
 
                   <div>
-                    <span className="text-slate-500">
-                      Body:
-                    </span>{' '}
+                    Wick:{" "}
                     {
-                      currentAnalysis
-                        .detectedCandles[
-                        currentAnalysis
-                          .detectedCandles
-                          .length -
-                          1
-                      ]?.bodyClass
+                      currentAnalysis.wickProfile
                     }
                   </div>
 
                   <div>
-                    <span className="text-slate-500">
-                      Upper Wick:
-                    </span>{' '}
-                    {
-                      currentAnalysis
-                        .detectedCandles[
-                        currentAnalysis
-                          .detectedCandles
-                          .length -
-                          1
-                      ]?.topWickClass
-                    }
+                    Sequence:
                   </div>
 
-                  <div>
-                    <span className="text-slate-500">
-                      Lower Wick:
-                    </span>{' '}
-                    {
-                      currentAnalysis
-                        .detectedCandles[
-                        currentAnalysis
-                          .detectedCandles
-                          .length -
-                          1
-                      ]?.bottomWickClass
-                    }
-                  </div>
-
-                  <div>
-                    <span className="text-slate-500">
-                      Sequence:
-                    </span>
-                  </div>
-
-                  <div className="break-all text-cyan-300">
+                  <div className="text-cyan-300 break-all">
                     {currentAnalysis.sequence.join(
-                      ' → '
+                      " → "
                     )}
                   </div>
 
                   <div>
-                    <span className="text-slate-500">
-                      Evidence:
-                    </span>{' '}
-                    <span className="text-emerald-400 font-bold">
-                      {currentAnalysis.strength.toFixed(
-                        1
-                      )}%
-                    </span>
+                    Strength:{" "}
+                    <b>
+                      {
+                        currentAnalysis.strength
+                      }
+                      %
+                    </b>
                   </div>
-
-                  {currentAnalysis
-                    .matchedCandlePattern && (
-                    <div className="mt-3 p-3 bg-purple-900/20 border border-purple-500/20 rounded">
-                      <div className="text-purple-300 font-bold">
-                        MEMORY MATCH
-                      </div>
-
-                      <div className="mt-1 text-slate-400">
-                        Occurrences:{' '}
-                        {
-                          currentAnalysis
-                            .matchedCandlePattern
-                            .occurrences
-                        }
-                      </div>
-
-                      <div className="text-slate-400">
-                        Historical next-color evidence:{' '}
-                        {
-                          currentAnalysis
-                            .matchedCandlePattern
-                            .confidence
-                        .toFixed(1)}
-                        %
-                      </div>
-                    </div>
-                  )}
-
-                  <p className="break-all pt-2">
-                    <span className="text-slate-500">
-                      Logic:
-                    </span>{' '}
-                    {currentAnalysis.pattern}
-                  </p>
-
                 </div>
               </div>
             )}
           </div>
 
-          {/* =================================================
-              RIGHT PANEL
-             ================================================= */}
+          {/* RIGHT */}
 
-          <div className="lg:col-span-2 space-y-4">
+          <div className="lg:col-span-2 space-y-5">
+            {/* VIDEO */}
 
-            {/* CHART */}
+            <div className="bg-[#0f172a] border border-slate-800 rounded-xl p-5">
+              <div className="flex justify-between items-center mb-3">
+                <span className="text-xs font-bold text-slate-400">
+                  LIVE CHART VISION
+                </span>
 
-            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
-
-              <div className="flex items-center justify-between mb-3">
-
-                <div className="flex items-center gap-2">
-
-                  <div
-                    className={`w-2 h-2 rounded-full ${
-                      isStreamActive
-                        ? 'bg-emerald-400 animate-pulse'
-                        : 'bg-slate-600'
-                    }`}
-                  />
-
-                  <span className="text-xs font-bold text-slate-400">
-                    CHART + CANDLE VISION
-                  </span>
-
-                </div>
-
-                {isStreamActive && (
-                  <button
-                    onClick={() =>
-                      setIsRoiLocked(
-                        !isRoiLocked
-                      )
-                    }
-                    className={`px-3 py-1 rounded text-xs font-bold transition-all ${
-                      isRoiLocked
-                        ? 'bg-red-900/60 text-red-400 border border-red-500/40'
-                        : 'bg-cyan-900/60 text-cyan-400 border border-cyan-500/40'
-                    }`}
-                  >
-                    {isRoiLocked
-                      ? '🔒 ROI Locked'
-                      : '🔓 Drag / Resize ROI'}
-                  </button>
-                )}
-
+                <button
+                  onClick={() =>
+                    setRoiLocked(
+                      v => !v
+                    )
+                  }
+                  disabled={
+                    !isStreamActive
+                  }
+                  className="text-xs px-3 py-1 rounded bg-slate-800"
+                >
+                  {roiLocked
+                    ? "🔒 ROI LOCKED"
+                    : "🔓 ROI EDIT"}
+                </button>
               </div>
 
               <div
                 ref={
                   videoContainerRef
                 }
-                className="bg-[#020617] rounded-lg aspect-video flex items-center justify-center overflow-hidden border border-slate-900 relative select-none"
+                className="relative w-full aspect-video bg-black rounded-lg overflow-hidden"
               >
-
                 {isStreamActive ? (
                   <>
                     <video
@@ -4551,14 +2831,14 @@ export default function TraderYodhaXEngine() {
                       autoPlay
                       playsInline
                       muted
-                      className="w-full h-full object-contain pointer-events-none"
+                      className="absolute inset-0 w-full h-full object-contain"
                     />
 
                     <canvas
                       ref={
                         overlayCanvasRef
                       }
-                      className="absolute inset-0 pointer-events-none w-full h-full z-10"
+                      className="absolute inset-0 w-full h-full pointer-events-none"
                     />
 
                     {/* ROI */}
@@ -4568,207 +2848,174 @@ export default function TraderYodhaXEngine() {
                         handleMouseDown
                       }
                       style={{
-                        left: `${roiBox.x}px`,
-                        top: `${roiBox.y}px`,
-                        width: `${roiBox.width}px`,
-                        height: `${roiBox.height}px`
+                        left:
+                          roi.x,
+                        top:
+                          roi.y,
+                        width:
+                          roi.width,
+                        height:
+                          roi.height
                       }}
                       className={`absolute border-2 ${
-                        isRoiLocked
-                          ? 'border-amber-400 bg-amber-500/5'
-                          : 'border-cyan-400 bg-cyan-500/5 cursor-move'
-                      } flex flex-col justify-between p-1 z-20`}
+                        roiLocked
+                          ? "border-amber-400 bg-amber-400/5"
+                          : "border-cyan-400 bg-cyan-400/10 cursor-move"
+                      }`}
                     >
-
-                      <div className="flex justify-between items-center text-[10px] font-mono text-cyan-300 font-bold bg-slate-950/80 px-1 py-0.5 rounded pointer-events-none">
-                        <span>
-                          AI CANDLE TARGET
-                        </span>
-
-                        <span>
-                          {Math.round(
-                            roiBox.width
-                          )}
-                          x
-                          {Math.round(
-                            roiBox.height
-                          )}
-                        </span>
+                      <div className="absolute -top-6 left-0 text-[10px] bg-cyan-500 text-black font-bold px-2 py-1 rounded">
+                        CANDLE AI ROI
                       </div>
 
-                      {!isRoiLocked && (
+                      {!roiLocked && (
                         <div
                           onMouseDown={
-                            handleResizeDown
+                            handleResizeMouseDown
                           }
-                          className="w-3.5 h-3.5 bg-cyan-400 absolute bottom-0 right-0 cursor-se-resize rounded-tl shadow-md"
+                          className="absolute -right-1 -bottom-1 w-4 h-4 bg-cyan-400 cursor-se-resize"
                         />
                       )}
-
                     </div>
                   </>
                 ) : (
-                  <div className="text-center space-y-2">
-                    <p className="text-slate-500 font-medium">
-                      Connect chart screen to start Trader Yodha X AI.
-                    </p>
-
-                    <p className="text-xs text-slate-600">
-                      The AI will number detected candles and learn their sequences.
-                    </p>
+                  <div className="absolute inset-0 flex items-center justify-center text-slate-500 text-center p-5">
+                    CONNECT SCREEN dabao aur
+                    chart/window select karo.
                   </div>
                 )}
-
               </div>
 
               <canvas
-                ref={
-                  canvasRef
-                }
+                ref={canvasRef}
                 className="hidden"
               />
 
               <canvas
-                ref={
-                  ocrCanvasRef
-                }
+                ref={ocrCanvasRef}
                 className="hidden"
               />
 
-              <div className="mt-3 px-4 py-2 bg-[#020617] rounded-lg border-l-4 border-cyan-500">
-                <p className="text-xs text-slate-400">
-                  <strong className="text-cyan-400">
-                    Status:
-                  </strong>{' '}
-                  {statusMessage}
-                </p>
+              <div className="mt-3 p-3 bg-black rounded-lg text-xs text-slate-400">
+                <span className="text-cyan-400 font-bold">
+                  STATUS:
+                </span>{" "}
+                {status}
               </div>
+            </div>
 
+            {/* CANDLE TABLE */}
+
+            <div className="bg-[#0f172a] border border-slate-800 rounded-xl p-5">
+              <h2 className="font-bold text-cyan-400 mb-4">
+                🔢 DETECTED CANDLES
+              </h2>
+
+              <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-2">
+                {detectedCandles
+                  .slice(-10)
+                  .map(candle => (
+                    <div
+                      key={
+                        candle.number
+                      }
+                      className="rounded-lg bg-black border border-slate-800 p-3"
+                    >
+                      <div
+                        className={`text-2xl font-black ${
+                          candle.color ===
+                          "GREEN"
+                            ? "text-emerald-400"
+                            : candle.color ===
+                              "RED"
+                            ? "text-red-400"
+                            : "text-yellow-400"
+                        }`}
+                      >
+                        #
+                        {
+                          candle.number
+                        }
+                      </div>
+
+                      <div className="text-[10px] text-slate-400">
+                        {
+                          candle.type
+                        }
+                      </div>
+
+                      <div className="text-[10px] mt-2">
+                        Body:{" "}
+                        {
+                          candle.bodySize
+                        }
+                      </div>
+
+                      <div className="text-[10px]">
+                        ↑ Wick:{" "}
+                        {
+                          candle.upperWick
+                        }
+                      </div>
+
+                      <div className="text-[10px]">
+                        ↓ Wick:{" "}
+                        {
+                          candle.lowerWick
+                        }
+                      </div>
+                    </div>
+                  ))}
+              </div>
             </div>
 
             {/* SIGNAL */}
 
-            <div className="bg-[#0f172a] rounded-xl p-6 border border-slate-800">
-
-              <div className="flex items-center justify-between mb-4">
-
-                <span className="px-3 py-1 bg-purple-900/50 text-purple-300 text-xs font-bold rounded tracking-wide">
-                  TRADER YODHA X SIGNAL ENGINE
-                </span>
-
-                <span className="text-xs text-slate-500 font-mono">
-                  1-Min Candle Transition
-                </span>
-
+            <div className="bg-[#0f172a] border border-slate-800 rounded-xl p-6 text-center">
+              <div className="text-xs text-slate-500 mb-3">
+                00:00 SIGNAL
               </div>
 
-              <div className="text-center py-8">
-
-                <div
-                  className={`inline-block px-14 py-6 rounded-2xl text-6xl font-black tracking-widest border-4 transition-all duration-300 ${
-                    aiSignal ===
-                    'CALL'
-                      ? 'bg-emerald-500/10 border-emerald-400 text-emerald-400'
-                      : aiSignal ===
-                        'PUT'
-                      ? 'bg-red-500/10 border-red-400 text-red-400'
-                      : 'bg-slate-800 border-slate-700 text-slate-600'
-                  }`}
-                >
-                  {aiSignal}
-                </div>
-
+              <div
+                className={`inline-block px-12 py-5 rounded-2xl border-4 text-5xl font-black ${
+                  signal ===
+                  "CALL"
+                    ? "border-emerald-400 text-emerald-400"
+                    : signal ===
+                      "PUT"
+                    ? "border-red-400 text-red-400"
+                    : "border-slate-700 text-slate-600"
+                }`}
+              >
+                {signal}
               </div>
 
-              {currentAnalysis && (
-                <div className="mb-5 grid grid-cols-3 gap-3">
+              {signal !==
+                "WAIT" && (
+                <div className="grid grid-cols-2 gap-3 mt-6">
+                  <button
+                    onClick={() =>
+                      logOutcome(
+                        "WIN"
+                      )
+                    }
+                    className="py-3 bg-emerald-600 rounded-lg font-bold"
+                  >
+                    WIN
+                  </button>
 
-                  <div className="bg-[#020617] rounded-lg p-3 text-center">
-                    <div className="text-xs text-slate-500">
-                      Candles
-                    </div>
-
-                    <div className="text-cyan-400 font-bold text-lg">
-                      {
-                        currentAnalysis
-                          .detectedCandles
-                          .length
-                      }
-                    </div>
-                  </div>
-
-                  <div className="bg-[#020617] rounded-lg p-3 text-center">
-                    <div className="text-xs text-slate-500">
-                      Latest #
-                    </div>
-
-                    <div className="text-purple-400 font-bold text-lg">
-                      {
-                        currentAnalysis
-                          .detectedCandles[
-                          currentAnalysis
-                            .detectedCandles
-                            .length -
-                            1
-                        ]?.id
-                      }
-                    </div>
-                  </div>
-
-                  <div className="bg-[#020617] rounded-lg p-3 text-center">
-                    <div className="text-xs text-slate-500">
-                      Evidence
-                    </div>
-
-                    <div className="text-emerald-400 font-bold text-lg">
-                      {currentAnalysis.strength.toFixed(
-                        1
-                      )}%
-                    </div>
-                  </div>
-
+                  <button
+                    onClick={() =>
+                      logOutcome(
+                        "LOSS"
+                      )
+                    }
+                    className="py-3 bg-red-600 rounded-lg font-bold"
+                  >
+                    LOSS
+                  </button>
                 </div>
               )}
-
-              {aiSignal !==
-                'WAIT' && (
-                <div className="mt-4 pt-4 border-t border-slate-800">
-
-                  <p className="text-xs text-slate-400 text-center mb-3">
-                    Log outcome to train the candle-pattern brain:
-                  </p>
-
-                  <div className="grid grid-cols-2 gap-3">
-
-                    <button
-                      onClick={() =>
-                        logTradeOutcome(
-                          'WIN'
-                        )
-                      }
-                      className="py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg transition-all tracking-wide"
-                    >
-                      WIN
-                    </button>
-
-                    <button
-                      onClick={() =>
-                        logTradeOutcome(
-                          'LOSS'
-                        )
-                      }
-                      className="py-3 bg-red-600 hover:bg-red-500 text-white font-bold rounded-lg transition-all tracking-wide"
-                    >
-                      LOSS
-                    </button>
-
-                  </div>
-
-                </div>
-              )}
-
             </div>
-
           </div>
         </div>
       </main>
