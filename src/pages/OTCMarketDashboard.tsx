@@ -75,6 +75,22 @@ type PatternFlags = {
   extractedRule: { detected: boolean; rule: string; direction: "CALL" | "PUT"; confidence: number };
 };
 
+// A single logic's contribution to the combined CALL/PUT score
+type ScoreContribution = {
+  logic: string;
+  direction: "CALL" | "PUT";
+  weight: number;
+  detail: string;
+};
+
+// Identifies a participating rule for outcome learning
+type ParticipatingRule = {
+  type: "MEMORY" | "AUTO_PATTERN" | "EXTRACTED_RULE";
+  id: string;
+  key?: string;
+  direction: "CALL" | "PUT";
+};
+
 // Image-extracted pattern with exact visual metrics
 type ExtractedRule = {
   id: string;
@@ -133,6 +149,12 @@ const AUTO_PATTERN_MIN_OCCURRENCES = 2;
 const SCAN_INTERVAL_MS = 300;
 const MANUAL_SCAN_ITERATIONS = 15;
 const AUTO_SCAN_MAX_ITERATIONS = 50;
+
+// Combined confidence threshold — signal fires only when the dominant side
+// exceeds this percentage of the total weighted evidence
+const SIGNAL_THRESHOLD = 58;
+// Minimum total weighted evidence required before any signal is considered
+const MIN_TOTAL_EVIDENCE = 4;
 
 const token = (c: Candle) => `${c.color[0]}-${c.shape}`;
 const roundNumber = (p: number) => /(?:000|500)$/.test(p.toFixed(5));
@@ -809,6 +831,8 @@ export default function OTCMarketDashboard() {
     candles: Candle[]; price: number; confidence: number; sequence: string[];
     indicators: Indicators; structure: Structure | null; patterns: PatternFlags;
     reversed: boolean; reasons: string[];
+    scoreBreakdown: ScoreContribution[];
+    callTotal: number; putTotal: number;
   } | null>(null);
   const [stats, setStats] = useState({
     candles: 0, memories: 0, trades: 0, zigzag: 0, structure: 0, winRate: 0, autoPatterns: 0, extractedRules: 0,
@@ -839,6 +863,7 @@ export default function OTCMarketDashboard() {
   const scanIterations = useRef(0);
   const imageCanvasRef = useRef<HTMLCanvasElement>(null);
   const lastMatchedRule = useRef<ExtractedRule | null>(null);
+  const participatingRules = useRef<ParticipatingRule[]>([]);
   const brain = useRef<Brain>({
     memories: [], trades: [], zigzag: [], structure: [], autoPatterns: [], extractedRules: [...SEED_RULES], winRate: 0,
   });
@@ -1185,7 +1210,10 @@ export default function OTCMarketDashboard() {
   }, [active, analyzeFrame]);
 
   // ============================================
-  // FINALIZE ANALYSIS — compute signal from all collected data
+  // UNIFIED COMBINED DECISION ENGINE
+  // All pattern logics, indicators, and rule engines run simultaneously.
+  // Each contributes a weighted score to CALL or PUT. Signal fires only when
+  // the dominant side's confidence crosses SIGNAL_THRESHOLD.
   // ============================================
 
   const finalizeAnalysis = useCallback(() => {
@@ -1206,7 +1234,9 @@ export default function OTCMarketDashboard() {
     const zigzagPoints = zigzagRef.current;
     const memory = recent.length === 5 ? brain.current.memories.find((item) => item.key === recent.map(token).join(">")) ?? null : null;
     const structure = zigzagPoints.at(-1)?.label ?? null;
+    const snr = snrLevelsRef.current;
 
+    // Run ALL detectors simultaneously
     const patterns: PatternFlags = {
       sequential7: detectSequential7(allCandles, brain.current),
       breakdown: detectBreakdown(allCandles, zigzagPoints),
@@ -1217,65 +1247,165 @@ export default function OTCMarketDashboard() {
       extractedRule: detectExtractedRules(allCandles, zigzagPoints, brain.current.extractedRules),
     };
 
-    let call = 0; let put = 0;
-    const reasons: string[] = [latest.shape];
+    // Reset participating rules for this analysis cycle
+    participatingRules.current = [];
+    const breakdown: ScoreContribution[] = [];
+    let call = 0;
+    let put = 0;
 
-    if (latest.lowerRatio > WICK_REJECTION_RATIO) { call += 2; reasons.push("lower-wick rejection"); }
-    if (latest.upperRatio > WICK_REJECTION_RATIO) { put += 2; reasons.push("upper-wick rejection"); }
+    // --- 1. SNR / Horizontal Support & Resistance Levels ---
+    const nearSupport = snr.find((l) => l.type === "SUPPORT" && Math.abs(l.y - latest.bottom) < CONFLUENCE_PROXIMITY_PX);
+    const nearResistance = snr.find((l) => l.type === "RESISTANCE" && Math.abs(l.y - latest.top) < CONFLUENCE_PROXIMITY_PX);
+    if (nearSupport) {
+      const w = 2 + Math.min(nearSupport.touches, 3);
+      call += w;
+      breakdown.push({ logic: "SNR Support", direction: "CALL", weight: w, detail: `${nearSupport.label} @ ${nearSupport.price ? nearSupport.price.toFixed(5) : `y:${nearSupport.y}`} (${nearSupport.touches}x)` });
+    }
+    if (nearResistance) {
+      const w = 2 + Math.min(nearResistance.touches, 3);
+      put += w;
+      breakdown.push({ logic: "SNR Resistance", direction: "PUT", weight: w, detail: `${nearResistance.label} @ ${nearResistance.price ? nearResistance.price.toFixed(5) : `y:${nearResistance.y}`} (${nearResistance.touches}x)` });
+    }
+
+    // --- 2. Latest candle wick rejection ---
+    if (latest.lowerRatio > WICK_REJECTION_RATIO) {
+      const w = 2;
+      call += w;
+      breakdown.push({ logic: "Lower Wick Rejection", direction: "CALL", weight: w, detail: `ratio ${latest.lowerRatio.toFixed(1)}` });
+    }
+    if (latest.upperRatio > WICK_REJECTION_RATIO) {
+      const w = 2;
+      put += w;
+      breakdown.push({ logic: "Upper Wick Rejection", direction: "PUT", weight: w, detail: `ratio ${latest.upperRatio.toFixed(1)}` });
+    }
+
+    // --- 3. RSI14 ---
     if (technical.rsi14 != null) {
-      if (technical.rsi14 < 35) { call += 2; reasons.push(`RSI14 oversold ${technical.rsi14.toFixed(1)}`); }
-      if (technical.rsi14 > 65) { put += 2; reasons.push(`RSI14 overbought ${technical.rsi14.toFixed(1)}`); }
+      if (technical.rsi14 < 35) {
+        const w = 2;
+        call += w;
+        breakdown.push({ logic: "RSI14 Oversold", direction: "CALL", weight: w, detail: technical.rsi14.toFixed(1) });
+      }
+      if (technical.rsi14 > 65) {
+        const w = 2;
+        put += w;
+        breakdown.push({ logic: "RSI14 Overbought", direction: "PUT", weight: w, detail: technical.rsi14.toFixed(1) });
+      }
     }
-    if (structure === "HH" || structure === "HL") { call++; reasons.push(`structure ${structure}`); }
-    if (structure === "LH" || structure === "LL") { put++; reasons.push(`structure ${structure}`); }
 
+    // --- 4. Market Structure (HH/HL/LH/LL) ---
+    if (structure === "HH" || structure === "HL") {
+      const w = 1;
+      call += w;
+      breakdown.push({ logic: "Market Structure", direction: "CALL", weight: w, detail: structure });
+    }
+    if (structure === "LH" || structure === "LL") {
+      const w = 1;
+      put += w;
+      breakdown.push({ logic: "Market Structure", direction: "PUT", weight: w, detail: structure });
+    }
+
+    // --- 5. 7-Candle Sequential Pattern ---
     if (patterns.sequential7.detected && patterns.sequential7.prediction !== "WAIT") {
-      if (patterns.sequential7.prediction === "CALL") { call += 3; reasons.push(`7-candle sequential CALL (${patterns.sequential7.confidence.toFixed(0)}%)`); }
-      else { put += 3; reasons.push(`7-candle sequential PUT (${patterns.sequential7.confidence.toFixed(0)}%)`); }
+      const w = 3;
+      if (patterns.sequential7.prediction === "CALL") { call += w; breakdown.push({ logic: "7-Candle Sequential", direction: "CALL", weight: w, detail: `${patterns.sequential7.confidence.toFixed(0)}%` }); }
+      else { put += w; breakdown.push({ logic: "7-Candle Sequential", direction: "PUT", weight: w, detail: `${patterns.sequential7.confidence.toFixed(0)}%` }); }
     }
-    if (patterns.breakdown.detected) { put += 3; reasons.push(`2-red breakdown: ${patterns.breakdown.level}`); }
+
+    // --- 6. 2-Red Breakdown ---
+    if (patterns.breakdown.detected) {
+      const w = 3;
+      put += w;
+      breakdown.push({ logic: "2-Red Breakdown", direction: "PUT", weight: w, detail: patterns.breakdown.level });
+    }
+
+    // --- 7. 3-Wick Rejection ---
     if (patterns.wickRejection.detected) {
-      if (patterns.wickRejection.direction === "CALL") { call += 3; reasons.push("3-candle lower wick rejection"); }
-      else { put += 3; reasons.push("3-candle upper wick rejection"); }
+      const w = 3;
+      if (patterns.wickRejection.direction === "CALL") { call += w; breakdown.push({ logic: "3-Wick Rejection", direction: "CALL", weight: w, detail: `${patterns.wickRejection.count}x lower` }); }
+      else { put += w; breakdown.push({ logic: "3-Wick Rejection", direction: "PUT", weight: w, detail: `${patterns.wickRejection.count}x upper` }); }
     }
+
+    // --- 8. Confluence ---
     if (patterns.confluence.score >= 2) {
       const nearLow = zigzagPoints.some((p) => p.type === "LOW" && Math.abs(p.y - latest.bottom) < CONFLUENCE_PROXIMITY_PX);
       const nearHigh = zigzagPoints.some((p) => p.type === "HIGH" && Math.abs(p.y - latest.top) < CONFLUENCE_PROXIMITY_PX);
-      if (nearLow) { call += patterns.confluence.score; reasons.push(`confluence (${patterns.confluence.points.join(" + ")})`); }
-      else if (nearHigh) { put += patterns.confluence.score; reasons.push(`confluence (${patterns.confluence.points.join(" + ")})`); }
+      const w = patterns.confluence.score;
+      if (nearLow) { call += w; breakdown.push({ logic: "Confluence", direction: "CALL", weight: w, detail: patterns.confluence.points.join(" + ") }); }
+      else if (nearHigh) { put += w; breakdown.push({ logic: "Confluence", direction: "PUT", weight: w, detail: patterns.confluence.points.join(" + ") }); }
     }
+
+    // --- 9. Trap Detection ---
     if (patterns.trap.detected) {
-      if (patterns.trap.direction === "CALL") { call += 4; reasons.push(`TRAP: ${patterns.trap.type} → CALL`); }
-      else { put += 4; reasons.push(`TRAP: ${patterns.trap.type} → PUT`); }
+      const w = 4;
+      if (patterns.trap.direction === "CALL") { call += w; breakdown.push({ logic: "Trap Detection", direction: "CALL", weight: w, detail: patterns.trap.type }); }
+      else { put += w; breakdown.push({ logic: "Trap Detection", direction: "PUT", weight: w, detail: patterns.trap.type }); }
     }
+
+    // --- 10. Micro-Sequence Auto Pattern Learner ---
     if (patterns.autoPrediction.prediction !== "WAIT") {
-      if (patterns.autoPrediction.prediction === "CALL") { call += 2; reasons.push(`auto-pattern ${patterns.autoPrediction.matched} CALL (${patterns.autoPrediction.confidence.toFixed(0)}%)`); }
-      else { put += 2; reasons.push(`auto-pattern ${patterns.autoPrediction.matched} PUT (${patterns.autoPrediction.confidence.toFixed(0)}%)`); }
+      const w = 2;
+      if (patterns.autoPrediction.prediction === "CALL") {
+        call += w;
+        breakdown.push({ logic: "Micro-Sequence", direction: "CALL", weight: w, detail: `${patterns.autoPrediction.matched} ${patterns.autoPrediction.confidence.toFixed(0)}%` });
+      } else {
+        put += w;
+        breakdown.push({ logic: "Micro-Sequence", direction: "PUT", weight: w, detail: `${patterns.autoPrediction.matched} ${patterns.autoPrediction.confidence.toFixed(0)}%` });
+      }
+      // Track participating auto patterns for outcome learning
+      for (let len = AUTO_PATTERN_MIN_LENGTH; len <= AUTO_PATTERN_MAX_LENGTH; len++) {
+        if (allCandles.length < len) continue;
+        const autoKey = allCandles.slice(-len).map(microToken).join(">");
+        participatingRules.current.push({ type: "AUTO_PATTERN", id: autoKey, direction: patterns.autoPrediction.prediction as "CALL" | "PUT" });
+      }
     }
+
+    // --- 11. Image Extracted Rules (trust-weighted) ---
     if (patterns.extractedRule.detected) {
       const matchedRule = brain.current.extractedRules.find((r) => r.name === patterns.extractedRule.rule);
-      if (matchedRule) lastMatchedRule.current = matchedRule;
-      if (patterns.extractedRule.direction === "CALL") { call += 3; reasons.push(`IMG-RULE: ${patterns.extractedRule.rule} → CALL (${patterns.extractedRule.confidence.toFixed(0)}%)`); }
-      else { put += 3; reasons.push(`IMG-RULE: ${patterns.extractedRule.rule} → PUT (${patterns.extractedRule.confidence.toFixed(0)}%)`); }
-    }
-    if (memory) {
-      if (memory.green > memory.red) { call++; reasons.push(`memory ${memory.confidence.toFixed(1)}%`); }
-      if (memory.red > memory.green) { put++; reasons.push(`memory ${memory.confidence.toFixed(1)}%`); }
+      if (matchedRule) {
+        lastMatchedRule.current = matchedRule;
+        // Weight scales with the rule's dynamic trust weight (40-95)
+        const w = Math.round((patterns.extractedRule.confidence / 100) * (matchedRule.trustWeight / 100) * 5);
+        if (patterns.extractedRule.direction === "CALL") { call += w; breakdown.push({ logic: "Image Rule", direction: "CALL", weight: w, detail: `${matchedRule.name} (${matchedRule.trustWeight}% trust)` }); }
+        else { put += w; breakdown.push({ logic: "Image Rule", direction: "PUT", weight: w, detail: `${matchedRule.name} (${matchedRule.trustWeight}% trust)` }); }
+        participatingRules.current.push({ type: "EXTRACTED_RULE", id: matchedRule.id, direction: patterns.extractedRule.direction });
+      }
     }
 
+    // --- 12. Human-Brain Memory Pattern ---
+    if (memory) {
+      if (memory.green > memory.red) {
+        const w = 1;
+        call += w;
+        breakdown.push({ logic: "Memory Pattern", direction: "CALL", weight: w, detail: `${memory.confidence.toFixed(1)}% (${memory.occurrences}x)` });
+      }
+      if (memory.red > memory.green) {
+        const w = 1;
+        put += w;
+        breakdown.push({ logic: "Memory Pattern", direction: "PUT", weight: w, detail: `${memory.confidence.toFixed(1)}% (${memory.occurrences}x)` });
+      }
+      participatingRules.current.push({ type: "MEMORY", id: memory.key, direction: memory.green > memory.red ? "CALL" : "PUT" });
+    }
+
+    // --- Combined Decision ---
     const total = call + put;
-    let nextSignal: Signal = total < 3 || Math.abs(call - put) < 0.5 ? "WAIT" : call > put ? "CALL" : "PUT";
-    const confidence = total ? (Math.max(call, put) / total) * 100 : 0;
+    const dominantScore = Math.max(call, put);
+    const combinedConfidence = total > 0 ? (dominantScore / total) * 100 : 0;
+    let nextSignal: Signal = total < MIN_TOTAL_EVIDENCE || combinedConfidence < SIGNAL_THRESHOLD ? "WAIT" : call > put ? "CALL" : "PUT";
     let signalReversed = false;
 
-    // REVERSE TRADING LOGIC
+    // REVERSE TRADING LOGIC — flips signal when the matched memory has a loss streak
     if (memory && (memory.lossStreak >= REVERSE_LOSS_STREAK || memory.reverse) && nextSignal !== "WAIT") {
       nextSignal = nextSignal === "CALL" ? "PUT" : "CALL";
       signalReversed = true;
-      reasons.push("** REVERSE LOGIC ACTIVATED ** (pattern loss streak detected — signal flipped)");
+      breakdown.push({ logic: "REVERSE LOGIC", direction: nextSignal as "CALL" | "PUT", weight: 0, detail: `Loss streak ${memory.lossStreak} — signal flipped` });
     }
 
-    setAnalysis({ candles: recent, price, confidence, sequence: recent.map(token), indicators: technical, structure, patterns, reversed: signalReversed, reasons });
+    // Sort breakdown by weight descending for UI display
+    breakdown.sort((a, b) => b.weight - a.weight);
+
+    setAnalysis({ candles: recent, price, confidence: combinedConfidence, sequence: recent.map(token), indicators: technical, structure, patterns, reversed: signalReversed, reasons: breakdown.map((b) => `${b.logic} ${b.direction === "CALL" ? "+" : "-"}${b.weight}`), scoreBreakdown: breakdown, callTotal: call, putTotal: put });
     setReversed(signalReversed);
     pending.current = nextSignal === "WAIT" ? null : nextSignal;
 
@@ -1283,7 +1413,7 @@ export default function OTCMarketDashboard() {
     const reverseText = signalReversed ? " | REVERSED" : "";
     const autoText = patterns.autoPrediction.prediction !== "WAIT" ? ` | AUTO: ${patterns.autoPrediction.prediction}` : "";
     const ruleText = patterns.extractedRule.detected ? ` | IMG-RULE: ${patterns.extractedRule.rule}` : "";
-    setStatus(`Deep 46S OTC analysis complete: ${nextSignal} | ${confidence.toFixed(1)}% evidence | price ${price.toFixed(5)}${trapText}${autoText}${ruleText}${reverseText}`);
+    setStatus(`Deep 46S OTC analysis complete: ${nextSignal} | ${combinedConfidence.toFixed(1)}% combined confidence (CALL ${call} vs PUT ${put}) | price ${price.toFixed(5)}${trapText}${autoText}${ruleText}${reverseText}`);
 
     deepScanActive.current = false;
     setScanning(false);
@@ -1364,42 +1494,56 @@ export default function OTCMarketDashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   });
 
-  // Log trade outcome — updates memory, auto patterns, loss streak / reverse tracking
+  // Log trade outcome — updates ALL participating rules simultaneously
   const logOutcome = (result: Outcome) => {
     if (!analysis || signal === "WAIT") return;
-    const key = analysis.sequence.join(">");
-    const memory = brain.current.memories.find((item) => item.key === key);
-    if (memory) {
-      if (result === "WIN") { memory.wins++; memory.lossStreak = 0; memory.reverse = false; }
-      else { memory.losses++; memory.lossStreak++; if (memory.lossStreak >= REVERSE_LOSS_STREAK) memory.reverse = true; }
-    }
-    // Update auto patterns with win/loss
-    for (let len = AUTO_PATTERN_MIN_LENGTH; len <= AUTO_PATTERN_MAX_LENGTH; len++) {
-      if (analysis.candles.length < len) continue;
-      const autoKey = analysis.candles.slice(-len).map(microToken).join(">");
-      const ap = brain.current.autoPatterns.find((p) => p.key === autoKey);
-      if (ap) { if (result === "WIN") ap.wins++; else ap.losses++; }
-    }
-    // Update matched extracted rule and generate a live variant
-    if (lastMatchedRule.current) {
-      const rule = brain.current.extractedRules.find((r) => r.id === lastMatchedRule.current!.id);
-      if (rule) {
-        rule.occurrences++;
-        if (result === "WIN") { rule.wins++; rule.trustWeight = Math.min(rule.trustWeight + 2, 95); }
-        else { rule.losses++; rule.trustWeight = Math.max(rule.trustWeight - 5, 40); }
-        const variant = generateVariant(rule, analysis.candles, result);
-        if (variant) {
-          brain.current.extractedRules = [...brain.current.extractedRules, variant].slice(-40);
-          setExtractedRulesList([...brain.current.extractedRules]);
+
+    // Update every participating rule from the unified decision
+    for (const participant of participatingRules.current) {
+      if (participant.type === "MEMORY") {
+        const memory = brain.current.memories.find((m) => m.key === participant.id);
+        if (memory) {
+          if (result === "WIN") { memory.wins++; memory.lossStreak = 0; memory.reverse = false; }
+          else { memory.losses++; memory.lossStreak++; if (memory.lossStreak >= REVERSE_LOSS_STREAK) memory.reverse = true; }
+        }
+      } else if (participant.type === "AUTO_PATTERN") {
+        const ap = brain.current.autoPatterns.find((p) => p.key === participant.id);
+        if (ap) { if (result === "WIN") ap.wins++; else ap.losses++; }
+      } else if (participant.type === "EXTRACTED_RULE") {
+        const rule = brain.current.extractedRules.find((r) => r.id === participant.id);
+        if (rule) {
+          rule.occurrences++;
+          if (result === "WIN") { rule.wins++; rule.trustWeight = Math.min(rule.trustWeight + 2, 95); }
+          else { rule.losses++; rule.trustWeight = Math.max(rule.trustWeight - 5, 40); }
+          // Generate a variant from the live candle shape
+          const variant = generateVariant(rule, analysis.candles, result);
+          if (variant) {
+            brain.current.extractedRules = [...brain.current.extractedRules, variant].slice(-40);
+            setExtractedRulesList([...brain.current.extractedRules]);
+          }
         }
       }
-      lastMatchedRule.current = null;
     }
+
+    // If no memory was a participant, still update by sequence key for backward compat
+    if (!participatingRules.current.some((p) => p.type === "MEMORY")) {
+      const key = analysis.sequence.join(">");
+      const memory = brain.current.memories.find((m) => m.key === key);
+      if (memory) {
+        if (result === "WIN") { memory.wins++; memory.lossStreak = 0; memory.reverse = false; }
+        else { memory.losses++; memory.lossStreak++; if (memory.lossStreak >= REVERSE_LOSS_STREAK) memory.reverse = true; }
+      }
+    }
+
+    // Clear participants for next cycle
+    participatingRules.current = [];
+    lastMatchedRule.current = null;
+
     brain.current.trades.push({ pattern: analysis.sequence.join(" → "), result, price: analysis.price });
     brain.current.winRate = (brain.current.trades.filter((t) => t.result === "WIN").length / brain.current.trades.length) * 100;
     void saveBrain();
     setSignal("WAIT"); setReversed(false);
-    setStatus(`Outcome logged [${result}]. TRADER_YODHA_X_AI OTC memory updated — loss streaks, auto-patterns & image rules tracked.`);
+    setStatus(`Outcome logged [${result}]. ALL participating rules updated simultaneously — memory, auto-patterns & image rules trust weights adjusted.`);
   };
 
   // ROI handlers
@@ -1657,7 +1801,7 @@ export default function OTCMarketDashboard() {
                   <div>Price: {priceText(analysis.price)} {round ? "ROUND SNR" : ""}</div>
                   <div>Structure: {analysis.structure ?? "Awaiting pivot"}</div>
                   <div>Sequence: <span className="text-cyan-300 break-all">{analysis.sequence.join(" → ")}</span></div>
-                  <div>Evidence: <span className="text-emerald-400">{analysis.confidence.toFixed(1)}%</span></div>
+                  <div>Evidence: <span className="text-emerald-400">{analysis.confidence.toFixed(1)}%</span> <span className="text-slate-600">(CALL {analysis.callTotal} / PUT {analysis.putTotal})</span></div>
                   <div>RSI14: {analysis.indicators.rsi14 == null ? "—" : analysis.indicators.rsi14.toFixed(1)}</div>
                   <div className="text-slate-400">{analysis.reasons.join(" • ")}</div>
                 </div>
@@ -1709,6 +1853,38 @@ export default function OTCMarketDashboard() {
                 </div>
                 {reversed && signal !== "WAIT" && <div className="mt-3 text-orange-400 text-sm font-bold animate-pulse">Signal Reversed via Loss-Streak Logic</div>}
               </div>
+
+              {/* COMBINED SCORE BREAKDOWN — shows every logic that contributed */}
+              {analysis && analysis.scoreBreakdown.length > 0 && (
+                <div className="border-t border-slate-800 pt-4 mb-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="text-xs font-bold text-slate-400 uppercase tracking-wider font-mono">Combined Score Breakdown</span>
+                    <span className="text-xs font-mono">
+                      <span className="text-emerald-400">CALL {analysis.callTotal}</span>
+                      <span className="text-slate-600 mx-1">vs</span>
+                      <span className="text-red-400">PUT {analysis.putTotal}</span>
+                    </span>
+                  </div>
+                  <div className="space-y-1.5 max-h-56 overflow-y-auto">
+                    {analysis.scoreBreakdown.map((contrib, i) => (
+                      <div key={i} className="flex items-center justify-between px-3 py-1.5 rounded bg-[#020617] text-xs font-mono">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${contrib.direction === "CALL" ? "bg-emerald-400" : "bg-red-400"}`} />
+                          <span className="text-slate-300 truncate">{contrib.logic}</span>
+                          <span className="text-slate-600 truncate hidden sm:inline">{contrib.detail}</span>
+                        </div>
+                        <span className={`flex-shrink-0 font-bold ${contrib.direction === "CALL" ? "text-emerald-400" : "text-red-400"}`}>
+                          {contrib.logic === "REVERSE LOGIC" ? "FLIP" : `+${contrib.weight}`}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-2 text-center text-xs font-mono text-slate-500">
+                    Combined Confidence: <span className={analysis.confidence >= SIGNAL_THRESHOLD ? "text-cyan-400 font-bold" : "text-slate-600"}>{analysis.confidence.toFixed(1)}%</span>
+                    <span className="text-slate-600"> (threshold {SIGNAL_THRESHOLD}%)</span>
+                  </div>
+                </div>
+              )}
               {signal !== "WAIT" && (
                 <div className="border-t border-slate-800 pt-4">
                   <p className="text-xs text-slate-400 text-center mb-3">Log outcome to train the live OTC brain:</p>
