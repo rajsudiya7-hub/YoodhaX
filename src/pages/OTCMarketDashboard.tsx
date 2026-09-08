@@ -63,6 +63,10 @@ type SNRLevel = {
   touches: number;
   price: number | null;
   label: string;
+  isRound: boolean;
+  isMajor: boolean;
+  behavior: "NONE" | "BOUNCE" | "BREAK";
+  strength: number;
 };
 
 type PatternFlags = {
@@ -142,6 +146,7 @@ const REVERSE_LOSS_STREAK = 2;
 
 const SNR_CLUSTER_PROXIMITY_PX = 8;
 const SNR_MAX_LEVELS = 8;
+const SNR_MIN_TOUCHES = 2;
 const AUTO_PATTERN_MIN_LENGTH = 2;
 const AUTO_PATTERN_MAX_LENGTH = 4;
 const AUTO_PATTERN_MIN_OCCURRENCES = 2;
@@ -259,8 +264,10 @@ function calculateZigZag(
 }
 
 // ============================================
-// AUTO HORIZONTAL SUPPORT & RESISTANCE LEVELS
-// Groups ZigZag pivots into clusters and adds round number SNR
+// AUTO LEVEL DETECTION SYSTEM
+// Automatically detects Support/Resistance from swing highs/lows,
+// classifies major vs minor by touch count, detects psychological round-number
+// levels, and checks break/bounce behavior against the latest candle.
 // ============================================
 
 function calculateSNRLevels(
@@ -269,39 +276,88 @@ function calculateSNRLevels(
   prices: number[],
 ): SNRLevel[] {
   const levels: SNRLevel[] = [];
+  const latest = candles.at(-1);
 
-  // Cluster HIGH pivots → resistance levels
-  const highClusters: { y: number; touches: number }[] = [];
+  // --- Cluster HIGH pivots → resistance levels ---
+  const highClusters: { y: number; touches: number; candleIds: number[] }[] = [];
   for (const p of zigzag.filter((z) => z.type === "HIGH")) {
     const cluster = highClusters.find((c) => Math.abs(c.y - p.y) < SNR_CLUSTER_PROXIMITY_PX);
     if (cluster) {
       cluster.y = (cluster.y * cluster.touches + p.y) / (cluster.touches + 1);
       cluster.touches++;
+      cluster.candleIds.push(p.candleId);
     } else {
-      highClusters.push({ y: p.y, touches: 1 });
+      highClusters.push({ y: p.y, touches: 1, candleIds: [p.candleId] });
     }
   }
 
-  // Cluster LOW pivots → support levels
-  const lowClusters: { y: number; touches: number }[] = [];
+  // --- Cluster LOW pivots → support levels ---
+  const lowClusters: { y: number; touches: number; candleIds: number[] }[] = [];
   for (const p of zigzag.filter((z) => z.type === "LOW")) {
     const cluster = lowClusters.find((c) => Math.abs(c.y - p.y) < SNR_CLUSTER_PROXIMITY_PX);
     if (cluster) {
       cluster.y = (cluster.y * cluster.touches + p.y) / (cluster.touches + 1);
       cluster.touches++;
+      cluster.candleIds.push(p.candleId);
     } else {
-      lowClusters.push({ y: p.y, touches: 1 });
+      lowClusters.push({ y: p.y, touches: 1, candleIds: [p.candleId] });
     }
   }
 
+  // Helper: detect break vs bounce behavior
+  const detectBehavior = (levelY: number, type: "SUPPORT" | "RESISTANCE"): "NONE" | "BOUNCE" | "BREAK" => {
+    if (!latest) return "NONE";
+    if (type === "RESISTANCE") {
+      // Break: candle closed above resistance
+      if (latest.bodyTop < levelY - BREAKDOWN_TOLERANCE_PX && latest.closeY < levelY) return "BOUNCE";
+      if (latest.closeY < levelY && latest.top > levelY) return "BOUNCE"; // wick rejection
+      if (latest.closeY > levelY + BREAKDOWN_TOLERANCE_PX) return "BREAK";
+    } else {
+      // Break: candle closed below support
+      if (latest.bodyBottom > levelY + BREAKDOWN_TOLERANCE_PX && latest.closeY > levelY) return "BOUNCE";
+      if (latest.closeY > levelY && latest.bottom < levelY) return "BOUNCE"; // wick rejection
+      if (latest.closeY < levelY - BREAKDOWN_TOLERANCE_PX) return "BREAK";
+    }
+    return "NONE";
+  };
+
+  // Build resistance levels — only levels with SNR_MIN_TOUCHES or more distinct touches
   for (const c of highClusters) {
-    levels.push({ y: Math.round(c.y), type: "RESISTANCE", touches: c.touches, price: null, label: `R (${c.touches}x)` });
-  }
-  for (const c of lowClusters) {
-    levels.push({ y: Math.round(c.y), type: "SUPPORT", touches: c.touches, price: null, label: `S (${c.touches}x)` });
+    if (c.touches < SNR_MIN_TOUCHES) continue;
+    const isMajor = c.touches >= 3;
+    const behavior = detectBehavior(Math.round(c.y), "RESISTANCE");
+    levels.push({
+      y: Math.round(c.y),
+      type: "RESISTANCE",
+      touches: c.touches,
+      price: null,
+      label: `${isMajor ? "Major " : ""}R (${c.touches}x)`,
+      isRound: false,
+      isMajor,
+      behavior,
+      strength: Math.min(c.touches * 20, 100),
+    });
   }
 
-  // Add round number SNR levels using price-to-Y estimation
+  // Build support levels — only levels with SNR_MIN_TOUCHES or more distinct touches
+  for (const c of lowClusters) {
+    if (c.touches < SNR_MIN_TOUCHES) continue;
+    const isMajor = c.touches >= 3;
+    const behavior = detectBehavior(Math.round(c.y), "SUPPORT");
+    levels.push({
+      y: Math.round(c.y),
+      type: "SUPPORT",
+      touches: c.touches,
+      price: null,
+      label: `${isMajor ? "Major " : ""}S (${c.touches}x)`,
+      isRound: false,
+      isMajor,
+      behavior,
+      strength: Math.min(c.touches * 20, 100),
+    });
+  }
+
+  // --- Round number psychological levels — only major .000 and .500 within visible chart ---
   if (prices.length >= 2 && candles.length >= 2) {
     const minPrice = Math.min(...prices);
     const maxPrice = Math.max(...prices);
@@ -314,19 +370,56 @@ function calculateSNRLevels(
         const pricePerPixel = priceRange / yRange;
         const currentPrice = prices[prices.length - 1];
         const latestCandle = candles[candles.length - 1];
-        const roundBase = Math.round(currentPrice / 0.001) * 0.001;
-        for (const target of [roundBase - 0.001, roundBase, roundBase + 0.001, roundBase - 0.0005, roundBase + 0.0005]) {
-          if (target <= 0) continue;
-          const y = Math.round(latestCandle.closeY - (target - currentPrice) / pricePerPixel);
-          if (y >= -20 && y <= yRange + minTop + 20 && !levels.some((l) => Math.abs(l.y - y) < SNR_CLUSTER_PROXIMITY_PX)) {
-            levels.push({ y, type: target > currentPrice ? "RESISTANCE" : "SUPPORT", touches: 1, price: target, label: `Round ${target.toFixed(5)}` });
+
+        // Only major psychological levels: .000 and .500
+        const roundTargets = new Set<number>();
+        for (const interval of [0.001, 0.0005]) {
+          const base = Math.round(currentPrice / interval) * interval;
+          for (const offset of [-interval, 0, interval]) {
+            const target = Math.round((base + offset) * 1e6) / 1e6;
+            if (target > 0 && /(?:000|500)$/.test(target.toFixed(5))) roundTargets.add(target);
           }
+        }
+
+        for (const target of roundTargets) {
+          const y = Math.round(latestCandle.closeY - (target - currentPrice) / pricePerPixel);
+          // Only draw if within the visible chart area
+          if (y < 0 || y > yRange + minTop) continue;
+          if (levels.some((l) => Math.abs(l.y - y) < SNR_CLUSTER_PROXIMITY_PX)) continue;
+
+          // Count actual candle touches at this level
+          let touchCount = 0;
+          for (const c of candles) {
+            if (Math.abs(c.top - y) < SNR_CLUSTER_PROXIMITY_PX || Math.abs(c.bottom - y) < SNR_CLUSTER_PROXIMITY_PX) touchCount++;
+          }
+          if (touchCount < 1) continue; // skip if no candle is near this round number
+
+          const behavior = detectBehavior(y, target > currentPrice ? "RESISTANCE" : "SUPPORT");
+          const isMajor = true; // .000 and .500 are always major
+          levels.push({
+            y,
+            type: target > currentPrice ? "RESISTANCE" : "SUPPORT",
+            touches: touchCount,
+            price: target,
+            label: `Round ${target.toFixed(5)} (${touchCount}x)`,
+            isRound: true,
+            isMajor,
+            behavior,
+            strength: Math.min(touchCount * 20, 100),
+          });
         }
       }
     }
   }
 
-  return levels.sort((a, b) => b.touches - a.touches).slice(0, SNR_MAX_LEVELS);
+  // Sort by strength (touches × type weight) and return top levels
+  // Major levels always rank above minor; round numbers rank by touch count
+  return levels
+    .sort((a, b) => {
+      if (a.isMajor !== b.isMajor) return a.isMajor ? -1 : 1;
+      return b.touches - a.touches;
+    })
+    .slice(0, SNR_MAX_LEVELS);
 }
 
 // ============================================
@@ -1062,20 +1155,35 @@ export default function OTCMarketDashboard() {
     context.save();
     context.translate(box.x, box.y);
 
-    // Draw horizontal S/R lines first (behind candles)
+    // Draw auto-detected S/R levels (behind candles)
     snr.forEach((level) => {
-      context.strokeStyle = level.type === "RESISTANCE" ? "#f87171" : "#4ade80";
-      context.lineWidth = 1.5;
-      context.setLineDash([6, 4]);
+      const isRes = level.type === "RESISTANCE";
+      const color = isRes ? (level.isMajor ? "#f87171" : "#fb923c") : (level.isMajor ? "#4ade80" : "#86efac");
+      const lineW = level.isMajor ? 2.5 : 1.2;
+      const dashPattern = level.isRound ? [3, 3] : level.isMajor ? [10, 4] : [5, 5];
+
+      context.strokeStyle = color;
+      context.lineWidth = lineW;
+      context.setLineDash(dashPattern);
       context.beginPath();
       context.moveTo(0, level.y);
       context.lineTo(box.width, level.y);
       context.stroke();
       context.setLineDash([]);
-      context.fillStyle = level.type === "RESISTANCE" ? "#f87171" : "#4ade80";
-      context.font = "bold 9px monospace";
-      const tag = level.price ? `${level.type === "RESISTANCE" ? "R" : "S"} ${level.price.toFixed(5)} (${level.touches}x)` : `${level.label}`;
+
+      // Label with touch count, strength bar, and break/bounce indicator
+      context.fillStyle = color;
+      context.font = level.isMajor ? "bold 10px monospace" : "bold 8px monospace";
+      const behaviorTag = level.behavior === "BREAK" ? " [BREAK]" : level.behavior === "BOUNCE" ? " [BOUNCE]" : "";
+      const tag = level.isRound
+        ? `${isRes ? "R" : "S"} ${level.price?.toFixed(5) ?? "?"} (${level.touches}x)${behaviorTag}`
+        : `${isRes ? "R" : "S"} (${level.touches}x)${behaviorTag}`;
       context.fillText(tag, 4, level.y - 3);
+
+      // Strength indicator bar (right side)
+      const barWidth = Math.max(8, (level.strength / 100) * 40);
+      context.fillStyle = level.isMajor ? color : `${color}80`;
+      context.fillRect(box.width - barWidth - 2, level.y - 2, barWidth, 3);
     });
 
     // Draw candle outlines and IDs
@@ -1090,40 +1198,6 @@ export default function OTCMarketDashboard() {
       context.stroke();
       context.font = "bold 10px monospace";
       context.fillText(String(candle.id), candle.x, Math.max(10, candle.top - 3));
-    });
-
-    // Draw ZigZag lines
-    if (zigzag.length >= 2) {
-      context.strokeStyle = "#fbbf24";
-      context.lineWidth = 2;
-      context.setLineDash([]);
-      context.beginPath();
-      let started = false;
-      zigzag.forEach((point) => {
-        const candle = found.find((c) => c.id === point.candleId);
-        if (!candle) return;
-        const x = candle.x + candle.width / 2;
-        if (!started) { context.moveTo(x, point.y); started = true; }
-        else context.lineTo(x, point.y);
-      });
-      context.stroke();
-      zigzag.forEach((point) => {
-        const candle = found.find((c) => c.id === point.candleId);
-        if (!candle) return;
-        context.fillStyle = point.type === "HIGH" ? "#34d399" : "#fb7185";
-        context.beginPath();
-        context.arc(candle.x + candle.width / 2, point.y, 3, 0, Math.PI * 2);
-        context.fill();
-      });
-    }
-
-    // Draw HH/HL/LH/LL labels
-    zigzag.slice(-8).forEach((point) => {
-      const candle = found.find((c) => c.id === point.candleId);
-      if (!candle) return;
-      context.fillStyle = point.label === "HH" || point.label === "HL" ? "#34d399" : "#fb7185";
-      context.font = "bold 11px monospace";
-      context.fillText(point.label, candle.x, point.type === "HIGH" ? point.y - 8 : point.y + 16);
     });
 
     context.restore();
@@ -1253,18 +1327,46 @@ export default function OTCMarketDashboard() {
     let call = 0;
     let put = 0;
 
-    // --- 1. SNR / Horizontal Support & Resistance Levels ---
-    const nearSupport = snr.find((l) => l.type === "SUPPORT" && Math.abs(l.y - latest.bottom) < CONFLUENCE_PROXIMITY_PX);
-    const nearResistance = snr.find((l) => l.type === "RESISTANCE" && Math.abs(l.y - latest.top) < CONFLUENCE_PROXIMITY_PX);
-    if (nearSupport) {
-      const w = 2 + Math.min(nearSupport.touches, 3);
-      call += w;
-      breakdown.push({ logic: "SNR Support", direction: "CALL", weight: w, detail: `${nearSupport.label} @ ${nearSupport.price ? nearSupport.price.toFixed(5) : `y:${nearSupport.y}`} (${nearSupport.touches}x)` });
-    }
-    if (nearResistance) {
-      const w = 2 + Math.min(nearResistance.touches, 3);
-      put += w;
-      breakdown.push({ logic: "SNR Resistance", direction: "PUT", weight: w, detail: `${nearResistance.label} @ ${nearResistance.price ? nearResistance.price.toFixed(5) : `y:${nearResistance.y}`} (${nearResistance.touches}x)` });
+    // --- 1. Auto SNR Levels — break/bounce confirmation ---
+    for (const level of snr) {
+      const proximity = Math.abs(level.type === "SUPPORT" ? level.y - latest.bottom : level.y - latest.top);
+      if (proximity > CONFLUENCE_PROXIMITY_PX * 2) continue;
+
+      // Bounce at support → CALL signal; Bounce at resistance → PUT signal
+      if (level.behavior === "BOUNCE") {
+        const w = level.isMajor ? 5 : 3;
+        const touchBonus = Math.min(level.touches - 1, 2);
+        const totalW = w + touchBonus;
+        if (level.type === "SUPPORT") {
+          call += totalW;
+          breakdown.push({ logic: level.isMajor ? "Major Support Bounce" : "Support Bounce", direction: "CALL", weight: totalW, detail: `${level.isRound ? level.price?.toFixed(5) : `y:${level.y}`} (${level.touches}x)` });
+        } else {
+          put += totalW;
+          breakdown.push({ logic: level.isMajor ? "Major Resistance Bounce" : "Resistance Bounce", direction: "PUT", weight: totalW, detail: `${level.isRound ? level.price?.toFixed(5) : `y:${level.y}`} (${level.touches}x)` });
+        }
+      }
+      // Break of resistance → CALL (continuation); Break of support → PUT (continuation)
+      else if (level.behavior === "BREAK") {
+        const w = level.isMajor ? 4 : 2;
+        if (level.type === "RESISTANCE") {
+          call += w;
+          breakdown.push({ logic: level.isMajor ? "Major Resistance Break" : "Resistance Break", direction: "CALL", weight: w, detail: `${level.isRound ? level.price?.toFixed(5) : `y:${level.y}`} (${level.touches}x)` });
+        } else {
+          put += w;
+          breakdown.push({ logic: level.isMajor ? "Major Support Break" : "Support Break", direction: "PUT", weight: w, detail: `${level.isRound ? level.price?.toFixed(5) : `y:${level.y}`} (${level.touches}x)` });
+        }
+      }
+      // Near a level but no confirmed break/bounce — proximity confluence (lighter weight)
+      else if (proximity < CONFLUENCE_PROXIMITY_PX) {
+        const w = level.isMajor ? 2 : 1;
+        if (level.type === "SUPPORT") {
+          call += w;
+          breakdown.push({ logic: level.isMajor ? "Major Support Proximity" : "Support Proximity", direction: "CALL", weight: w, detail: `${level.isRound ? level.price?.toFixed(5) : `y:${level.y}`} (${level.touches}x)` });
+        } else {
+          put += w;
+          breakdown.push({ logic: level.isMajor ? "Major Resistance Proximity" : "Resistance Proximity", direction: "PUT", weight: w, detail: `${level.isRound ? level.price?.toFixed(5) : `y:${level.y}`} (${level.touches}x)` });
+        }
+      }
     }
 
     // --- 2. Latest candle wick rejection ---
@@ -1699,25 +1801,31 @@ export default function OTCMarketDashboard() {
               )}
             </div>
 
-            {/* AUTO S/R LEVELS — NEW */}
+            {/* AUTO S/R LEVELS — fully automatic detection */}
             {active && snrLevels.length > 0 && (
               <div className={card}>
                 <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono flex items-center gap-2">
                   <Layers className="w-3 h-3 text-rose-400" />
-                  Auto Horizontal S/R Levels
+                  Auto S/R Levels
                 </h3>
-                <div className="space-y-1.5 text-xs font-mono max-h-48 overflow-y-auto">
+                <div className="space-y-1.5 text-xs font-mono max-h-56 overflow-y-auto">
                   {snrLevels.map((level, i) => (
                     <div key={i} className="flex items-center justify-between px-2 py-1.5 rounded bg-[#020617]">
-                      <div className="flex items-center gap-2">
-                        <span className={`w-2 h-2 rounded-full ${level.type === "RESISTANCE" ? "bg-red-400" : "bg-emerald-400"}`} />
-                        <span className={level.type === "RESISTANCE" ? "text-red-400" : "text-emerald-400"}>
-                          {level.type === "RESISTANCE" ? "Resistance" : "Support"}
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className={`w-2 h-2 rounded-full flex-shrink-0 ${level.type === "RESISTANCE" ? (level.isMajor ? "bg-red-400" : "bg-orange-400") : (level.isMajor ? "bg-emerald-400" : "bg-lime-400")}`} />
+                        <span className={`truncate ${level.type === "RESISTANCE" ? (level.isMajor ? "text-red-400 font-bold" : "text-orange-400") : (level.isMajor ? "text-emerald-400 font-bold" : "text-lime-400")}`}>
+                          {level.isMajor ? "Major " : ""}{level.type === "RESISTANCE" ? "R" : "S"}
+                          {level.isRound && " Round"}
                         </span>
+                        {level.behavior !== "NONE" && (
+                          <span className={`px-1 rounded text-[9px] flex-shrink-0 ${level.behavior === "BREAK" ? "bg-red-900/60 text-red-300" : "bg-emerald-900/60 text-emerald-300"}`}>
+                            {level.behavior}
+                          </span>
+                        )}
                       </div>
-                      <div className="text-right">
+                      <div className="text-right flex-shrink-0">
                         <span className="text-slate-300">{level.price ? level.price.toFixed(5) : `y:${level.y}`}</span>
-                        <span className="text-slate-500 ml-2">({level.touches}x)</span>
+                        <span className="text-slate-500 ml-1.5">({level.touches}x)</span>
                       </div>
                     </div>
                   ))}
@@ -1813,7 +1921,7 @@ export default function OTCMarketDashboard() {
           <div className="lg:col-span-2 space-y-4">
             <div className={card}>
               <div className="flex items-center justify-between mb-3">
-                <span className="text-xs font-bold text-slate-400">OTC CHART + CANDLE VISION + ZIGZAG + AUTO S/R LINES</span>
+                <span className="text-xs font-bold text-slate-400">OTC CHART + CANDLE VISION + AUTO S/R LINES</span>
                 {active && <button onClick={() => setLocked((v) => !v)} className="px-3 py-1 rounded text-xs font-bold text-cyan-400 bg-cyan-900/60">{locked ? "ROI Locked" : "Drag / Resize ROI"}</button>}
               </div>
               <div ref={containerRef} className="bg-[#020617] rounded-lg aspect-video flex items-center justify-center overflow-hidden border border-slate-900 relative select-none">
