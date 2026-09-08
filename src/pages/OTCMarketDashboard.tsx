@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
 import { createWorker } from "tesseract.js";
-import { Loader2, AlertTriangle, TrendingUp, TrendingDown, Shield, Zap, Activity, Layers } from "lucide-react";
+import { Loader2, AlertTriangle, TrendingUp, TrendingDown, Shield, Zap, Activity, Layers, Image as ImageIcon, Brain } from "lucide-react";
 
 // ============================================
 // TYPES
@@ -43,6 +43,7 @@ type Brain = {
   zigzag: Array<{ price: number; type: "HIGH" | "LOW"; occurrences: number }>;
   structure: Array<{ label: Structure; y: number; candleId: number }>;
   autoPatterns: AutoPattern[];
+  extractedRules: ExtractedRule[];
   winRate: number;
 };
 
@@ -71,6 +72,36 @@ type PatternFlags = {
   confluence: { score: number; points: string[] };
   trap: { detected: boolean; type: string; direction: "CALL" | "PUT" };
   autoPrediction: { prediction: Signal; confidence: number; matched: string };
+  extractedRule: { detected: boolean; rule: string; direction: "CALL" | "PUT"; confidence: number };
+};
+
+// Image-extracted pattern with exact visual metrics
+type ExtractedRule = {
+  id: string;
+  name: string;
+  bodyPct: number;
+  upperWickPct: number;
+  lowerWickPct: number;
+  colorFlow: string;
+  levelBehavior: "SR_REJECTION" | "FAKE_BREAKOUT" | "EXHAUSTION_SWEEP" | "NONE";
+  direction: "CALL" | "PUT";
+  trustWeight: number;
+  occurrences: number;
+  wins: number;
+  losses: number;
+  source: "IMAGE" | "LIVE_VARIANT";
+  createdAt: number;
+};
+
+// Metrics extracted from an uploaded chart image
+type ImageMetrics = {
+  candleCount: number;
+  avgBodyPct: number;
+  avgUpperWickPct: number;
+  avgLowerWickPct: number;
+  colorFlow: string;
+  levelBehavior: string;
+  extractedCandles: Array<{ bodyPct: number; upperWickPct: number; lowerWickPct: number; color: Color }>;
 };
 
 // ============================================
@@ -419,6 +450,283 @@ function detectTraps(candles: Candle[], zigzag: ZigZagPoint[]): { detected: bool
 }
 
 // ============================================
+// IMAGE PATTERN EXTRACTOR — Auto-Learning from chart screenshots
+// Analyzes uploaded candle chart images and converts visual rules into programmatic detectors
+// ============================================
+
+// Extract candle metrics from an image's pixel data
+function extractImageMetrics(data: Uint8ClampedArray, width: number, height: number): ImageMetrics {
+  const found = detectCandles(data, width, height);
+  if (found.length === 0) {
+    return { candleCount: 0, avgBodyPct: 0, avgUpperWickPct: 0, avgLowerWickPct: 0, colorFlow: "UNKNOWN", levelBehavior: "NONE", extractedCandles: [] };
+  }
+
+  const extractedCandles = found.map((c) => {
+    const total = Math.max(1, c.bottom - c.top);
+    return {
+      bodyPct: (c.body / total) * 100,
+      upperWickPct: (c.upper / total) * 100,
+      lowerWickPct: (c.lower / total) * 100,
+      color: c.color,
+    };
+  });
+
+  const avgBodyPct = extractedCandles.reduce((s, c) => s + c.bodyPct, 0) / extractedCandles.length;
+  const avgUpperWickPct = extractedCandles.reduce((s, c) => s + c.upperWickPct, 0) / extractedCandles.length;
+  const avgLowerWickPct = extractedCandles.reduce((s, c) => s + c.lowerWickPct, 0) / extractedCandles.length;
+
+  // Build color flow string: e.g., "GREEN→GREEN→RED"
+  const colorFlow = found.slice(-6).map((c) => c.color).join("→");
+
+  // Detect level behavior from last 3 candles
+  const last3 = found.slice(-3);
+  let levelBehavior: ImageMetrics["levelBehavior"] = "NONE";
+
+  // Check for S/R Rejection: long wick on latest candle touching a recent extreme
+  if (last3.length >= 2) {
+    const latest = last3[last3.length - 1];
+    const prevHigh = Math.min(...last3.slice(0, -1).map((c) => c.top));
+    const prevLow = Math.max(...last3.slice(0, -1).map((c) => c.bottom));
+
+    // Upper wick rejection at resistance
+    if (latest.upperRatio > 1.5 && latest.top < prevHigh + 5) {
+      levelBehavior = "SR_REJECTION";
+    }
+    // Lower wick rejection at support
+    if (latest.lowerRatio > 1.5 && latest.bottom > prevLow - 5) {
+      levelBehavior = "SR_REJECTION";
+    }
+  }
+
+  // Check for Fake Breakout: candle broke a level but closed back inside
+  if (last3.length >= 3 && levelBehavior === "NONE") {
+    const latest = last3[2];
+    const range1 = last3[0];
+    if (latest.top < range1.top - 3 && latest.closeY > range1.top) {
+      levelBehavior = "FAKE_BREAKOUT";
+    }
+    if (latest.bottom > range1.bottom + 3 && latest.closeY < range1.bottom) {
+      levelBehavior = "FAKE_BREAKOUT";
+    }
+  }
+
+  // Check for Exhaustion Sweep: 3+ same-color candles then long wick reversal
+  if (last3.length >= 3 && levelBehavior === "NONE") {
+    const first2SameColor = last3[0].color === last3[1].color;
+    const latest = last3[2];
+    if (first2SameColor) {
+      if (last3[0].color === "GREEN" && latest.lower > latest.body * 2) {
+        levelBehavior = "EXHAUSTION_SWEEP";
+      }
+      if (last3[0].color === "RED" && latest.upper > latest.body * 2) {
+        levelBehavior = "EXHAUSTION_SWEEP";
+      }
+    }
+  }
+
+  return { candleCount: found.length, avgBodyPct, avgUpperWickPct, avgLowerWickPct, colorFlow, levelBehavior, extractedCandles };
+}
+
+// Seeded default rules extracted from common OTC chart patterns (high trust baseline)
+const SEED_RULES: ExtractedRule[] = [
+  {
+    id: "seed-engulfing-red",
+    name: "Engulfing Red after Greens",
+    bodyPct: 65, upperWickPct: 10, lowerWickPct: 10,
+    colorFlow: "GREEN→GREEN→RED",
+    levelBehavior: "NONE",
+    direction: "PUT",
+    trustWeight: 70,
+    occurrences: 0, wins: 0, losses: 0,
+    source: "IMAGE",
+    createdAt: 0,
+  },
+  {
+    id: "seed-engulfing-green",
+    name: "Engulfing Green after Reds",
+    bodyPct: 65, upperWickPct: 10, lowerWickPct: 10,
+    colorFlow: "RED→RED→GREEN",
+    levelBehavior: "NONE",
+    direction: "CALL",
+    trustWeight: 70,
+    occurrences: 0, wins: 0, losses: 0,
+    source: "IMAGE",
+    createdAt: 0,
+  },
+  {
+    id: "seed-sr-rejection-bull",
+    name: "Support Rejection (Lower Wick)",
+    bodyPct: 35, upperWickPct: 15, lowerWickPct: 50,
+    colorFlow: "RED→RED→GREEN",
+    levelBehavior: "SR_REJECTION",
+    direction: "CALL",
+    trustWeight: 75,
+    occurrences: 0, wins: 0, losses: 0,
+    source: "IMAGE",
+    createdAt: 0,
+  },
+  {
+    id: "seed-sr-rejection-bear",
+    name: "Resistance Rejection (Upper Wick)",
+    bodyPct: 35, upperWickPct: 50, lowerWickPct: 15,
+    colorFlow: "GREEN→GREEN→RED",
+    levelBehavior: "SR_REJECTION",
+    direction: "PUT",
+    trustWeight: 75,
+    occurrences: 0, wins: 0, losses: 0,
+    source: "IMAGE",
+    createdAt: 0,
+  },
+  {
+    id: "seed-fake-breakout-up",
+    name: "Fake Breakout above Resistance",
+    bodyPct: 50, upperWickPct: 25, lowerWickPct: 10,
+    colorFlow: "GREEN→RED→RED",
+    levelBehavior: "FAKE_BREAKOUT",
+    direction: "PUT",
+    trustWeight: 72,
+    occurrences: 0, wins: 0, losses: 0,
+    source: "IMAGE",
+    createdAt: 0,
+  },
+  {
+    id: "seed-fake-breakout-down",
+    name: "Fake Breakout below Support",
+    bodyPct: 50, upperWickPct: 10, lowerWickPct: 25,
+    colorFlow: "RED→GREEN→GREEN",
+    levelBehavior: "FAKE_BREAKOUT",
+    direction: "CALL",
+    trustWeight: 72,
+    occurrences: 0, wins: 0, losses: 0,
+    source: "IMAGE",
+    createdAt: 0,
+  },
+  {
+    id: "seed-exhaustion-bull",
+    name: "Exhaustion Sweep (Bullish Reversal)",
+    bodyPct: 30, upperWickPct: 15, lowerWickPct: 55,
+    colorFlow: "RED→RED→GREEN",
+    levelBehavior: "EXHAUSTION_SWEEP",
+    direction: "CALL",
+    trustWeight: 68,
+    occurrences: 0, wins: 0, losses: 0,
+    source: "IMAGE",
+    createdAt: 0,
+  },
+  {
+    id: "seed-exhaustion-bear",
+    name: "Exhaustion Sweep (Bearish Reversal)",
+    bodyPct: 30, upperWickPct: 55, lowerWickPct: 15,
+    colorFlow: "GREEN→GREEN→RED",
+    levelBehavior: "EXHAUSTION_SWEEP",
+    direction: "PUT",
+    trustWeight: 68,
+    occurrences: 0, wins: 0, losses: 0,
+    source: "IMAGE",
+    createdAt: 0,
+  },
+];
+
+// Match live candles against extracted image rules
+function detectExtractedRules(candles: Candle[], zigzag: ZigZagPoint[], rules: ExtractedRule[]): { detected: boolean; rule: string; direction: "CALL" | "PUT"; confidence: number } {
+  if (candles.length < 3 || rules.length === 0) return { detected: false, rule: "", direction: "CALL", confidence: 0 };
+
+  const last3 = candles.slice(-3);
+  const latest = last3[2];
+  const total = Math.max(1, latest.bottom - latest.top);
+  const liveBodyPct = (latest.body / total) * 100;
+  const liveUpperPct = (latest.upper / total) * 100;
+  const liveLowerPct = (latest.lower / total) * 100;
+  const liveColorFlow = last3.map((c) => c.color).join("→");
+
+  let bestMatch: ExtractedRule | null = null;
+  let bestScore = 0;
+
+  for (const rule of rules) {
+    let score = 0;
+
+    // Color flow match (weighted heavily)
+    if (rule.colorFlow === liveColorFlow) score += 40;
+    else if (rule.colorFlow.endsWith(latest.color)) score += 15;
+
+    // Body percentage proximity (±15% tolerance)
+    const bodyDiff = Math.abs(rule.bodyPct - liveBodyPct);
+    if (bodyDiff < 15) score += (15 - bodyDiff);
+
+    // Upper wick proximity (±15% tolerance)
+    const upperDiff = Math.abs(rule.upperWickPct - liveUpperPct);
+    if (upperDiff < 15) score += (15 - upperDiff) * 0.5;
+
+    // Lower wick proximity (±15% tolerance)
+    const lowerDiff = Math.abs(rule.lowerWickPct - liveLowerPct);
+    if (lowerDiff < 15) score += (15 - lowerDiff) * 0.5;
+
+    // Level behavior match
+    if (rule.levelBehavior !== "NONE") {
+      const recentHighs = zigzag.filter((p) => p.type === "HIGH").slice(-2);
+      const recentLows = zigzag.filter((p) => p.type === "LOW").slice(-2);
+      if (rule.levelBehavior === "SR_REJECTION") {
+        if (rule.direction === "CALL" && latest.lowerRatio > 1.5) score += 20;
+        if (rule.direction === "PUT" && latest.upperRatio > 1.5) score += 20;
+      }
+      if (rule.levelBehavior === "FAKE_BREAKOUT") {
+        for (const h of recentHighs) {
+          if (latest.top < h.y - 3 && latest.closeY > h.y) { score += 20; break; }
+        }
+        for (const l of recentLows) {
+          if (latest.bottom > l.y + 3 && latest.closeY < l.y) { score += 20; break; }
+        }
+      }
+      if (rule.levelBehavior === "EXHAUSTION_SWEEP") {
+        const first2 = last3.slice(0, 2);
+        if (rule.direction === "CALL" && first2.every((c) => c.color === "RED") && latest.lower > latest.body * 2) score += 20;
+        if (rule.direction === "PUT" && first2.every((c) => c.color === "GREEN") && latest.upper > latest.body * 2) score += 20;
+      }
+    }
+
+    // Factor in trust weight
+    score = (score * rule.trustWeight) / 100;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = rule;
+    }
+  }
+
+  if (bestMatch && bestScore >= 35) {
+    return { detected: true, rule: bestMatch.name, direction: bestMatch.direction, confidence: Math.min(bestScore, 95) };
+  }
+  return { detected: false, rule: "", direction: "CALL", confidence: 0 };
+}
+
+// Generate variant rules from a matched extracted rule + live outcome
+function generateVariant(rule: ExtractedRule, liveCandles: Candle[], outcome: Outcome): ExtractedRule | null {
+  if (liveCandles.length < 3) return null;
+  const last3 = liveCandles.slice(-3);
+  const latest = last3[2];
+  const total = Math.max(1, latest.bottom - latest.top);
+
+  const variant: ExtractedRule = {
+    id: `variant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name: `Variant: ${rule.name} → ${outcome}`,
+    bodyPct: Math.round((latest.body / total) * 100),
+    upperWickPct: Math.round((latest.upper / total) * 100),
+    lowerWickPct: Math.round((latest.lower / total) * 100),
+    colorFlow: last3.map((c) => c.color).join("→"),
+    levelBehavior: rule.levelBehavior,
+    direction: outcome === "WIN" ? rule.direction : rule.direction === "CALL" ? "PUT" : "CALL",
+    trustWeight: outcome === "WIN" ? Math.min(rule.trustWeight + 5, 90) : Math.max(rule.trustWeight - 10, 40),
+    occurrences: 1,
+    wins: outcome === "WIN" ? 1 : 0,
+    losses: outcome === "LOSS" ? 1 : 0,
+    source: "LIVE_VARIANT",
+    createdAt: Date.now(),
+  };
+
+  return variant;
+}
+
+// ============================================
 // CANDLE DETECTION (Pixel-based, OTC optimized for fast micro-trends)
 // ============================================
 
@@ -494,6 +802,9 @@ export default function OTCMarketDashboard() {
   const [reversed, setReversed] = useState(false);
   const [scanCount, setScanCount] = useState(0);
   const [snrLevels, setSnrLevels] = useState<SNRLevel[]>([]);
+  const [imageUploading, setImageUploading] = useState(false);
+  const [imageMetrics, setImageMetrics] = useState<ImageMetrics | null>(null);
+  const [extractedRulesList, setExtractedRulesList] = useState<ExtractedRule[]>([]);
   const [analysis, setAnalysis] = useState<{
     candles: Candle[]; price: number; confidence: number; sequence: string[];
     indicators: Indicators; structure: Structure | null; patterns: PatternFlags;
@@ -526,8 +837,10 @@ export default function OTCMarketDashboard() {
   const lastSignalMinute = useRef(-1);
   const deepScanActive = useRef(false);
   const scanIterations = useRef(0);
+  const imageCanvasRef = useRef<HTMLCanvasElement>(null);
+  const lastMatchedRule = useRef<ExtractedRule | null>(null);
   const brain = useRef<Brain>({
-    memories: [], trades: [], zigzag: [], structure: [], autoPatterns: [], winRate: 0,
+    memories: [], trades: [], zigzag: [], structure: [], autoPatterns: [], extractedRules: [...SEED_RULES], winRate: 0,
   });
 
   const updateStats = useCallback(() => {
@@ -539,6 +852,7 @@ export default function OTCMarketDashboard() {
       structure: brain.current.structure.length,
       winRate: brain.current.winRate,
       autoPatterns: brain.current.autoPatterns.length,
+      extractedRules: brain.current.extractedRules.length,
     });
   }, []);
 
@@ -569,6 +883,7 @@ export default function OTCMarketDashboard() {
           zigzag: request.result.zigzag ?? [],
           structure: request.result.structure ?? [],
           autoPatterns: request.result.autoPatterns ?? [],
+          extractedRules: request.result.extractedRules ?? [...SEED_RULES],
         };
         updateStats();
         setStatus(`TRADER_YODHA_X_AI memory loaded: ${brain.current.trades.length} trades, ${brain.current.autoPatterns.length} auto-patterns.`);
@@ -829,6 +1144,7 @@ export default function OTCMarketDashboard() {
       confluence: detectConfluence(allCandles, zigzagPoints, price, round, brain.current),
       trap: detectTraps(allCandles, zigzagPoints),
       autoPrediction: getAutoPrediction(allCandles, brain.current),
+      extractedRule: detectExtractedRules(allCandles, zigzagPoints, brain.current.extractedRules),
     };
 
     let call = 0; let put = 0;
@@ -866,6 +1182,12 @@ export default function OTCMarketDashboard() {
       if (patterns.autoPrediction.prediction === "CALL") { call += 2; reasons.push(`auto-pattern ${patterns.autoPrediction.matched} CALL (${patterns.autoPrediction.confidence.toFixed(0)}%)`); }
       else { put += 2; reasons.push(`auto-pattern ${patterns.autoPrediction.matched} PUT (${patterns.autoPrediction.confidence.toFixed(0)}%)`); }
     }
+    if (patterns.extractedRule.detected) {
+      const matchedRule = brain.current.extractedRules.find((r) => r.name === patterns.extractedRule.rule);
+      if (matchedRule) lastMatchedRule.current = matchedRule;
+      if (patterns.extractedRule.direction === "CALL") { call += 3; reasons.push(`IMG-RULE: ${patterns.extractedRule.rule} → CALL (${patterns.extractedRule.confidence.toFixed(0)}%)`); }
+      else { put += 3; reasons.push(`IMG-RULE: ${patterns.extractedRule.rule} → PUT (${patterns.extractedRule.confidence.toFixed(0)}%)`); }
+    }
     if (memory) {
       if (memory.green > memory.red) { call++; reasons.push(`memory ${memory.confidence.toFixed(1)}%`); }
       if (memory.red > memory.green) { put++; reasons.push(`memory ${memory.confidence.toFixed(1)}%`); }
@@ -890,7 +1212,8 @@ export default function OTCMarketDashboard() {
     const trapText = patterns.trap.detected ? ` | TRAP: ${patterns.trap.type}` : "";
     const reverseText = signalReversed ? " | REVERSED" : "";
     const autoText = patterns.autoPrediction.prediction !== "WAIT" ? ` | AUTO: ${patterns.autoPrediction.prediction}` : "";
-    setStatus(`Deep 46S OTC analysis complete: ${nextSignal} | ${confidence.toFixed(1)}% evidence | price ${price.toFixed(5)}${trapText}${autoText}${reverseText}`);
+    const ruleText = patterns.extractedRule.detected ? ` | IMG-RULE: ${patterns.extractedRule.rule}` : "";
+    setStatus(`Deep 46S OTC analysis complete: ${nextSignal} | ${confidence.toFixed(1)}% evidence | price ${price.toFixed(5)}${trapText}${autoText}${ruleText}${reverseText}`);
 
     deepScanActive.current = false;
     setScanning(false);
