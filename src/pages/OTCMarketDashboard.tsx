@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type ChangeEvent, type MouseEvent } from "react";
 import { createWorker } from "tesseract.js";
-import { Loader2, AlertTriangle, TrendingUp, TrendingDown, Shield, Zap, Activity, Layers, Image as ImageIcon, Brain } from "lucide-react";
+import { Loader2, AlertTriangle, TrendingUp, TrendingDown, Shield, Zap, Activity, Layers, Image as ImageIcon, Cpu } from "lucide-react";
 
 // ============================================
 // TYPES
@@ -811,7 +811,7 @@ export default function OTCMarketDashboard() {
     reversed: boolean; reasons: string[];
   } | null>(null);
   const [stats, setStats] = useState({
-    candles: 0, memories: 0, trades: 0, zigzag: 0, structure: 0, winRate: 0, autoPatterns: 0,
+    candles: 0, memories: 0, trades: 0, zigzag: 0, structure: 0, winRate: 0, autoPatterns: 0, extractedRules: 0,
   });
   const [roi, setRoi] = useState({ x: 100, y: 50, width: 500, height: 350 });
   const [locked, setLocked] = useState(false);
@@ -886,6 +886,7 @@ export default function OTCMarketDashboard() {
           extractedRules: request.result.extractedRules ?? [...SEED_RULES],
         };
         updateStats();
+        setExtractedRulesList(brain.current.extractedRules);
         setStatus(`TRADER_YODHA_X_AI memory loaded: ${brain.current.trades.length} trades, ${brain.current.autoPatterns.length} auto-patterns.`);
       };
     }).catch((error) => console.error("[TRADER_YODHA_X_AI] IndexedDB load failed", error));
@@ -910,6 +911,75 @@ export default function OTCMarketDashboard() {
       width: Math.max(1, Math.floor(roi.width * sx)), height: Math.max(1, Math.floor(roi.height * sy)),
     };
   }, [roi]);
+
+  const handlePatternImage = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setStatus("Pattern intake needs a chart screenshot or exported image page.");
+      return;
+    }
+
+    setImageUploading(true);
+    setStatus(`Reading ${file.name} and measuring candle bodies, wicks, color flow, and level behavior...`);
+    const objectUrl = URL.createObjectURL(file);
+    try {
+      const image = new Image();
+      image.decoding = "async";
+      image.src = objectUrl;
+      await new Promise<void>((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () => reject(new Error("The pattern image could not be read."));
+      });
+
+      const canvas = imageCanvasRef.current;
+      if (!canvas) throw new Error("Pattern intake canvas is unavailable.");
+      const scale = Math.min(1, 1600 / Math.max(image.naturalWidth, image.naturalHeight));
+      canvas.width = Math.max(1, Math.floor(image.naturalWidth * scale));
+      canvas.height = Math.max(1, Math.floor(image.naturalHeight * scale));
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      if (!context) throw new Error("Pattern image pixels could not be read.");
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      const metrics = extractImageMetrics(context.getImageData(0, 0, canvas.width, canvas.height).data, canvas.width, canvas.height);
+      setImageMetrics(metrics);
+
+      if (metrics.candleCount < 3) {
+        setStatus("The image did not contain at least three readable green/red candles. Try a tighter chart crop.");
+        return;
+      }
+
+      const extractedRule: ExtractedRule = {
+        id: `image-${Date.now()}`,
+        name: `Imported chart: ${metrics.colorFlow}`,
+        bodyPct: Math.round(metrics.avgBodyPct),
+        upperWickPct: Math.round(metrics.avgUpperWickPct),
+        lowerWickPct: Math.round(metrics.avgLowerWickPct),
+        colorFlow: metrics.colorFlow,
+        levelBehavior: metrics.levelBehavior as ExtractedRule["levelBehavior"],
+        direction: metrics.colorFlow.endsWith("GREEN") ? "CALL" : "PUT",
+        trustWeight: 80,
+        occurrences: 0,
+        wins: 0,
+        losses: 0,
+        source: "IMAGE",
+        createdAt: Date.now(),
+      };
+
+      brain.current.extractedRules = [
+        ...brain.current.extractedRules.filter((rule) => rule.id !== extractedRule.id),
+        extractedRule,
+      ].slice(-40);
+      setExtractedRulesList([...brain.current.extractedRules]);
+      await saveBrain();
+      setStatus(`Pattern imported: ${metrics.colorFlow} | body ${metrics.avgBodyPct.toFixed(0)}% | upper wick ${metrics.avgUpperWickPct.toFixed(0)}% | lower wick ${metrics.avgLowerWickPct.toFixed(0)}% | ${metrics.levelBehavior}.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Pattern image intake failed.");
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+      setImageUploading(false);
+    }
+  };
 
   // Pattern learning — updates memory AND auto pattern matrix
   const learn = useCallback(() => {
@@ -1310,11 +1380,26 @@ export default function OTCMarketDashboard() {
       const ap = brain.current.autoPatterns.find((p) => p.key === autoKey);
       if (ap) { if (result === "WIN") ap.wins++; else ap.losses++; }
     }
+    // Update matched extracted rule and generate a live variant
+    if (lastMatchedRule.current) {
+      const rule = brain.current.extractedRules.find((r) => r.id === lastMatchedRule.current!.id);
+      if (rule) {
+        rule.occurrences++;
+        if (result === "WIN") { rule.wins++; rule.trustWeight = Math.min(rule.trustWeight + 2, 95); }
+        else { rule.losses++; rule.trustWeight = Math.max(rule.trustWeight - 5, 40); }
+        const variant = generateVariant(rule, analysis.candles, result);
+        if (variant) {
+          brain.current.extractedRules = [...brain.current.extractedRules, variant].slice(-40);
+          setExtractedRulesList([...brain.current.extractedRules]);
+        }
+      }
+      lastMatchedRule.current = null;
+    }
     brain.current.trades.push({ pattern: analysis.sequence.join(" → "), result, price: analysis.price });
     brain.current.winRate = (brain.current.trades.filter((t) => t.result === "WIN").length / brain.current.trades.length) * 100;
     void saveBrain();
     setSignal("WAIT"); setReversed(false);
-    setStatus(`Outcome logged [${result}]. TRADER_YODHA_X_AI OTC memory updated — loss streaks & auto-patterns tracked.`);
+    setStatus(`Outcome logged [${result}]. TRADER_YODHA_X_AI OTC memory updated — loss streaks, auto-patterns & image rules tracked.`);
   };
 
   // ROI handlers
@@ -1416,6 +1501,7 @@ export default function OTCMarketDashboard() {
                   ["ZigZag Points", stats.zigzag, "text-yellow-400"],
                   ["HH/HL/LH/LL", stats.structure, "text-sky-400"],
                   ["Auto Patterns", stats.autoPatterns, "text-fuchsia-400"],
+                  ["Image Rules", stats.extractedRules, "text-cyan-300"],
                   ["S/R Levels", snrLevels.length, "text-rose-400"],
                 ].map(([label, value, color]) => (
                   <div key={String(label)} className="bg-[#020617] p-3 rounded">
@@ -1424,6 +1510,49 @@ export default function OTCMarketDashboard() {
                   </div>
                 ))}
               </div>
+            </div>
+
+            {/* IMAGE PATTERN INTAKE — upload chart screenshots to extract visual rules */}
+            <div className={card}>
+              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono flex items-center gap-2">
+                <ImageIcon className="w-3 h-3 text-cyan-300" />
+                Image Pattern Intake
+              </h3>
+              <label className={`w-full py-3 rounded-lg font-bold text-sm flex items-center justify-center gap-2 cursor-pointer ${imageUploading ? "bg-slate-700 text-slate-500" : "bg-cyan-900/60 hover:bg-cyan-800/60 text-cyan-300 border border-cyan-700"}`}>
+                {imageUploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <ImageIcon className="w-4 h-4" />}
+                {imageUploading ? "Analyzing image..." : "Upload Chart Screenshot"}
+                <input type="file" accept="image/*" className="hidden" onChange={(e) => void handlePatternImage(e)} disabled={imageUploading} />
+              </label>
+              {imageMetrics && imageMetrics.candleCount > 0 && (
+                <div className="mt-3 space-y-1 text-xs font-mono">
+                  <div className="flex justify-between"><span className="text-slate-500">Candles found:</span><span className="text-cyan-300">{imageMetrics.candleCount}</span></div>
+                  <div className="flex justify-between"><span className="text-slate-500">Avg Body:</span><span className="text-emerald-400">{imageMetrics.avgBodyPct.toFixed(0)}%</span></div>
+                  <div className="flex justify-between"><span className="text-slate-500">Avg Upper Wick:</span><span className="text-amber-400">{imageMetrics.avgUpperWickPct.toFixed(0)}%</span></div>
+                  <div className="flex justify-between"><span className="text-slate-500">Avg Lower Wick:</span><span className="text-amber-400">{imageMetrics.avgLowerWickPct.toFixed(0)}%</span></div>
+                  <div className="flex justify-between"><span className="text-slate-500">Color Flow:</span><span className="text-cyan-300 break-all">{imageMetrics.colorFlow}</span></div>
+                  <div className="flex justify-between"><span className="text-slate-500">Level Behavior:</span><span className="text-orange-400">{imageMetrics.levelBehavior}</span></div>
+                </div>
+              )}
+              {extractedRulesList.length > 0 && (
+                <div className="mt-3">
+                  <div className="text-xs text-slate-500 mb-1.5 font-mono">Stored Rules ({extractedRulesList.length}):</div>
+                  <div className="space-y-1 max-h-40 overflow-y-auto">
+                    {extractedRulesList.slice(-8).reverse().map((rule) => (
+                      <div key={rule.id} className="flex items-center justify-between px-2 py-1.5 rounded bg-[#020617] text-xs font-mono">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${rule.direction === "CALL" ? "bg-emerald-400" : "bg-red-400"}`} />
+                          <span className="text-slate-300 truncate">{rule.name}</span>
+                        </div>
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          <span className="text-slate-500">{rule.source === "IMAGE" ? "IMG" : "VAR"}</span>
+                          <span className="text-cyan-400">{rule.trustWeight}%</span>
+                          <span className="text-slate-600">{rule.wins}W/{rule.losses}L</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* AUTO S/R LEVELS — NEW */}
@@ -1503,6 +1632,13 @@ export default function OTCMarketDashboard() {
                       {analysis.patterns.autoPrediction.prediction !== "WAIT" ? `${analysis.patterns.autoPrediction.prediction} (${analysis.patterns.autoPrediction.matched} ${analysis.patterns.autoPrediction.confidence.toFixed(0)}%)` : "No match"}
                     </span>
                   </div>
+                  <div className="flex items-center gap-2">
+                    <Cpu className={`w-4 h-4 ${analysis.patterns.extractedRule.detected ? "text-cyan-300" : "text-slate-600"}`} />
+                    <span className="text-slate-400">Image Rule:</span>
+                    <span className={analysis.patterns.extractedRule.detected ? (analysis.patterns.extractedRule.direction === "CALL" ? "text-emerald-400 font-bold" : "text-red-400 font-bold") : "text-slate-600"}>
+                      {analysis.patterns.extractedRule.detected ? `${analysis.patterns.extractedRule.rule} → ${analysis.patterns.extractedRule.direction} (${analysis.patterns.extractedRule.confidence.toFixed(0)}%)` : "No match"}
+                    </span>
+                  </div>
                   {analysis.reversed && (
                     <div className="mt-2 px-2 py-1.5 bg-orange-900/40 border border-orange-500/50 rounded text-orange-400 font-bold text-center">
                       REVERSE LOGIC ACTIVATED — Signal Flipped
@@ -1555,6 +1691,7 @@ export default function OTCMarketDashboard() {
               </div>
               <canvas ref={canvasRef} className="hidden" />
               <canvas ref={ocrCanvasRef} className="hidden" />
+              <canvas ref={imageCanvasRef} className="hidden" />
               <div className="mt-3 px-4 py-2 bg-[#020617] rounded-lg border-l-4 border-cyan-500 flex items-center gap-2">
                 {scanning && <Loader2 className="w-4 h-4 animate-spin text-cyan-400 flex-shrink-0" />}
                 <p className="text-xs text-slate-400"><strong className="text-cyan-400">Status:</strong> {status}</p>
