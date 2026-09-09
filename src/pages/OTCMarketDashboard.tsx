@@ -44,6 +44,7 @@ type Brain = {
   structure: Array<{ label: Structure; y: number; candleId: number }>;
   autoPatterns: AutoPattern[];
   extractedRules: ExtractedRule[];
+  customPatterns: CustomPatternMemory[];
   winRate: number;
 };
 
@@ -77,6 +78,7 @@ type PatternFlags = {
   trap: { detected: boolean; type: string; direction: "CALL" | "PUT" };
   autoPrediction: { prediction: Signal; confidence: number; matched: string };
   extractedRule: { detected: boolean; rule: string; direction: "CALL" | "PUT"; confidence: number };
+  customPattern: CustomPatternResult;
 };
 
 // A single logic's contribution to the combined CALL/PUT score
@@ -89,10 +91,34 @@ type ScoreContribution = {
 
 // Identifies a participating rule for outcome learning
 type ParticipatingRule = {
-  type: "MEMORY" | "AUTO_PATTERN" | "EXTRACTED_RULE";
+  type: "MEMORY" | "AUTO_PATTERN" | "EXTRACTED_RULE" | "CUSTOM_PATTERN";
   id: string;
   key?: string;
   direction: "CALL" | "PUT";
+};
+
+// Adaptive memory for the image-derived custom pattern rules.
+// Tracks per-rule win/loss so the engine can learn and blacklist failing setups.
+type CustomPatternMemory = {
+  key: string;
+  name: string;
+  wins: number;
+  losses: number;
+  occurrences: number;
+  blacklisted: boolean;
+};
+
+// Live evaluation of the custom (whiteboard) pattern engine for the current chart
+type CustomPatternResult = {
+  detected: boolean;
+  name: string;
+  key: string;
+  direction: "CALL" | "PUT";
+  confidence: number;
+  atLevel: boolean;
+  vPattern: boolean;
+  blacklisted: boolean;
+  notes: string[];
 };
 
 // Image-extracted pattern with exact visual metrics
@@ -158,6 +184,30 @@ const ANALYSIS_INTERVAL_MS = 800;
 const SIGNAL_THRESHOLD = 58;
 // Minimum total weighted evidence required before any signal is considered
 const MIN_TOTAL_EVIDENCE = 4;
+
+// 2-MINUTE ANALYSIS INTERVAL — the engine processes the market continuously but
+// only releases the next signal after a full 2-minute processing window has elapsed.
+const SIGNAL_COOLDOWN_MS = 120000;
+// Across the 2-minute window the candidate direction must stay consistent at least
+// this percentage of the decided ticks before a signal is confirmed.
+const WINDOW_CONSENSUS_MIN = 60;
+
+// SELF-LEARNING BLACKLIST — a custom pattern is suppressed once it has enough
+// decided trades and its loss rate crosses this threshold.
+const CUSTOM_BLACKLIST_MIN_OCCURRENCES = 4;
+const CUSTOM_BLACKLIST_LOSS_RATE = 0.6;
+
+// Friendly labels for the image-derived custom pattern keys
+const CUSTOM_LABELS: Record<string, string> = {
+  HFLIP_RES: "Green→Red Flip @ Resistance",
+  HFLIP_SUP: "Red→Green Card @ Support",
+  WICK_RES: "Long-Wick Breaker @ Resistance",
+  WICK_SUP: "Long-Wick Breaker @ Support",
+  DOJI_RES: "Doji Breaker @ Resistance",
+  DOJI_SUP: "Doji Breaker @ Support",
+  BOUNCE_SUP: "Support Bounce Continuation",
+  BOUNCE_RES: "Resistance Bounce Continuation",
+};
 
 const token = (c: Candle) => `${c.color[0]}-${c.shape}`;
 const roundNumber = (p: number) => /(?:000|500)$/.test(p.toFixed(5));
@@ -900,6 +950,118 @@ function detectCandles(data: Uint8ClampedArray, width: number, height: number): 
 }
 
 // ============================================
+// CUSTOM PATTERN ENGINE — encodes the hand-drawn whiteboard rules
+// H-line (S/R) color-flip entries, "green then red" / "red then green card",
+// long-wick & Doji breakers, bounce continuation, and the V-pattern guard.
+// ============================================
+
+// V-PATTERN GUARD — the rulebook explicitly says the setup does NOT work on a
+// sharp V / inverted-V. Two strong candles of one color immediately reversed by
+// two strong candles of the opposite color is a V spike → block the signal.
+function detectVPattern(candles: Candle[]): boolean {
+  if (candles.length < 4) return false;
+  const [a, b, c, d] = candles.slice(-4);
+  const strong = (k: Candle) => k.body > 12;
+  const invertedV = a.color === "GREEN" && b.color === "GREEN" && c.color === "RED" && d.color === "RED" && strong(b) && strong(c);
+  const vBottom = a.color === "RED" && b.color === "RED" && c.color === "GREEN" && d.color === "GREEN" && strong(b) && strong(c);
+  return invertedV || vBottom;
+}
+
+// Evaluate the current chart against the custom whiteboard rules and return the
+// single strongest matching setup, scaled by its learned win rate.
+function detectCustomPatterns(candles: Candle[], zigzag: ZigZagPoint[], snr: SNRLevel[], brain: Brain): CustomPatternResult {
+  const none: CustomPatternResult = {
+    detected: false, name: "", key: "", direction: "CALL", confidence: 0,
+    atLevel: false, vPattern: false, blacklisted: false, notes: [],
+  };
+  if (candles.length < 3) return none;
+
+  const latest = candles.at(-1)!;
+  const vPattern = detectVPattern(candles);
+
+  // Nearest horizontal H-line (support/resistance) to the latest candle
+  let nearLevel: SNRLevel | null = null;
+  let nearDist = Infinity;
+  for (const lvl of snr) {
+    const d = Math.abs(lvl.type === "SUPPORT" ? lvl.y - latest.bottom : lvl.y - latest.top);
+    if (d < nearDist) { nearDist = d; nearLevel = lvl; }
+  }
+  const atLevel = !!nearLevel && nearDist <= CONFLUENCE_PROXIMITY_PX * 2.5;
+
+  type Candidate = { key: string; name: string; direction: "CALL" | "PUT"; confidence: number; notes: string[] };
+  const candidates: Candidate[] = [];
+
+  // Consecutive same-color run BEFORE the latest candle (the "2 back to back" count)
+  const prior = candles.slice(0, -1);
+  const runColor = prior.at(-1)?.color;
+  let run = 0;
+  for (let i = prior.length - 1; i >= 0; i--) {
+    if (prior[i].color === runColor) run++;
+    else break;
+  }
+
+  // --- Rule 1: H-line color flip — "green then red" / "red then green card" ---
+  if (run >= 1 && runColor && latest.color !== "NEUTRAL" && latest.color !== runColor) {
+    const touchBonus = nearLevel ? Math.min(nearLevel.touches, 3) * 3 : 0;
+    if (runColor === "GREEN" && latest.color === "RED") {
+      const resNear = nearLevel?.type === "RESISTANCE" && atLevel;
+      candidates.push({
+        key: "HFLIP_RES", name: CUSTOM_LABELS.HFLIP_RES, direction: "PUT",
+        confidence: 55 + Math.min(run, 3) * 8 + (resNear ? 12 : 0) + touchBonus,
+        notes: [resNear ? "at resistance H-line" : "trend color flip", `${run} green run → red`],
+      });
+    }
+    if (runColor === "RED" && latest.color === "GREEN") {
+      const supNear = nearLevel?.type === "SUPPORT" && atLevel;
+      candidates.push({
+        key: "HFLIP_SUP", name: CUSTOM_LABELS.HFLIP_SUP, direction: "CALL",
+        confidence: 55 + Math.min(run, 3) * 8 + (supNear ? 12 : 0) + touchBonus,
+        notes: [supNear ? "at support H-line" : "trend color flip", `${run} red run → green`],
+      });
+    }
+  }
+
+  // --- Rule 2: Long-wick / Doji breaker rejection at an H-line ---
+  if (atLevel && nearLevel) {
+    const touchBonus = Math.min(nearLevel.touches, 3) * 4;
+    if (latest.shape === "UPPER_REJECTION" && nearLevel.type === "RESISTANCE") {
+      candidates.push({ key: "WICK_RES", name: CUSTOM_LABELS.WICK_RES, direction: "PUT", confidence: 60 + touchBonus, notes: ["upper wick rejection"] });
+    }
+    if (latest.shape === "LOWER_REJECTION" && nearLevel.type === "SUPPORT") {
+      candidates.push({ key: "WICK_SUP", name: CUSTOM_LABELS.WICK_SUP, direction: "CALL", confidence: 60 + touchBonus, notes: ["lower wick rejection"] });
+    }
+    if (latest.shape === "DOJI") {
+      const dir: "CALL" | "PUT" = nearLevel.type === "RESISTANCE" ? "PUT" : "CALL";
+      candidates.push({ key: dir === "PUT" ? "DOJI_RES" : "DOJI_SUP", name: dir === "PUT" ? CUSTOM_LABELS.DOJI_RES : CUSTOM_LABELS.DOJI_SUP, direction: dir, confidence: 56 + touchBonus, notes: ["doji breaker at level"] });
+    }
+  }
+
+  // --- Rule 3: Confirmed bounce continuation off an H-line ---
+  if (nearLevel && nearLevel.behavior === "BOUNCE") {
+    const dir: "CALL" | "PUT" = nearLevel.type === "SUPPORT" ? "CALL" : "PUT";
+    candidates.push({ key: dir === "CALL" ? "BOUNCE_SUP" : "BOUNCE_RES", name: dir === "CALL" ? CUSTOM_LABELS.BOUNCE_SUP : CUSTOM_LABELS.BOUNCE_RES, direction: dir, confidence: 58 + Math.min(nearLevel.touches, 3) * 4, notes: ["confirmed level bounce"] });
+  }
+
+  if (candidates.length === 0) return { ...none, atLevel, vPattern };
+
+  let best = candidates[0];
+  for (const c of candidates) if (c.confidence > best.confidence) best = c;
+
+  // Scale confidence by the rule's learned win rate and read blacklist status
+  const mem = brain.customPatterns.find((m) => m.key === best.key);
+  let confidence = best.confidence;
+  let blacklisted = false;
+  if (mem) {
+    const decided = mem.wins + mem.losses;
+    if (decided > 0) confidence *= 0.6 + (mem.wins / decided) * 0.6;
+    blacklisted = mem.blacklisted;
+  }
+  confidence = Math.max(0, Math.min(95, Math.round(confidence)));
+
+  return { detected: true, name: best.name, key: best.key, direction: best.direction, confidence, atLevel, vPattern, blacklisted, notes: best.notes };
+}
+
+// ============================================
 // MAIN COMPONENT
 // ============================================
 
@@ -911,8 +1073,14 @@ export default function OTCMarketDashboard() {
   const [status, setStatus] = useState("TRADER_YODHA_X_AI OTC Engine Ready. Connect Quotex / ExpertOption OTC screen.");
   const [ocrText, setOcrText] = useState("Searching...");
   const [round, setRound] = useState(false);
-  const [countdown, setCountdown] = useState(60);
   const [reversed, setReversed] = useState(false);
+
+  // 2-minute processing window telemetry
+  const [analysisProgress, setAnalysisProgress] = useState(0);
+  const [windowInfo, setWindowInfo] = useState<{ remaining: number; consensusDir: Signal; consensusStrength: number; votes: { call: number; put: number; wait: number } }>({
+    remaining: SIGNAL_COOLDOWN_MS / 1000, consensusDir: "WAIT", consensusStrength: 0, votes: { call: 0, put: 0, wait: 0 },
+  });
+  const [customPatternList, setCustomPatternList] = useState<CustomPatternMemory[]>([]);
 
   const [snrLevels, setSnrLevels] = useState<SNRLevel[]>([]);
   const [imageUploading, setImageUploading] = useState(false);
@@ -946,16 +1114,18 @@ export default function OTCMarketDashboard() {
   const candles = useRef<Candle[]>([]);
   const prices = useRef<number[]>([]);
   const lastSignature = useRef("");
-  const pending = useRef<Signal | null>(null);
   const zigzagRef = useRef<ZigZagPoint[]>([]);
   const snrLevelsRef = useRef<SNRLevel[]>([]);
-  const lastSignalMinute = useRef(-1);
+  // 2-minute window bookkeeping
+  const windowStart = useRef(0);
+  const windowVotes = useRef({ call: 0, put: 0, wait: 0 });
+  const awaitingOutcome = useRef(false);
 
   const imageCanvasRef = useRef<HTMLCanvasElement>(null);
   const lastMatchedRule = useRef<ExtractedRule | null>(null);
   const participatingRules = useRef<ParticipatingRule[]>([]);
   const brain = useRef<Brain>({
-    memories: [], trades: [], zigzag: [], structure: [], autoPatterns: [], extractedRules: [...SEED_RULES], winRate: 0,
+    memories: [], trades: [], zigzag: [], structure: [], autoPatterns: [], extractedRules: [...SEED_RULES], customPatterns: [], winRate: 0,
   });
 
   const updateStats = useCallback(() => {
@@ -999,9 +1169,11 @@ export default function OTCMarketDashboard() {
           structure: request.result.structure ?? [],
           autoPatterns: request.result.autoPatterns ?? [],
           extractedRules: request.result.extractedRules ?? [...SEED_RULES],
+          customPatterns: request.result.customPatterns ?? [],
         };
         updateStats();
         setExtractedRulesList(brain.current.extractedRules);
+        setCustomPatternList([...brain.current.customPatterns]);
         setStatus(`TRADER_YODHA_X_AI memory loaded: ${brain.current.trades.length} trades, ${brain.current.autoPatterns.length} auto-patterns.`);
       };
     }).catch((error) => console.error("[TRADER_YODHA_X_AI] IndexedDB load failed", error));
@@ -1259,18 +1431,27 @@ export default function OTCMarketDashboard() {
     } finally { busy.current = false; }
   }, [learn, paint, readPrice, saveBrain, scaledRoi, updateStats]);
 
+  const resetWindow = useCallback(() => {
+    windowStart.current = Date.now();
+    windowVotes.current = { call: 0, put: 0, wait: 0 };
+    awaitingOutcome.current = false;
+    setAnalysisProgress(0);
+    setSignal("WAIT");
+  }, []);
+
   const connect = async () => {
     try {
       const next = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
       setStream(next); setActive(true);
-      setStatus("TRADER_YODHA_X_AI connected to OTC chart. Reading live candles.");
+      resetWindow();
+      setStatus("TRADER_YODHA_X_AI connected. Running a full 2-minute analysis before the first signal.");
       next.getVideoTracks()[0]?.addEventListener("ended", () => { setActive(false); setStream(null); });
     } catch { setStatus("Screen capture was cancelled. No market data was fabricated."); }
   };
 
   const disconnect = () => {
     stream?.getTracks().forEach((track) => track.stop());
-    setStream(null); setActive(false); setSignal("WAIT"); pending.current = null;
+    setStream(null); setActive(false); resetWindow();
   };
 
   useEffect(() => {
@@ -1287,6 +1468,11 @@ export default function OTCMarketDashboard() {
   // ============================================
 
   const finalizeAnalysis = useCallback(() => {
+    // Engine pauses while a fired signal is awaiting its WIN/LOSS outcome so the
+    // frozen analysis stays valid for adaptive learning and a fresh 2-minute
+    // window only starts once the trade is resolved.
+    if (awaitingOutcome.current) return;
+
     const recent = candles.current.slice(-5);
     const allCandles = candles.current;
     const price = prices.current.at(-1);
@@ -1313,7 +1499,9 @@ export default function OTCMarketDashboard() {
       trap: detectTraps(allCandles, zigzagPoints),
       autoPrediction: getAutoPrediction(allCandles, brain.current),
       extractedRule: detectExtractedRules(allCandles, zigzagPoints, brain.current.extractedRules),
+      customPattern: detectCustomPatterns(allCandles, zigzagPoints, snr, brain.current),
     };
+    const custom = patterns.customPattern;
 
     // Reset participating rules for this analysis cycle
     participatingRules.current = [];
@@ -1484,18 +1672,42 @@ export default function OTCMarketDashboard() {
       participatingRules.current.push({ type: "MEMORY", id: memory.key, direction: memory.green > memory.red ? "CALL" : "PUT" });
     }
 
+    // --- 13. Custom Pattern Engine (image-derived master rules) ---
+    // Skipped entirely when the setup is blacklisted or a V-pattern is present.
+    if (custom.detected && !custom.blacklisted && !custom.vPattern && custom.atLevel) {
+      const w = 5 + Math.round(custom.confidence / 25);
+      if (custom.direction === "CALL") { call += w; breakdown.push({ logic: "Custom Pattern", direction: "CALL", weight: w, detail: `${custom.name} ${custom.confidence}%` }); }
+      else { put += w; breakdown.push({ logic: "Custom Pattern", direction: "PUT", weight: w, detail: `${custom.name} ${custom.confidence}%` }); }
+      participatingRules.current.push({ type: "CUSTOM_PATTERN", id: custom.key, direction: custom.direction });
+    }
+
     // --- Combined Decision ---
     const total = call + put;
     const dominantScore = Math.max(call, put);
     const combinedConfidence = total > 0 ? (dominantScore / total) * 100 : 0;
-    let nextSignal: Signal = total < MIN_TOTAL_EVIDENCE || combinedConfidence < SIGNAL_THRESHOLD ? "WAIT" : call > put ? "CALL" : "PUT";
+    const weightedDir: Signal = call > put ? "CALL" : put > call ? "PUT" : "WAIT";
+
+    // MASTER ALIGNMENT GATE — a signal candidate exists ONLY when every core
+    // condition agrees at once: a confirmed custom pattern sitting on a real
+    // H-line, no V-pattern, not blacklisted, the weighted engine pointing the
+    // same way, and the combined confidence clearing the threshold.
+    const coreAligned =
+      custom.detected &&
+      custom.atLevel &&
+      !custom.vPattern &&
+      !custom.blacklisted &&
+      weightedDir === custom.direction &&
+      total >= MIN_TOTAL_EVIDENCE &&
+      combinedConfidence >= SIGNAL_THRESHOLD;
+
+    let candidate: Signal = coreAligned ? custom.direction : "WAIT";
     let signalReversed = false;
 
-    // REVERSE TRADING LOGIC — flips signal when the matched memory has a loss streak
-    if (memory && (memory.lossStreak >= REVERSE_LOSS_STREAK || memory.reverse) && nextSignal !== "WAIT") {
-      nextSignal = nextSignal === "CALL" ? "PUT" : "CALL";
+    // REVERSE TRADING LOGIC — flips the candidate when the matched memory has a loss streak
+    if (memory && (memory.lossStreak >= REVERSE_LOSS_STREAK || memory.reverse) && candidate !== "WAIT") {
+      candidate = candidate === "CALL" ? "PUT" : "CALL";
       signalReversed = true;
-      breakdown.push({ logic: "REVERSE LOGIC", direction: nextSignal as "CALL" | "PUT", weight: 0, detail: `Loss streak ${memory.lossStreak} — signal flipped` });
+      breakdown.push({ logic: "REVERSE LOGIC", direction: candidate as "CALL" | "PUT", weight: 0, detail: `Loss streak ${memory.lossStreak} — signal flipped` });
     }
 
     // Sort breakdown by weight descending for UI display
@@ -1503,13 +1715,39 @@ export default function OTCMarketDashboard() {
 
     setAnalysis({ candles: recent, price, confidence: combinedConfidence, sequence: recent.map(token), indicators: technical, structure, patterns, reversed: signalReversed, reasons: breakdown.map((b) => `${b.logic} ${b.direction === "CALL" ? "+" : "-"}${b.weight}`), scoreBreakdown: breakdown, callTotal: call, putTotal: put });
     setReversed(signalReversed);
-    pending.current = nextSignal === "WAIT" ? null : nextSignal;
 
-    const trapText = patterns.trap.detected ? ` | TRAP: ${patterns.trap.type}` : "";
-    const reverseText = signalReversed ? " | REVERSED" : "";
-    const autoText = patterns.autoPrediction.prediction !== "WAIT" ? ` | AUTO: ${patterns.autoPrediction.prediction}` : "";
-    const ruleText = patterns.extractedRule.detected ? ` | IMG-RULE: ${patterns.extractedRule.rule}` : "";
-    setStatus(`Real-time analysis: ${nextSignal} | ${combinedConfidence.toFixed(1)}% combined confidence (CALL ${call} vs PUT ${put}) | price ${price.toFixed(5)}${trapText}${autoText}${ruleText}${reverseText}`);
+    // ---- 2-MINUTE PROCESSING WINDOW ----
+    // The engine keeps voting every tick; a signal is only released once a full
+    // 2-minute window has passed AND the window agrees with the current alignment.
+    const now = Date.now();
+    if (windowStart.current === 0) windowStart.current = now;
+    if (candidate === "CALL") windowVotes.current.call++;
+    else if (candidate === "PUT") windowVotes.current.put++;
+    else windowVotes.current.wait++;
+
+    const elapsed = now - windowStart.current;
+    const progress = Math.min(100, (elapsed / SIGNAL_COOLDOWN_MS) * 100);
+    const votes = windowVotes.current;
+    const decidedVotes = votes.call + votes.put;
+    const consensusDir: Signal = votes.call > votes.put ? "CALL" : votes.put > votes.call ? "PUT" : "WAIT";
+    const consensusStrength = decidedVotes > 0 ? (Math.max(votes.call, votes.put) / decidedVotes) * 100 : 0;
+    setAnalysisProgress(progress);
+    setWindowInfo({ remaining: Math.max(0, Math.ceil((SIGNAL_COOLDOWN_MS - elapsed) / 1000)), consensusDir, consensusStrength, votes: { ...votes } });
+
+    const windowReady = elapsed >= SIGNAL_COOLDOWN_MS;
+    if (windowReady && coreAligned && candidate !== "WAIT" && candidate === consensusDir && consensusStrength >= WINDOW_CONSENSUS_MIN) {
+      setSignal(candidate);
+      awaitingOutcome.current = true;
+      windowStart.current = now;
+      windowVotes.current = { call: 0, put: 0, wait: 0 };
+      setStatus(`SIGNAL ${candidate} confirmed after a full 2-minute analysis — ${custom.name} (${custom.confidence}%), window consensus ${consensusStrength.toFixed(0)}%. Log the outcome to train the brain.`);
+    } else {
+      const guard = custom.vPattern ? " | V-PATTERN BLOCKED" : custom.blacklisted ? " | PATTERN BLACKLISTED" : "";
+      const phase = windowReady
+        ? `2-min window complete — holding for full alignment${custom.detected ? "" : " (no custom pattern yet)"}`
+        : `Analyzing market — ${Math.max(0, Math.ceil((SIGNAL_COOLDOWN_MS - elapsed) / 1000))}s left in 2-min window`;
+      setStatus(`${phase} | candidate ${candidate} | CALL ${call} vs PUT ${put} | ${custom.detected ? custom.name : "scanning patterns"}${guard}`);
+    }
   }, [round]);
 
   // ============================================
@@ -1529,27 +1767,6 @@ export default function OTCMarketDashboard() {
     return () => { cancelled = true; window.clearInterval(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, analyzeFrame, finalizeAnalysis]);
-
-  // ============================================
-  // STRICT 00s–05s ENTRY TIMING
-  // ============================================
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      const now = new Date();
-      const seconds = now.getSeconds();
-      const ms = now.getMilliseconds();
-      setCountdown(Math.ceil(60 - seconds - ms / 1000));
-
-      if (seconds >= 0 && seconds <= 5 && pending.current && lastSignalMinute.current !== now.getMinutes()) {
-        lastSignalMinute.current = now.getMinutes();
-        setSignal(pending.current);
-        setStatus(`TRADER_YODHA_X_AI signal active: ${pending.current} — entered at 0${seconds}s of new candle.`);
-        pending.current = null;
-      }
-    }, 200);
-    return () => window.clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  });
 
   // Log trade outcome — updates ALL participating rules simultaneously
   const logOutcome = (result: Outcome) => {
@@ -1579,6 +1796,21 @@ export default function OTCMarketDashboard() {
             setExtractedRulesList([...brain.current.extractedRules]);
           }
         }
+      } else if (participant.type === "CUSTOM_PATTERN") {
+        // SELF-LEARNING: track win/loss per custom rule and blacklist repeat losers
+        let mem = brain.current.customPatterns.find((m) => m.key === participant.id);
+        if (!mem) {
+          mem = { key: participant.id, label: CUSTOM_LABELS[participant.id] ?? participant.id, wins: 0, losses: 0, lossStreak: 0, blacklisted: false, lastResult: result };
+          brain.current.customPatterns.push(mem);
+        }
+        mem.lastResult = result;
+        if (result === "WIN") { mem.wins++; mem.lossStreak = 0; mem.blacklisted = false; }
+        else { mem.losses++; mem.lossStreak++; }
+        const decided = mem.wins + mem.losses;
+        const lossRate = decided > 0 ? mem.losses / decided : 0;
+        // Blacklist a pattern that loses too often so the engine stops repeating it
+        mem.blacklisted = decided >= CUSTOM_BLACKLIST_MIN_OCCURRENCES && lossRate >= CUSTOM_BLACKLIST_LOSS_RATE;
+        setCustomPatternList([...brain.current.customPatterns]);
       }
     }
 
@@ -1627,7 +1859,7 @@ export default function OTCMarketDashboard() {
   };
 
   const latest = analysis?.candles.at(-1);
-  const entryWindow = countdown <= 5 || countdown >= 55;
+  const entryWindow = analysisProgress >= 100 && !awaitingOutcome.current;
 
   return (
     <div className="min-h-screen bg-[#040814] text-slate-100 font-sans" onMouseMove={mouseMove} onMouseUp={() => { setMoving(false); setResizing(false); }}>
@@ -1663,9 +1895,9 @@ export default function OTCMarketDashboard() {
                 {active ? "Live Real-Time Scanning..." : "Scanner Idle — Connect to Start"}
               </div>
               <div className="mt-4 flex items-center justify-between text-sm">
-                <span className="text-slate-500">Next Candle Entry:</span>
+                <span className="text-slate-500">2-Min Analysis:</span>
                 <span className={`font-mono text-xl ${entryWindow ? "text-emerald-400 font-bold animate-pulse" : "text-amber-400"}`}>
-                  {countdown}s {entryWindow && "— ENTRY WINDOW"}
+                  {awaitingOutcome.current ? "SIGNAL LIVE" : entryWindow ? "READY — ALIGNING" : `${windowInfo.remaining}s left`}
                 </span>
               </div>
               {active && (
@@ -1699,6 +1931,7 @@ export default function OTCMarketDashboard() {
                   ["HH/HL/LH/LL", stats.structure, "text-sky-400"],
                   ["Auto Patterns", stats.autoPatterns, "text-fuchsia-400"],
                   ["Image Rules", stats.extractedRules, "text-cyan-300"],
+                  ["Custom Rules", customPatternList.length, "text-violet-300"],
                   ["S/R Levels", snrLevels.length, "text-rose-400"],
                 ].map(([label, value, color]) => (
                   <div key={String(label)} className="bg-[#020617] p-3 rounded">
@@ -1747,6 +1980,77 @@ export default function OTCMarketDashboard() {
                         </div>
                       </div>
                     ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* 2-MINUTE ANALYSIS WINDOW — continuous 24/7 processing before each signal */}
+            {active && (
+              <div className={card}>
+                <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">2-Minute Analysis Window</h3>
+                <div className="flex items-center justify-between text-xs font-mono mb-2">
+                  <span className="text-slate-500">{awaitingOutcome.current ? "Signal live — log outcome to resume" : "Processing market"}</span>
+                  <span className="text-violet-300 font-bold">{awaitingOutcome.current ? "PAUSED" : `${windowInfo.remaining}s left`}</span>
+                </div>
+                <div className="h-2 rounded-full bg-[#020617] overflow-hidden">
+                  <div className="h-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-all duration-500" style={{ width: `${analysisProgress}%` }} />
+                </div>
+                <div className="grid grid-cols-3 gap-2 mt-3 text-center text-xs font-mono">
+                  <div className="bg-[#020617] p-2 rounded"><div className="text-slate-500">CALL votes</div><div className="text-emerald-400 font-bold">{windowInfo.votes.call}</div></div>
+                  <div className="bg-[#020617] p-2 rounded"><div className="text-slate-500">PUT votes</div><div className="text-red-400 font-bold">{windowInfo.votes.put}</div></div>
+                  <div className="bg-[#020617] p-2 rounded"><div className="text-slate-500">WAIT</div><div className="text-slate-400 font-bold">{windowInfo.votes.wait}</div></div>
+                </div>
+                <div className="flex justify-between text-xs font-mono mt-2">
+                  <span className="text-slate-500">Window consensus:</span>
+                  <span className={windowInfo.consensusDir === "CALL" ? "text-emerald-400" : windowInfo.consensusDir === "PUT" ? "text-red-400" : "text-slate-400"}>
+                    {windowInfo.consensusDir} {windowInfo.consensusStrength.toFixed(0)}%
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* CUSTOM PATTERN ENGINE — image-derived rules with self-learning memory */}
+            <div className={card}>
+              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">Custom Pattern Engine</h3>
+              {active && analysis?.patterns.customPattern.detected ? (
+                <div className="mb-3 p-2.5 rounded-lg bg-[#020617] border border-violet-800/50">
+                  <div className="flex items-center justify-between text-xs font-mono">
+                    <span className="text-violet-300 font-bold truncate">{analysis.patterns.customPattern.name}</span>
+                    <span className={analysis.patterns.customPattern.direction === "CALL" ? "text-emerald-400 font-bold" : "text-red-400 font-bold"}>
+                      {analysis.patterns.customPattern.direction} {analysis.patterns.customPattern.confidence}%
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap gap-1 mt-2">
+                    {analysis.patterns.customPattern.atLevel && <span className="px-1.5 py-0.5 rounded text-[9px] bg-cyan-900/60 text-cyan-300">AT H-LINE</span>}
+                    {analysis.patterns.customPattern.vPattern && <span className="px-1.5 py-0.5 rounded text-[9px] bg-red-900/60 text-red-300">V-PATTERN BLOCKED</span>}
+                    {analysis.patterns.customPattern.blacklisted && <span className="px-1.5 py-0.5 rounded text-[9px] bg-red-900/60 text-red-300">BLACKLISTED</span>}
+                    {analysis.patterns.customPattern.notes.map((n) => (
+                      <span key={n} className="px-1.5 py-0.5 rounded text-[9px] bg-slate-800 text-slate-400">{n}</span>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="mb-3 text-xs font-mono text-slate-500">{active ? "Scanning candles for a custom setup at a real level..." : "Connect an OTC screen to begin."}</div>
+              )}
+              {customPatternList.length > 0 && (
+                <div>
+                  <div className="text-xs text-slate-500 mb-1.5 font-mono">Self-Learning Memory:</div>
+                  <div className="space-y-1 max-h-44 overflow-y-auto">
+                    {[...customPatternList].sort((a, b) => (b.wins + b.losses) - (a.wins + a.losses)).map((m) => {
+                      const decided = m.wins + m.losses;
+                      const wr = decided > 0 ? Math.round((m.wins / decided) * 100) : 0;
+                      return (
+                        <div key={m.key} className={`flex items-center justify-between px-2 py-1.5 rounded text-xs font-mono ${m.blacklisted ? "bg-red-950/40 border border-red-900/50" : "bg-[#020617]"}`}>
+                          <span className={`truncate ${m.blacklisted ? "text-red-400 line-through" : "text-slate-300"}`}>{m.label}</span>
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            {m.blacklisted && <span className="text-[9px] text-red-400 font-bold">AVOID</span>}
+                            <span className={wr >= 50 ? "text-emerald-400" : "text-amber-400"}>{wr}%</span>
+                            <span className="text-slate-600">{m.wins}W/{m.losses}L</span>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               )}
