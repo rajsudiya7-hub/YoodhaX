@@ -151,9 +151,7 @@ const AUTO_PATTERN_MIN_LENGTH = 2;
 const AUTO_PATTERN_MAX_LENGTH = 4;
 const AUTO_PATTERN_MIN_OCCURRENCES = 2;
 
-const SCAN_INTERVAL_MS = 300;
-const MANUAL_SCAN_ITERATIONS = 15;
-const AUTO_SCAN_MAX_ITERATIONS = 50;
+const ANALYSIS_INTERVAL_MS = 800;
 
 // Combined confidence threshold — signal fires only when the dominant side
 // exceeds this percentage of the total weighted evidence
@@ -908,14 +906,14 @@ function detectCandles(data: Uint8ClampedArray, width: number, height: number): 
 export default function OTCMarketDashboard() {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [active, setActive] = useState(false);
-  const [scanning, setScanning] = useState(false);
+
   const [signal, setSignal] = useState<Signal>("WAIT");
   const [status, setStatus] = useState("TRADER_YODHA_X_AI OTC Engine Ready. Connect Quotex / ExpertOption OTC screen.");
   const [ocrText, setOcrText] = useState("Searching...");
   const [round, setRound] = useState(false);
   const [countdown, setCountdown] = useState(60);
   const [reversed, setReversed] = useState(false);
-  const [scanCount, setScanCount] = useState(0);
+
   const [snrLevels, setSnrLevels] = useState<SNRLevel[]>([]);
   const [imageUploading, setImageUploading] = useState(false);
   const [imageMetrics, setImageMetrics] = useState<ImageMetrics | null>(null);
@@ -952,8 +950,7 @@ export default function OTCMarketDashboard() {
   const zigzagRef = useRef<ZigZagPoint[]>([]);
   const snrLevelsRef = useRef<SNRLevel[]>([]);
   const lastSignalMinute = useRef(-1);
-  const deepScanActive = useRef(false);
-  const scanIterations = useRef(0);
+
   const imageCanvasRef = useRef<HTMLCanvasElement>(null);
   const lastMatchedRule = useRef<ExtractedRule | null>(null);
   const participatingRules = useRef<ParticipatingRule[]>([]);
@@ -1274,7 +1271,6 @@ export default function OTCMarketDashboard() {
   const disconnect = () => {
     stream?.getTracks().forEach((track) => track.stop());
     setStream(null); setActive(false); setSignal("WAIT"); pending.current = null;
-    deepScanActive.current = false;
   };
 
   useEffect(() => {
@@ -1298,8 +1294,6 @@ export default function OTCMarketDashboard() {
     if (recent.length < 3 || !price) {
       setSignal("WAIT");
       setStatus("Waiting for at least 3 detected candles and a readable live OTC price.");
-      deepScanActive.current = false;
-      setScanning(false);
       return;
     }
 
@@ -1515,60 +1509,26 @@ export default function OTCMarketDashboard() {
     const reverseText = signalReversed ? " | REVERSED" : "";
     const autoText = patterns.autoPrediction.prediction !== "WAIT" ? ` | AUTO: ${patterns.autoPrediction.prediction}` : "";
     const ruleText = patterns.extractedRule.detected ? ` | IMG-RULE: ${patterns.extractedRule.rule}` : "";
-    setStatus(`Deep 46S OTC analysis complete: ${nextSignal} | ${combinedConfidence.toFixed(1)}% combined confidence (CALL ${call} vs PUT ${put}) | price ${price.toFixed(5)}${trapText}${autoText}${ruleText}${reverseText}`);
-
-    deepScanActive.current = false;
-    setScanning(false);
+    setStatus(`Real-time analysis: ${nextSignal} | ${combinedConfidence.toFixed(1)}% combined confidence (CALL ${call} vs PUT ${put}) | price ${price.toFixed(5)}${trapText}${autoText}${ruleText}${reverseText}`);
   }, [round]);
 
   // ============================================
-  // DYNAMIC CONTINUOUS 46s DEEP SCAN LOOP
-  // Runs from 46s to 59s (or 15 iterations for manual)
-  // Keeps spinner active and continuously re-verifies prices, OCR, candle shapes, and volume/size shifts
+  // CONTINUOUS REAL-TIME ANALYSIS LOOP
+  // Runs automatically whenever the screen is connected — no button or timer trigger needed.
+  // Each tick captures a frame, detects candles, auto-detects S/R levels, learns patterns,
+  // and runs the full decision engine. The 00s–05s entry window still fires the pending signal.
   // ============================================
-
-  const runContinuousScan = async (manual: boolean) => {
-    if (deepScanActive.current) return;
-    deepScanActive.current = true;
-    scanIterations.current = 0;
-    setScanning(true);
-    setScanCount(0);
-    setStatus(manual
-      ? "DEEP 46S CONTINUOUS OTC SCAN — manual multi-frame analysis running..."
-      : "DEEP 46S AUTO SCAN — continuous re-verification from 46s to candle transition...");
-
-    const maxIterations = manual ? MANUAL_SCAN_ITERATIONS : AUTO_SCAN_MAX_ITERATIONS;
-
-    for (let i = 0; i < maxIterations; i++) {
-      if (!deepScanActive.current) break;
-
+  useEffect(() => {
+    if (!active) return;
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      if (cancelled || busy.current) return;
       await analyzeFrame();
-      scanIterations.current = i + 1;
-      setScanCount(i + 1);
-
-      // Track volume/size shifts between frames
-      const latest = candles.current.at(-1);
-      if (latest) {
-        const prevCandle = candles.current.at(-2);
-        const sizeShift = prevCandle ? Math.abs(latest.body - prevCandle.body) / Math.max(1, prevCandle.body) * 100 : 0;
-        setStatus(
-          `DEEP 46S SCAN — frame ${i + 1}/${manual ? maxIterations : "→59s"} | ` +
-          `candles: ${candles.current.length} | OCR: ${prices.current.at(-1)?.toFixed(5) ?? "—"} | ` +
-          `size shift: ${sizeShift.toFixed(0)}% | re-verifying...`
-        );
-      }
-
-      // Auto scan stops at 58s (just before candle transition)
-      if (!manual) {
-        const seconds = new Date().getSeconds();
-        if (seconds >= 58) break;
-      }
-
-      await new Promise((r) => setTimeout(r, SCAN_INTERVAL_MS));
-    }
-
-    finalizeAnalysis();
-  };
+      finalizeAnalysis();
+    }, ANALYSIS_INTERVAL_MS);
+    return () => { cancelled = true; window.clearInterval(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, analyzeFrame, finalizeAnalysis]);
 
   // ============================================
   // STRICT 00s–05s ENTRY TIMING
@@ -1585,11 +1545,6 @@ export default function OTCMarketDashboard() {
         setSignal(pending.current);
         setStatus(`TRADER_YODHA_X_AI signal active: ${pending.current} — entered at 0${seconds}s of new candle.`);
         pending.current = null;
-      }
-
-      // Auto-trigger continuous deep scan at 46s
-      if (active && seconds === 46 && !deepScanActive.current) {
-        void runContinuousScan(false);
       }
     }, 200);
     return () => window.clearInterval(timer);
@@ -1680,7 +1635,7 @@ export default function OTCMarketDashboard() {
         <div className="max-w-7xl mx-auto flex items-center justify-between gap-4">
           <div>
             <h1 className="text-2xl font-bold text-cyan-400 tracking-wider">TRADER YODHA X AI</h1>
-            <p className="text-slate-500 text-sm">OTC Market Engine — Continuous 46s Scan + Auto S/R + Pattern Generator + Reverse Logic</p>
+            <p className="text-slate-500 text-sm">OTC Market Engine — Real-Time Continuous Scan + Auto S/R + Pattern Generator + Reverse Logic</p>
           </div>
           <div className="flex items-center gap-3">
             <div className="text-right mr-2">
@@ -1701,26 +1656,22 @@ export default function OTCMarketDashboard() {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           {/* LEFT COLUMN */}
           <div className="space-y-4">
-            {/* SCAN CONTROL — with spinner and scan count */}
+            {/* LIVE SCAN STATUS — automatic real-time indicator */}
             <div className={card}>
-              <button
-                onClick={() => void runContinuousScan(true)}
-                disabled={!active || scanning}
-                className={`w-full py-4 rounded-xl font-bold text-lg flex items-center justify-center gap-3 ${!active || scanning ? "bg-slate-700 text-slate-500" : "bg-cyan-600 hover:bg-cyan-500 text-white"}`}
-              >
-                {scanning && <Loader2 className="w-6 h-6 animate-spin" />}
-                {scanning ? `DEEP 46S SCAN RUNNING — ${scanCount} frames` : "FORCE MANUAL 46S SCAN"}
-              </button>
+              <div className={`w-full py-4 rounded-xl font-bold text-lg flex items-center justify-center gap-3 ${active ? "bg-cyan-900/40 border border-cyan-700 text-cyan-300" : "bg-slate-800 text-slate-600"}`}>
+                {active && <span className="w-3 h-3 rounded-full bg-emerald-400 animate-pulse" />}
+                {active ? "Live Real-Time Scanning..." : "Scanner Idle — Connect to Start"}
+              </div>
               <div className="mt-4 flex items-center justify-between text-sm">
                 <span className="text-slate-500">Next Candle Entry:</span>
                 <span className={`font-mono text-xl ${entryWindow ? "text-emerald-400 font-bold animate-pulse" : "text-amber-400"}`}>
                   {countdown}s {entryWindow && "— ENTRY WINDOW"}
                 </span>
               </div>
-              {scanning && (
+              {active && (
                 <div className="mt-2 flex items-center gap-2">
-                  <Loader2 className="w-3 h-3 animate-spin text-cyan-400" />
-                  <span className="text-xs text-cyan-400 font-mono">Re-verifying OCR, candle shapes & volume shifts...</span>
+                  <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
+                  <span className="text-xs text-cyan-400 font-mono">Auto-analyzing every {ANALYSIS_INTERVAL_MS}ms — candles, S/R levels, patterns & signal engine</span>
                 </div>
               )}
             </div>
@@ -1945,7 +1896,7 @@ export default function OTCMarketDashboard() {
               <canvas ref={ocrCanvasRef} className="hidden" />
               <canvas ref={imageCanvasRef} className="hidden" />
               <div className="mt-3 px-4 py-2 bg-[#020617] rounded-lg border-l-4 border-cyan-500 flex items-center gap-2">
-                {scanning && <Loader2 className="w-4 h-4 animate-spin text-cyan-400 flex-shrink-0" />}
+                {active && <span className="w-3 h-3 rounded-full bg-cyan-400 animate-ping flex-shrink-0" />}
                 <p className="text-xs text-slate-400"><strong className="text-cyan-400">Status:</strong> {status}</p>
               </div>
             </div>
