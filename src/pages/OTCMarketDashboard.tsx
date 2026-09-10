@@ -37,6 +37,21 @@ type AutoPattern = {
   bestOutcome: Signal;
 };
 
+// Self-taught chart pattern — the AI observes the full visible chart and builds
+// its own candle-sequence patterns (color + relative size + wick), tracking what
+// candle tends to follow and whether trading it won or lost.
+type ChartPattern = {
+  key: string;
+  green: number;
+  red: number;
+  neutral: number;
+  wins: number;
+  losses: number;
+  occurrences: number;
+  confidence: number;
+  bestOutcome: Signal;
+};
+
 type Brain = {
   memories: Memory[];
   trades: Array<{ pattern: string; result: Outcome; price: number }>;
@@ -45,6 +60,7 @@ type Brain = {
   autoPatterns: AutoPattern[];
   extractedRules: ExtractedRule[];
   customPatterns: CustomPatternMemory[];
+  chartPatterns: ChartPattern[];
   winRate: number;
 };
 
@@ -79,6 +95,7 @@ type PatternFlags = {
   autoPrediction: { prediction: Signal; confidence: number; matched: string };
   extractedRule: { detected: boolean; rule: string; direction: "CALL" | "PUT"; confidence: number };
   customPattern: CustomPatternResult;
+  synthetic: { prediction: Signal; confidence: number; matched: string };
 };
 
 // A single logic's contribution to the combined CALL/PUT score
@@ -91,7 +108,7 @@ type ScoreContribution = {
 
 // Identifies a participating rule for outcome learning
 type ParticipatingRule = {
-  type: "MEMORY" | "AUTO_PATTERN" | "EXTRACTED_RULE" | "CUSTOM_PATTERN";
+  type: "MEMORY" | "AUTO_PATTERN" | "EXTRACTED_RULE" | "CUSTOM_PATTERN" | "SYNTH_PATTERN";
   id: string;
   key?: string;
   direction: "CALL" | "PUT";
@@ -185,11 +202,17 @@ const SIGNAL_THRESHOLD = 58;
 // Minimum total weighted evidence required before any signal is considered
 const MIN_TOTAL_EVIDENCE = 4;
 
-// 2-MINUTE ANALYSIS INTERVAL — the engine processes the market continuously but
-// only releases the next signal after a full 2-minute processing window has elapsed.
-const SIGNAL_COOLDOWN_MS = 120000;
-// Across the 2-minute window the candidate direction must stay consistent at least
-// this percentage of the decided ticks before a signal is confirmed.
+// 1-MINUTE CANDLE CYCLE — the engine analyzes every forming 1-minute candle and
+// releases a fresh signal the moment a NEW candle opens (wall-clock :00 seconds),
+// then automatically repeats for the next candle.
+const CANDLE_PERIOD_MS = 60000; // one 1-minute candle
+// The AI keeps a rolling 1-minute-46-second observation window of votes so each
+// decision reflects human-like context spanning the current and previous candle.
+const ANALYSIS_HOLD_MS = 106000; // 1 min 46 sec
+// A signal is released only within this tolerance right after a new candle opens.
+const ENTRY_TOLERANCE_MS = 2500;
+// Across the observation window the candidate direction must stay consistent at
+// least this percentage of the decided ticks before a signal is confirmed.
 const WINDOW_CONSENSUS_MIN = 60;
 
 // SELF-LEARNING BLACKLIST — a custom pattern is suppressed once it has enough
@@ -508,6 +531,86 @@ function getAutoPrediction(candles: Candle[], brain: Brain): { prediction: Signa
     }
   }
   return { prediction: "WAIT", confidence: 0, matched: "" };
+}
+
+// ============================================
+// FULL-CHART VISION — SELF-TAUGHT PATTERN ENGINE
+// The AI observes the ENTIRE visible chart, not just the last few candles, and
+// builds its own candle-sequence patterns from what it sees. Each candle is
+// encoded relative to the whole chart (color, size vs the chart average, and
+// wick dominance), so the engine "understands" the shape of the chart the way a
+// human eye does and remembers which formations tend to precede a green/red move.
+// ============================================
+
+// Normalized, chart-aware token: color + relative body size + wick dominance
+function chartToken(c: Candle, avgBody: number): string {
+  const sizeCat = c.body > avgBody * 1.4 ? "LG" : c.body < avgBody * 0.6 ? "SM" : "MD";
+  const wickCat = c.upperRatio > 1.3 ? "UW" : c.lowerRatio > 1.3 ? "LW" : "NW";
+  return `${c.color[0]}${sizeCat}${wickCat}`;
+}
+
+// Observe the chart on every newly completed candle and self-create patterns.
+// Runs incrementally on the tail windows (length 3-5) that end at the latest
+// candle, but normalizes each candle against the FULL visible chart average so
+// the learned patterns reflect the whole picture. Called once per new candle.
+function observeChart(candles: Candle[], brain: Brain): void {
+  if (candles.length < 4) return;
+  const avgBody = candles.reduce((sum, c) => sum + c.body, 0) / candles.length || 1;
+  for (let len = 3; len <= 5; len++) {
+    if (candles.length < len + 1) continue;
+    const seq = candles.slice(-(len + 1));
+    const outcome = seq[len];
+    if (outcome.color === "NEUTRAL") continue;
+    const key = seq.slice(0, len).map((c) => chartToken(c, avgBody)).join(">");
+    let pattern = brain.chartPatterns.find((p) => p.key === key);
+    if (!pattern) {
+      pattern = { key, green: 0, red: 0, neutral: 0, wins: 0, losses: 0, occurrences: 0, confidence: 0, bestOutcome: "WAIT" };
+      brain.chartPatterns.push(pattern);
+    }
+    pattern.occurrences++;
+    if (outcome.color === "GREEN") pattern.green++;
+    else if (outcome.color === "RED") pattern.red++;
+    else pattern.neutral++;
+    const decided = pattern.green + pattern.red;
+    pattern.confidence = decided > 0 ? (Math.max(pattern.green, pattern.red) / decided) * 100 : 0;
+    pattern.bestOutcome = pattern.green > pattern.red ? "CALL" : pattern.red > pattern.green ? "PUT" : "WAIT";
+  }
+  // Cap the self-taught library so it never grows unbounded — keep the most-seen
+  if (brain.chartPatterns.length > 400) {
+    brain.chartPatterns.sort((a, b) => b.occurrences - a.occurrences);
+    brain.chartPatterns = brain.chartPatterns.slice(0, 400);
+  }
+}
+
+// Match the current chart tail against the AI's self-taught patterns.
+function getSyntheticPrediction(candles: Candle[], brain: Brain): { prediction: Signal; confidence: number; matched: string } {
+  if (candles.length < 3) return { prediction: "WAIT", confidence: 0, matched: "" };
+  const avgBody = candles.reduce((sum, c) => sum + c.body, 0) / candles.length || 1;
+  for (let len = 5; len >= 3; len--) {
+    if (candles.length < len) continue;
+    const key = candles.slice(-len).map((c) => chartToken(c, avgBody)).join(">");
+    const pattern = brain.chartPatterns.find((p) => p.key === key && p.occurrences >= 3);
+    if (pattern && pattern.bestOutcome !== "WAIT" && pattern.confidence >= 60) {
+      // Bias confidence by the pattern's real trade record when it has one
+      const decided = pattern.wins + pattern.losses;
+      const record = decided > 0 ? pattern.wins / decided : 0.5;
+      const confidence = Math.min(95, pattern.confidence * (0.7 + record * 0.6));
+      return { prediction: pattern.bestOutcome, confidence, matched: `${len}-candle self-taught (${pattern.occurrences}x)` };
+    }
+  }
+  return { prediction: "WAIT", confidence: 0, matched: "" };
+}
+
+// Get the participating self-taught pattern keys for the current tail (for outcome learning)
+function getSyntheticParticipants(candles: Candle[]): string[] {
+  if (candles.length < 3) return [];
+  const avgBody = candles.reduce((sum, c) => sum + c.body, 0) / candles.length || 1;
+  const keys: string[] = [];
+  for (let len = 3; len <= 5; len++) {
+    if (candles.length < len) continue;
+    keys.push(candles.slice(-len).map((c) => chartToken(c, avgBody)).join(">"));
+  }
+  return keys;
 }
 
 // ============================================
@@ -1078,7 +1181,7 @@ export default function OTCMarketDashboard() {
   // 2-minute processing window telemetry
   const [analysisProgress, setAnalysisProgress] = useState(0);
   const [windowInfo, setWindowInfo] = useState<{ remaining: number; consensusDir: Signal; consensusStrength: number; votes: { call: number; put: number; wait: number } }>({
-    remaining: SIGNAL_COOLDOWN_MS / 1000, consensusDir: "WAIT", consensusStrength: 0, votes: { call: 0, put: 0, wait: 0 },
+    remaining: CANDLE_PERIOD_MS / 1000, consensusDir: "WAIT", consensusStrength: 0, votes: { call: 0, put: 0, wait: 0 },
   });
   const [customPatternList, setCustomPatternList] = useState<CustomPatternMemory[]>([]);
 
@@ -1094,7 +1197,7 @@ export default function OTCMarketDashboard() {
     callTotal: number; putTotal: number;
   } | null>(null);
   const [stats, setStats] = useState({
-    candles: 0, memories: 0, trades: 0, zigzag: 0, structure: 0, winRate: 0, autoPatterns: 0, extractedRules: 0,
+    candles: 0, memories: 0, trades: 0, zigzag: 0, structure: 0, winRate: 0, autoPatterns: 0, extractedRules: 0, synth: 0,
   });
   const [roi, setRoi] = useState({ x: 100, y: 50, width: 500, height: 350 });
   const [locked, setLocked] = useState(false);
@@ -1116,16 +1219,20 @@ export default function OTCMarketDashboard() {
   const lastSignature = useRef("");
   const zigzagRef = useRef<ZigZagPoint[]>([]);
   const snrLevelsRef = useRef<SNRLevel[]>([]);
-  // 2-minute window bookkeeping
+  // 1-minute candle cycle bookkeeping
   const windowStart = useRef(0);
   const windowVotes = useRef({ call: 0, put: 0, wait: 0 });
   const awaitingOutcome = useRef(false);
+  // Wall-clock minute index of the last candle we fired a signal for (one signal per candle)
+  const lastSignaledMinute = useRef(-1);
+  // Rolling 1:46 observation window of per-tick votes
+  const voteLog = useRef<Array<{ t: number; dir: Signal }>>([]);
 
   const imageCanvasRef = useRef<HTMLCanvasElement>(null);
   const lastMatchedRule = useRef<ExtractedRule | null>(null);
   const participatingRules = useRef<ParticipatingRule[]>([]);
   const brain = useRef<Brain>({
-    memories: [], trades: [], zigzag: [], structure: [], autoPatterns: [], extractedRules: [...SEED_RULES], customPatterns: [], winRate: 0,
+    memories: [], trades: [], zigzag: [], structure: [], autoPatterns: [], extractedRules: [...SEED_RULES], customPatterns: [], chartPatterns: [], winRate: 0,
   });
 
   const updateStats = useCallback(() => {
@@ -1138,6 +1245,7 @@ export default function OTCMarketDashboard() {
       winRate: brain.current.winRate,
       autoPatterns: brain.current.autoPatterns.length,
       extractedRules: brain.current.extractedRules.length,
+      synth: brain.current.chartPatterns.length,
     });
   }, []);
 
@@ -1170,6 +1278,7 @@ export default function OTCMarketDashboard() {
           autoPatterns: request.result.autoPatterns ?? [],
           extractedRules: request.result.extractedRules ?? [...SEED_RULES],
           customPatterns: request.result.customPatterns ?? [],
+          chartPatterns: request.result.chartPatterns ?? [],
         };
         updateStats();
         setExtractedRulesList(brain.current.extractedRules);
@@ -1288,6 +1397,10 @@ export default function OTCMarketDashboard() {
 
     // Auto pattern generator — learns micro-sequences of 2-4 candles
     autoLearn(candles.current, brain.current);
+
+    // Full-chart vision — the AI observes the whole visible chart and creates its
+    // own self-taught candle-sequence patterns from what it sees.
+    observeChart(candles.current, brain.current);
   }, []);
 
   const readPrice = useCallback(async (context: CanvasRenderingContext2D): Promise<number | null> => {
@@ -1435,6 +1548,10 @@ export default function OTCMarketDashboard() {
     windowStart.current = Date.now();
     windowVotes.current = { call: 0, put: 0, wait: 0 };
     awaitingOutcome.current = false;
+    voteLog.current = [];
+    // Start from the current candle so the first signal only fires when the NEXT
+    // 1-minute candle opens — giving the AI a full candle to observe first.
+    lastSignaledMinute.current = Math.floor(Date.now() / CANDLE_PERIOD_MS);
     setAnalysisProgress(0);
     setSignal("WAIT");
   }, []);
@@ -1500,6 +1617,7 @@ export default function OTCMarketDashboard() {
       autoPrediction: getAutoPrediction(allCandles, brain.current),
       extractedRule: detectExtractedRules(allCandles, zigzagPoints, brain.current.extractedRules),
       customPattern: detectCustomPatterns(allCandles, zigzagPoints, snr, brain.current),
+      synthetic: getSyntheticPrediction(allCandles, brain.current),
     };
     const custom = patterns.customPattern;
 
@@ -1681,6 +1799,21 @@ export default function OTCMarketDashboard() {
       participatingRules.current.push({ type: "CUSTOM_PATTERN", id: custom.key, direction: custom.direction });
     }
 
+    // --- 14. Self-Taught Chart Vision (full-chart auto patterns) ---
+    if (patterns.synthetic.prediction !== "WAIT") {
+      const w = 2 + Math.round(patterns.synthetic.confidence / 40);
+      if (patterns.synthetic.prediction === "CALL") {
+        call += w;
+        breakdown.push({ logic: "Self-Taught Vision", direction: "CALL", weight: w, detail: `${patterns.synthetic.matched} ${patterns.synthetic.confidence.toFixed(0)}%` });
+      } else {
+        put += w;
+        breakdown.push({ logic: "Self-Taught Vision", direction: "PUT", weight: w, detail: `${patterns.synthetic.matched} ${patterns.synthetic.confidence.toFixed(0)}%` });
+      }
+      for (const key of getSyntheticParticipants(allCandles)) {
+        participatingRules.current.push({ type: "SYNTH_PATTERN", id: key, direction: patterns.synthetic.prediction as "CALL" | "PUT" });
+      }
+    }
+
     // --- Combined Decision ---
     const total = call + put;
     const dominantScore = Math.max(call, put);
@@ -1716,37 +1849,60 @@ export default function OTCMarketDashboard() {
     setAnalysis({ candles: recent, price, confidence: combinedConfidence, sequence: recent.map(token), indicators: technical, structure, patterns, reversed: signalReversed, reasons: breakdown.map((b) => `${b.logic} ${b.direction === "CALL" ? "+" : "-"}${b.weight}`), scoreBreakdown: breakdown, callTotal: call, putTotal: put });
     setReversed(signalReversed);
 
-    // ---- 2-MINUTE PROCESSING WINDOW ----
-    // The engine keeps voting every tick; a signal is only released once a full
-    // 2-minute window has passed AND the window agrees with the current alignment.
+    // ---- 1-MINUTE CANDLE CYCLE ----
+    // The engine analyzes every forming candle and keeps a rolling 1:46 window of
+    // per-tick votes. A fresh signal is released the moment a NEW 1-minute candle
+    // opens (wall-clock :00s), then it automatically repeats for the next candle.
     const now = Date.now();
-    if (windowStart.current === 0) windowStart.current = now;
-    if (candidate === "CALL") windowVotes.current.call++;
-    else if (candidate === "PUT") windowVotes.current.put++;
-    else windowVotes.current.wait++;
 
-    const elapsed = now - windowStart.current;
-    const progress = Math.min(100, (elapsed / SIGNAL_COOLDOWN_MS) * 100);
-    const votes = windowVotes.current;
+    // Record this tick's vote and prune anything older than the 1:46 hold window.
+    voteLog.current.push({ t: now, dir: candidate });
+    const cutoff = now - ANALYSIS_HOLD_MS;
+    voteLog.current = voteLog.current.filter((v) => v.t >= cutoff);
+
+    const votes = { call: 0, put: 0, wait: 0 };
+    for (const v of voteLog.current) {
+      if (v.dir === "CALL") votes.call++;
+      else if (v.dir === "PUT") votes.put++;
+      else votes.wait++;
+    }
     const decidedVotes = votes.call + votes.put;
     const consensusDir: Signal = votes.call > votes.put ? "CALL" : votes.put > votes.call ? "PUT" : "WAIT";
     const consensusStrength = decidedVotes > 0 ? (Math.max(votes.call, votes.put) / decidedVotes) * 100 : 0;
-    setAnalysisProgress(progress);
-    setWindowInfo({ remaining: Math.max(0, Math.ceil((SIGNAL_COOLDOWN_MS - elapsed) / 1000)), consensusDir, consensusStrength, votes: { ...votes } });
 
-    const windowReady = elapsed >= SIGNAL_COOLDOWN_MS;
-    if (windowReady && coreAligned && candidate !== "WAIT" && candidate === consensusDir && consensusStrength >= WINDOW_CONSENSUS_MIN) {
+    // Position within the current 1-minute candle.
+    const minuteIndex = Math.floor(now / CANDLE_PERIOD_MS);
+    const msIntoCandle = now % CANDLE_PERIOD_MS;
+    const msToNextCandle = CANDLE_PERIOD_MS - msIntoCandle;
+    // Progress shows how far the current candle has formed (fills toward the next :00).
+    const progress = Math.min(100, (msIntoCandle / CANDLE_PERIOD_MS) * 100);
+    setAnalysisProgress(progress);
+    setWindowInfo({ remaining: Math.max(0, Math.ceil(msToNextCandle / 1000)), consensusDir, consensusStrength, votes: { ...votes } });
+
+    // A brand-new candle has opened if the minute index advanced past the last one
+    // we acted on. Auto-release the previous live signal so the engine never freezes.
+    const newCandleOpened = minuteIndex > lastSignaledMinute.current;
+    if (newCandleOpened && awaitingOutcome.current) {
+      // Previous signal was never logged — clear it so this candle can be analyzed.
+      awaitingOutcome.current = false;
+    }
+
+    // Fire only right at the candle open (within tolerance) and once per candle.
+    const atCandleOpen = newCandleOpened && msIntoCandle <= ENTRY_TOLERANCE_MS;
+    if (atCandleOpen && coreAligned && candidate !== "WAIT" && candidate === consensusDir && consensusStrength >= WINDOW_CONSENSUS_MIN) {
       setSignal(candidate);
       awaitingOutcome.current = true;
-      windowStart.current = now;
-      windowVotes.current = { call: 0, put: 0, wait: 0 };
-      setStatus(`SIGNAL ${candidate} confirmed after a full 2-minute analysis — ${custom.name} (${custom.confidence}%), window consensus ${consensusStrength.toFixed(0)}%. Log the outcome to train the brain.`);
+      lastSignaledMinute.current = minuteIndex;
+      setStatus(`SIGNAL ${candidate} released at new 1-min candle — ${custom.name} (${custom.confidence}%), 1:46 consensus ${consensusStrength.toFixed(0)}%. Trade this candle; log the outcome to train the brain.`);
     } else {
+      if (newCandleOpened && !atCandleOpen) {
+        // Candle advanced but alignment wasn't ready at the open — skip this candle.
+        lastSignaledMinute.current = minuteIndex;
+        setSignal("WAIT");
+      }
       const guard = custom.vPattern ? " | V-PATTERN BLOCKED" : custom.blacklisted ? " | PATTERN BLACKLISTED" : "";
-      const phase = windowReady
-        ? `2-min window complete — holding for full alignment${custom.detected ? "" : " (no custom pattern yet)"}`
-        : `Analyzing market — ${Math.max(0, Math.ceil((SIGNAL_COOLDOWN_MS - elapsed) / 1000))}s left in 2-min window`;
-      setStatus(`${phase} | candidate ${candidate} | CALL ${call} vs PUT ${put} | ${custom.detected ? custom.name : "scanning patterns"}${guard}`);
+      const secsLeft = Math.max(0, Math.ceil(msToNextCandle / 1000));
+      setStatus(`Analyzing 1-min candle — next signal in ${secsLeft}s | candidate ${candidate} | CALL ${call} vs PUT ${put} | 1:46 consensus ${consensusDir} ${consensusStrength.toFixed(0)}% | ${custom.detected ? custom.name : "scanning patterns"}${guard}`);
     }
   }, [round]);
 
