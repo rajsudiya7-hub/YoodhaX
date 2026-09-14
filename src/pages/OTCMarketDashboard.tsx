@@ -1,2040 +1,788 @@
-import { useCallback, useEffect, useRef, useState, type ChangeEvent, type MouseEvent } from "react";
-import { createWorker } from "tesseract.js";
-import { Loader2, AlertTriangle, TrendingUp, TrendingDown, Shield, Zap, Activity, Layers, Image as ImageIcon, Cpu } from "lucide-react";
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { createWorker } from 'tesseract.js';
 
-// ============================================
-// TYPES
-// ============================================
-
-type Color = "GREEN" | "RED" | "NEUTRAL";
-type Signal = "WAIT" | "CALL" | "PUT";
-type Structure = "HH" | "HL" | "LH" | "LL";
-type Outcome = "WIN" | "LOSS";
-
-type Candle = {
-  id: number; x: number; width: number; top: number; bottom: number;
-  bodyTop: number; bodyBottom: number; closeY: number; color: Color;
-  body: number; upper: number; lower: number; upperRatio: number; lowerRatio: number;
-  shape: string; timestamp: number;
-};
-
-type Memory = {
-  key: string; description: string; green: number; red: number; neutral: number;
-  wins: number; losses: number; confidence: number; occurrences: number;
-  lossStreak: number; reverse: boolean; lastOutcomeCandleId?: number;
-};
-
-type AutoPattern = {
-  key: string;
-  length: number;
-  green: number;
-  red: number;
-  neutral: number;
-  wins: number;
-  losses: number;
-  occurrences: number;
+// Brain Memory Types - TRADER YODHA X AI Systems
+interface PatternMemory {
+  id: string;
+  pattern: string;
+  sequenceLength: number;
+  priceLevel: number;
+  priceRange: string;
+  bodySize: number;
+  topWickSize: number;
+  bottomWickSize: number;
+  result: 'WIN' | 'LOSS';
+  timestamp: number;
+  timeSync?: number;
+  timeKey24H: string;
+  minuteMarker: number;
   confidence: number;
-  bestOutcome: Signal;
-};
+}
 
-// Self-taught chart pattern — the AI observes the full visible chart and builds
-// its own candle-sequence patterns (color + relative size + wick), tracking what
-// candle tends to follow and whether trading it won or lost.
-type ChartPattern = {
-  key: string;
-  green: number;
-  red: number;
-  neutral: number;
-  wins: number;
-  losses: number;
+interface MagicNumber {
+  priceLevel: number;
+  isRoundNumber: boolean;
+  priceRange: string;
+  direction: 'GREEN_TO_RED' | 'RED_TO_GREEN';
   occurrences: number;
-  confidence: number;
-  bestOutcome: Signal;
-};
+  successRate: number;
+  lastSeen: number;
+}
 
-type Brain = {
-  memories: Memory[];
-  trades: Array<{ pattern: string; result: Outcome; price: number }>;
-  zigzag: Array<{ price: number; type: "HIGH" | "LOW"; occurrences: number }>;
-  structure: Array<{ label: Structure; y: number; candleId: number }>;
-  autoPatterns: AutoPattern[];
-  extractedRules: ExtractedRule[];
-  customPatterns: CustomPatternMemory[];
-  chartPatterns: ChartPattern[];
+interface TimeAlgorithm {
+  timeKey24H: string;
+  minuteMarker: number;
+  secondMarker: number;
+  direction: 'UP' | 'DOWN' | 'NEUTRAL';
+  frequency: number;
+  successRate: number;
+  lastOccurrences: number[];
+}
+
+interface ZigZagLevel {
+  price: number;
+  type: 'HIGH' | 'LOW';
+  occurrences: number;
+  timestamp: number;
+  screenY?: number;
+}
+
+interface BrainState {
+  patterns: PatternMemory[];
+  magicNumbers: MagicNumber[];
+  timeAlgorithms: TimeAlgorithm[];
+  zigzagLevels: ZigZagLevel[];
+  totalTrades: number;
   winRate: number;
-};
+  lastUpdated: number;
+}
 
-type Indicators = { rsi14: number | null };
-
-type ZigZagPoint = {
-  index: number;
-  y: number;
-  type: "HIGH" | "LOW";
-  candleId: number;
-  label: Structure;
-};
-
-type SNRLevel = {
-  y: number;
-  type: "SUPPORT" | "RESISTANCE";
-  touches: number;
-  price: number | null;
-  label: string;
-  isRound: boolean;
-  isMajor: boolean;
-  behavior: "NONE" | "BOUNCE" | "BREAK";
+interface LiveAnalysis {
+  pattern: string;
+  sequence: string[];
+  dominantColor: 'GREEN' | 'RED' | 'NEUTRAL';
   strength: number;
-};
-
-type PatternFlags = {
-  sequential7: { detected: boolean; prediction: Signal; confidence: number };
-  breakdown: { detected: boolean; level: string };
-  wickRejection: { detected: boolean; direction: "CALL" | "PUT"; count: number };
-  confluence: { score: number; points: string[] };
-  trap: { detected: boolean; type: string; direction: "CALL" | "PUT" };
-  autoPrediction: { prediction: Signal; confidence: number; matched: string };
-  extractedRule: { detected: boolean; rule: string; direction: "CALL" | "PUT"; confidence: number };
-  customPattern: CustomPatternResult;
-  synthetic: { prediction: Signal; confidence: number; matched: string };
-};
-
-// A single logic's contribution to the combined CALL/PUT score
-type ScoreContribution = {
-  logic: string;
-  direction: "CALL" | "PUT";
-  weight: number;
-  detail: string;
-};
-
-// Identifies a participating rule for outcome learning
-type ParticipatingRule = {
-  type: "MEMORY" | "AUTO_PATTERN" | "EXTRACTED_RULE" | "CUSTOM_PATTERN" | "SYNTH_PATTERN";
-  id: string;
-  key?: string;
-  direction: "CALL" | "PUT";
-};
-
-// Adaptive memory for the image-derived custom pattern rules.
-// Tracks per-rule win/loss so the engine can learn and blacklist failing setups.
-type CustomPatternMemory = {
-  key: string;
-  name: string;
-  wins: number;
-  losses: number;
-  occurrences: number;
-  blacklisted: boolean;
-};
-
-// Live evaluation of the custom (whiteboard) pattern engine for the current chart
-type CustomPatternResult = {
-  detected: boolean;
-  name: string;
-  key: string;
-  direction: "CALL" | "PUT";
-  confidence: number;
-  atLevel: boolean;
-  vPattern: boolean;
-  blacklisted: boolean;
-  notes: string[];
-};
-
-// Image-extracted pattern with exact visual metrics
-type ExtractedRule = {
-  id: string;
-  name: string;
-  bodyPct: number;
-  upperWickPct: number;
-  lowerWickPct: number;
-  colorFlow: string;
-  levelBehavior: "SR_REJECTION" | "FAKE_BREAKOUT" | "EXHAUSTION_SWEEP" | "NONE";
-  direction: "CALL" | "PUT";
-  trustWeight: number;
-  occurrences: number;
-  wins: number;
-  losses: number;
-  source: "IMAGE" | "LIVE_VARIANT";
-  createdAt: number;
-};
-
-// Metrics extracted from an uploaded chart image
-type ImageMetrics = {
-  candleCount: number;
-  avgBodyPct: number;
-  avgUpperWickPct: number;
-  avgLowerWickPct: number;
-  colorFlow: string;
-  levelBehavior: string;
-  extractedCandles: Array<{ bodyPct: number; upperWickPct: number; lowerWickPct: number; color: Color }>;
-};
-
-// ============================================
-// CONSTANTS — OTC Optimized
-// ============================================
-
-const DB = "TRADER_YODHA_X_AI";
-const STORE = "TRADER_YODHA_X_AI_BRAIN";
-const KEY = "TRADER_YODHA_X_AI_BRAIN_STATE";
-const MAX_CANDLES = 120;
-
-const ZIGZAG_DEVIATION = 5;
-const ZIGZAG_DEPTH = 1;
-const ZIGZAG_BACKSTEP = 3;
-
-const WICK_REJECTION_RATIO = 1.5;
-const WICK_REJECTION_COUNT = 3;
-const BREAKDOWN_TOLERANCE_PX = 3;
-const CONFLUENCE_PROXIMITY_PX = 8;
-const TRAP_WICK_MULTIPLIER = 2.5;
-const REVERSE_LOSS_STREAK = 2;
-
-const SNR_CLUSTER_PROXIMITY_PX = 8;
-const SNR_MAX_LEVELS = 8;
-const SNR_MIN_TOUCHES = 2;
-const AUTO_PATTERN_MIN_LENGTH = 2;
-const AUTO_PATTERN_MAX_LENGTH = 4;
-const AUTO_PATTERN_MIN_OCCURRENCES = 2;
-
-const ANALYSIS_INTERVAL_MS = 800;
-
-// Combined confidence threshold — signal fires only when the dominant side
-// exceeds this percentage of the total weighted evidence
-const SIGNAL_THRESHOLD = 58;
-// Minimum total weighted evidence required before any signal is considered
-const MIN_TOTAL_EVIDENCE = 4;
-
-// 1-MINUTE CANDLE CYCLE — the engine analyzes every forming 1-minute candle and
-// releases a fresh signal the moment a NEW candle opens (wall-clock :00 seconds),
-// then automatically repeats for the next candle.
-const CANDLE_PERIOD_MS = 60000; // one 1-minute candle
-// The AI keeps a rolling 1-minute-46-second observation window of votes so each
-// decision reflects human-like context spanning the current and previous candle.
-const ANALYSIS_HOLD_MS = 106000; // 1 min 46 sec
-// A signal is released only within this tolerance right after a new candle opens.
-const ENTRY_TOLERANCE_MS = 2500;
-// Across the observation window the candidate direction must stay consistent at
-// least this percentage of the decided ticks before a signal is confirmed.
-const WINDOW_CONSENSUS_MIN = 60;
-
-// SELF-LEARNING BLACKLIST — a custom pattern is suppressed once it has enough
-// decided trades and its loss rate crosses this threshold.
-const CUSTOM_BLACKLIST_MIN_OCCURRENCES = 4;
-const CUSTOM_BLACKLIST_LOSS_RATE = 0.6;
-
-// Friendly labels for the image-derived custom pattern keys
-const CUSTOM_LABELS: Record<string, string> = {
-  HFLIP_RES: "Green→Red Flip @ Resistance",
-  HFLIP_SUP: "Red→Green Card @ Support",
-  WICK_RES: "Long-Wick Breaker @ Resistance",
-  WICK_SUP: "Long-Wick Breaker @ Support",
-  DOJI_RES: "Doji Breaker @ Resistance",
-  DOJI_SUP: "Doji Breaker @ Support",
-  BOUNCE_SUP: "Support Bounce Continuation",
-  BOUNCE_RES: "Resistance Bounce Continuation",
-};
-
-const token = (c: Candle) => `${c.color[0]}-${c.shape}`;
-const roundNumber = (p: number) => /(?:000|500)$/.test(p.toFixed(5));
-const priceText = (p: number | null) => (p == null ? "—" : p.toFixed(5));
-const card = "bg-[#0f172a] rounded-xl p-5 border border-slate-800";
-
-// Richer micro-sequence token for auto pattern learning — encodes color, body size, and wick dominance
-function microToken(c: Candle): string {
-  const sizeCat = c.body > 25 ? "LG" : c.body > 10 ? "MD" : "SM";
-  const wickCat = c.upperRatio > 1.5 ? "UW" : c.lowerRatio > 1.5 ? "LW" : "NW";
-  return `${c.color[0]}-${sizeCat}-${wickCat}`;
+  priceLevel: number;
+  isRoundNumber: boolean;
+  bodySize: number;
+  topWick: number;
+  bottomWick: number;
+  detectedMagicNumbers: MagicNumber[];
+  matchedZigZag: ZigZagLevel | null;
+  timeKey24H: string;
+  timestampSecond: number;
+  currentMinute: number;
+  timeSyncData: TimeAlgorithm | null;
 }
 
-// ============================================
-// INDICATORS — RSI14 only
-// ============================================
-
-function getIndicators(values: number[]): Indicators {
-  if (!values.length) return { rsi14: null };
-  const recent = values.slice(-15);
-  let gain = 0;
-  let loss = 0;
-  for (let i = 1; i < recent.length; i++) {
-    const delta = recent[i] - recent[i - 1];
-    if (delta >= 0) gain += delta;
-    else loss += Math.abs(delta);
-  }
-  const rsi14 =
-    recent.length === 15
-      ? loss === 0
-        ? 100
-        : 100 - 100 / (1 + gain / loss)
-      : null;
-  return { rsi14 };
+interface CropRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
-// ============================================
-// FULL ZIGZAG ENGINE (Deviation=5, Depth=1, Backstep=3)
-// ============================================
-
-function calculateZigZag(
-  candles: Candle[],
-  deviation: number,
-  depth: number,
-  backstep: number,
-): ZigZagPoint[] {
-  if (candles.length < depth * 2 + 1) return [];
-
-  type RawPivot = { index: number; y: number; type: "HIGH" | "LOW" };
-  const rawPivots: RawPivot[] = [];
-
-  for (let i = depth; i < candles.length - depth; i++) {
-    let isHigh = true;
-    for (let j = i - depth; j <= i + depth; j++) {
-      if (j === i) continue;
-      if (candles[j].top < candles[i].top) { isHigh = false; break; }
-    }
-    if (isHigh) rawPivots.push({ index: i, y: candles[i].top, type: "HIGH" });
-
-    let isLow = true;
-    for (let j = i - depth; j <= i + depth; j++) {
-      if (j === i) continue;
-      if (candles[j].bottom > candles[i].bottom) { isLow = false; break; }
-    }
-    if (isLow) rawPivots.push({ index: i, y: candles[i].bottom, type: "LOW" });
-  }
-
-  rawPivots.sort((a, b) => a.index - b.index);
-
-  const confirmed: RawPivot[] = [];
-  for (const pivot of rawPivots) {
-    const last = confirmed[confirmed.length - 1];
-    if (!last) { confirmed.push(pivot); continue; }
-    if (pivot.type === last.type) {
-      if (pivot.type === "HIGH" && pivot.y < last.y) confirmed[confirmed.length - 1] = pivot;
-      else if (pivot.type === "LOW" && pivot.y > last.y) confirmed[confirmed.length - 1] = pivot;
-      continue;
-    }
-    if (Math.abs(pivot.y - last.y) < deviation) continue;
-    const lastSameType = [...confirmed].reverse().find((p) => p.type === pivot.type);
-    if (lastSameType && pivot.index - lastSameType.index < backstep) continue;
-    confirmed.push(pivot);
-  }
-
-  const result: ZigZagPoint[] = [];
-  let prevHigh: RawPivot | null = null;
-  let prevLow: RawPivot | null = null;
-
-  for (const pivot of confirmed) {
-    let label: Structure;
-    if (pivot.type === "HIGH") {
-      label = !prevHigh || pivot.y < prevHigh.y ? "HH" : "LH";
-      prevHigh = pivot;
-    } else {
-      label = !prevLow || pivot.y < prevLow.y ? "HL" : "LL";
-      prevLow = pivot;
-    }
-    result.push({ index: pivot.index, y: pivot.y, type: pivot.type, candleId: candles[pivot.index].id, label });
-  }
-
-  return result;
-}
-
-// ============================================
-// AUTO LEVEL DETECTION SYSTEM
-// Automatically detects Support/Resistance from swing highs/lows,
-// classifies major vs minor by touch count, detects psychological round-number
-// levels, and checks break/bounce behavior against the latest candle.
-// ============================================
-
-function calculateSNRLevels(
-  zigzag: ZigZagPoint[],
-  candles: Candle[],
-  prices: number[],
-): SNRLevel[] {
-  const levels: SNRLevel[] = [];
-  const latest = candles.at(-1);
-
-  // --- Cluster HIGH pivots → resistance levels ---
-  const highClusters: { y: number; touches: number; candleIds: number[] }[] = [];
-  for (const p of zigzag.filter((z) => z.type === "HIGH")) {
-    const cluster = highClusters.find((c) => Math.abs(c.y - p.y) < SNR_CLUSTER_PROXIMITY_PX);
-    if (cluster) {
-      cluster.y = (cluster.y * cluster.touches + p.y) / (cluster.touches + 1);
-      cluster.touches++;
-      cluster.candleIds.push(p.candleId);
-    } else {
-      highClusters.push({ y: p.y, touches: 1, candleIds: [p.candleId] });
-    }
-  }
-
-  // --- Cluster LOW pivots → support levels ---
-  const lowClusters: { y: number; touches: number; candleIds: number[] }[] = [];
-  for (const p of zigzag.filter((z) => z.type === "LOW")) {
-    const cluster = lowClusters.find((c) => Math.abs(c.y - p.y) < SNR_CLUSTER_PROXIMITY_PX);
-    if (cluster) {
-      cluster.y = (cluster.y * cluster.touches + p.y) / (cluster.touches + 1);
-      cluster.touches++;
-      cluster.candleIds.push(p.candleId);
-    } else {
-      lowClusters.push({ y: p.y, touches: 1, candleIds: [p.candleId] });
-    }
-  }
-
-  // Helper: detect break vs bounce behavior
-  const detectBehavior = (levelY: number, type: "SUPPORT" | "RESISTANCE"): "NONE" | "BOUNCE" | "BREAK" => {
-    if (!latest) return "NONE";
-    if (type === "RESISTANCE") {
-      // Break: candle closed above resistance
-      if (latest.bodyTop < levelY - BREAKDOWN_TOLERANCE_PX && latest.closeY < levelY) return "BOUNCE";
-      if (latest.closeY < levelY && latest.top > levelY) return "BOUNCE"; // wick rejection
-      if (latest.closeY > levelY + BREAKDOWN_TOLERANCE_PX) return "BREAK";
-    } else {
-      // Break: candle closed below support
-      if (latest.bodyBottom > levelY + BREAKDOWN_TOLERANCE_PX && latest.closeY > levelY) return "BOUNCE";
-      if (latest.closeY > levelY && latest.bottom < levelY) return "BOUNCE"; // wick rejection
-      if (latest.closeY < levelY - BREAKDOWN_TOLERANCE_PX) return "BREAK";
-    }
-    return "NONE";
-  };
-
-  // Build resistance levels — only levels with SNR_MIN_TOUCHES or more distinct touches
-  for (const c of highClusters) {
-    if (c.touches < SNR_MIN_TOUCHES) continue;
-    const isMajor = c.touches >= 3;
-    const behavior = detectBehavior(Math.round(c.y), "RESISTANCE");
-    levels.push({
-      y: Math.round(c.y),
-      type: "RESISTANCE",
-      touches: c.touches,
-      price: null,
-      label: `${isMajor ? "Major " : ""}R (${c.touches}x)`,
-      isRound: false,
-      isMajor,
-      behavior,
-      strength: Math.min(c.touches * 20, 100),
-    });
-  }
-
-  // Build support levels — only levels with SNR_MIN_TOUCHES or more distinct touches
-  for (const c of lowClusters) {
-    if (c.touches < SNR_MIN_TOUCHES) continue;
-    const isMajor = c.touches >= 3;
-    const behavior = detectBehavior(Math.round(c.y), "SUPPORT");
-    levels.push({
-      y: Math.round(c.y),
-      type: "SUPPORT",
-      touches: c.touches,
-      price: null,
-      label: `${isMajor ? "Major " : ""}S (${c.touches}x)`,
-      isRound: false,
-      isMajor,
-      behavior,
-      strength: Math.min(c.touches * 20, 100),
-    });
-  }
-
-  // --- Round number psychological levels — only major .000 and .500 within visible chart ---
-  if (prices.length >= 2 && candles.length >= 2) {
-    const minPrice = Math.min(...prices);
-    const maxPrice = Math.max(...prices);
-    const priceRange = maxPrice - minPrice;
-    if (priceRange > 0) {
-      const minTop = Math.min(...candles.map((c) => c.top));
-      const maxBottom = Math.max(...candles.map((c) => c.bottom));
-      const yRange = maxBottom - minTop;
-      if (yRange > 0) {
-        const pricePerPixel = priceRange / yRange;
-        const currentPrice = prices[prices.length - 1];
-        const latestCandle = candles[candles.length - 1];
-
-        // Only major psychological levels: .000 and .500
-        const roundTargets = new Set<number>();
-        for (const interval of [0.001, 0.0005]) {
-          const base = Math.round(currentPrice / interval) * interval;
-          for (const offset of [-interval, 0, interval]) {
-            const target = Math.round((base + offset) * 1e6) / 1e6;
-            if (target > 0 && /(?:000|500)$/.test(target.toFixed(5))) roundTargets.add(target);
-          }
-        }
-
-        for (const target of roundTargets) {
-          const y = Math.round(latestCandle.closeY - (target - currentPrice) / pricePerPixel);
-          // Only draw if within the visible chart area
-          if (y < 0 || y > yRange + minTop) continue;
-          if (levels.some((l) => Math.abs(l.y - y) < SNR_CLUSTER_PROXIMITY_PX)) continue;
-
-          // Count actual candle touches at this level
-          let touchCount = 0;
-          for (const c of candles) {
-            if (Math.abs(c.top - y) < SNR_CLUSTER_PROXIMITY_PX || Math.abs(c.bottom - y) < SNR_CLUSTER_PROXIMITY_PX) touchCount++;
-          }
-          if (touchCount < 1) continue; // skip if no candle is near this round number
-
-          const behavior = detectBehavior(y, target > currentPrice ? "RESISTANCE" : "SUPPORT");
-          const isMajor = true; // .000 and .500 are always major
-          levels.push({
-            y,
-            type: target > currentPrice ? "RESISTANCE" : "SUPPORT",
-            touches: touchCount,
-            price: target,
-            label: `Round ${target.toFixed(5)} (${touchCount}x)`,
-            isRound: true,
-            isMajor,
-            behavior,
-            strength: Math.min(touchCount * 20, 100),
-          });
-        }
-      }
-    }
-  }
-
-  // Sort by strength (touches × type weight) and return top levels
-  // Major levels always rank above minor; round numbers rank by touch count
-  return levels
-    .sort((a, b) => {
-      if (a.isMajor !== b.isMajor) return a.isMajor ? -1 : 1;
-      return b.touches - a.touches;
-    })
-    .slice(0, SNR_MAX_LEVELS);
-}
-
-// ============================================
-// HUMAN-BRAIN AUTO PATTERN GENERATOR & SEQUENCE LEARNER
-// Tracks micro-sequences (size, wick, color) and learns what follows
-// ============================================
-
-function autoLearn(candles: Candle[], brain: Brain): void {
-  for (let len = AUTO_PATTERN_MIN_LENGTH; len <= AUTO_PATTERN_MAX_LENGTH; len++) {
-    if (candles.length < len + 1) continue;
-    const seq = candles.slice(-(len + 1));
-    const key = seq.slice(0, len).map(microToken).join(">");
-    const outcome = seq[len];
-    let pattern = brain.autoPatterns.find((p) => p.key === key);
-    if (!pattern) {
-      pattern = { key, length: len, green: 0, red: 0, neutral: 0, wins: 0, losses: 0, occurrences: 0, confidence: 0, bestOutcome: "WAIT" };
-      brain.autoPatterns.push(pattern);
-    }
-    pattern.occurrences++;
-    if (outcome.color === "GREEN") pattern.green++;
-    else if (outcome.color === "RED") pattern.red++;
-    else pattern.neutral++;
-    pattern.confidence = pattern.occurrences > 0
-      ? (Math.max(pattern.green, pattern.red) / pattern.occurrences) * 100
-      : 0;
-    pattern.bestOutcome = pattern.green > pattern.red ? "CALL" : pattern.red > pattern.green ? "PUT" : "WAIT";
-  }
-}
-
-function getAutoPrediction(candles: Candle[], brain: Brain): { prediction: Signal; confidence: number; matched: string } {
-  if (candles.length < 3) return { prediction: "WAIT", confidence: 0, matched: "" };
-  for (let len = Math.min(AUTO_PATTERN_MAX_LENGTH, candles.length - 1); len >= AUTO_PATTERN_MIN_LENGTH; len--) {
-    const seq = candles.slice(-len);
-    const key = seq.map(microToken).join(">");
-    const pattern = brain.autoPatterns.find((p) => p.key === key && p.occurrences >= AUTO_PATTERN_MIN_OCCURRENCES);
-    if (pattern && pattern.bestOutcome !== "WAIT" && pattern.confidence >= 55) {
-      return { prediction: pattern.bestOutcome, confidence: pattern.confidence, matched: `${len}-candle micro (${pattern.occurrences}x)` };
-    }
-  }
-  return { prediction: "WAIT", confidence: 0, matched: "" };
-}
-
-// ============================================
-// FULL-CHART VISION — SELF-TAUGHT PATTERN ENGINE
-// The AI observes the ENTIRE visible chart, not just the last few candles, and
-// builds its own candle-sequence patterns from what it sees. Each candle is
-// encoded relative to the whole chart (color, size vs the chart average, and
-// wick dominance), so the engine "understands" the shape of the chart the way a
-// human eye does and remembers which formations tend to precede a green/red move.
-// ============================================
-
-// Normalized, chart-aware token: color + relative body size + wick dominance
-function chartToken(c: Candle, avgBody: number): string {
-  const sizeCat = c.body > avgBody * 1.4 ? "LG" : c.body < avgBody * 0.6 ? "SM" : "MD";
-  const wickCat = c.upperRatio > 1.3 ? "UW" : c.lowerRatio > 1.3 ? "LW" : "NW";
-  return `${c.color[0]}${sizeCat}${wickCat}`;
-}
-
-// Observe the chart on every newly completed candle and self-create patterns.
-// Runs incrementally on the tail windows (length 3-5) that end at the latest
-// candle, but normalizes each candle against the FULL visible chart average so
-// the learned patterns reflect the whole picture. Called once per new candle.
-function observeChart(candles: Candle[], brain: Brain): void {
-  if (candles.length < 4) return;
-  const avgBody = candles.reduce((sum, c) => sum + c.body, 0) / candles.length || 1;
-  for (let len = 3; len <= 5; len++) {
-    if (candles.length < len + 1) continue;
-    const seq = candles.slice(-(len + 1));
-    const outcome = seq[len];
-    if (outcome.color === "NEUTRAL") continue;
-    const key = seq.slice(0, len).map((c) => chartToken(c, avgBody)).join(">");
-    let pattern = brain.chartPatterns.find((p) => p.key === key);
-    if (!pattern) {
-      pattern = { key, green: 0, red: 0, neutral: 0, wins: 0, losses: 0, occurrences: 0, confidence: 0, bestOutcome: "WAIT" };
-      brain.chartPatterns.push(pattern);
-    }
-    pattern.occurrences++;
-    if (outcome.color === "GREEN") pattern.green++;
-    else if (outcome.color === "RED") pattern.red++;
-    else pattern.neutral++;
-    const decided = pattern.green + pattern.red;
-    pattern.confidence = decided > 0 ? (Math.max(pattern.green, pattern.red) / decided) * 100 : 0;
-    pattern.bestOutcome = pattern.green > pattern.red ? "CALL" : pattern.red > pattern.green ? "PUT" : "WAIT";
-  }
-  // Cap the self-taught library so it never grows unbounded — keep the most-seen
-  if (brain.chartPatterns.length > 400) {
-    brain.chartPatterns.sort((a, b) => b.occurrences - a.occurrences);
-    brain.chartPatterns = brain.chartPatterns.slice(0, 400);
-  }
-}
-
-// Match the current chart tail against the AI's self-taught patterns.
-function getSyntheticPrediction(candles: Candle[], brain: Brain): { prediction: Signal; confidence: number; matched: string } {
-  if (candles.length < 3) return { prediction: "WAIT", confidence: 0, matched: "" };
-  const avgBody = candles.reduce((sum, c) => sum + c.body, 0) / candles.length || 1;
-  for (let len = 5; len >= 3; len--) {
-    if (candles.length < len) continue;
-    const key = candles.slice(-len).map((c) => chartToken(c, avgBody)).join(">");
-    const pattern = brain.chartPatterns.find((p) => p.key === key && p.occurrences >= 3);
-    if (pattern && pattern.bestOutcome !== "WAIT" && pattern.confidence >= 60) {
-      // Bias confidence by the pattern's real trade record when it has one
-      const decided = pattern.wins + pattern.losses;
-      const record = decided > 0 ? pattern.wins / decided : 0.5;
-      const confidence = Math.min(95, pattern.confidence * (0.7 + record * 0.6));
-      return { prediction: pattern.bestOutcome, confidence, matched: `${len}-candle self-taught (${pattern.occurrences}x)` };
-    }
-  }
-  return { prediction: "WAIT", confidence: 0, matched: "" };
-}
-
-// Get the participating self-taught pattern keys for the current tail (for outcome learning)
-function getSyntheticParticipants(candles: Candle[]): string[] {
-  if (candles.length < 3) return [];
-  const avgBody = candles.reduce((sum, c) => sum + c.body, 0) / candles.length || 1;
-  const keys: string[] = [];
-  for (let len = 3; len <= 5; len++) {
-    if (candles.length < len) continue;
-    keys.push(candles.slice(-len).map((c) => chartToken(c, avgBody)).join(">"));
-  }
-  return keys;
-}
-
-// ============================================
-// ADVANCED OTC PATTERN DETECTORS
-// ============================================
-
-function detectSequential7(candles: Candle[], brain: Brain): { detected: boolean; prediction: Signal; confidence: number } {
-  if (candles.length < 7) return { detected: false, prediction: "WAIT", confidence: 0 };
-  const seq = candles.slice(-7);
-  if (seq[0].color !== "RED" || seq[1].color !== "GREEN") return { detected: false, prediction: "WAIT", confidence: 0 };
-  const key = seq.slice(0, 6).map(token).join(">");
-  const memory = brain.memories.find((m) => m.key === key);
-  if (memory && memory.occurrences >= 2) {
-    const prediction: Signal = memory.green > memory.red ? "CALL" : memory.red > memory.green ? "PUT" : "WAIT";
-    return { detected: true, prediction, confidence: memory.confidence };
-  }
-  const greens = seq.filter((c) => c.color === "GREEN").length;
-  const reds = seq.filter((c) => c.color === "RED").length;
-  if (greens > reds) return { detected: true, prediction: "CALL", confidence: 55 };
-  if (reds > greens) return { detected: true, prediction: "PUT", confidence: 55 };
-  return { detected: true, prediction: "WAIT", confidence: 0 };
-}
-
-function detectBreakdown(candles: Candle[], zigzag: ZigZagPoint[]): { detected: boolean; level: string } {
-  if (candles.length < 2) return { detected: false, level: "" };
-  const last2 = candles.slice(-2);
-  if (last2[0].color !== "RED" || last2[1].color !== "RED") return { detected: false, level: "" };
-  const lastLow = [...zigzag].reverse().find((p) => p.type === "LOW");
-  if (!lastLow) return { detected: false, level: "" };
-  if (last2[1].bottom > lastLow.y + BREAKDOWN_TOLERANCE_PX) return { detected: true, level: `Support broken @ pivot #${lastLow.candleId}` };
-  return { detected: false, level: "" };
-}
-
-function detectWickRejection(candles: Candle[]): { detected: boolean; direction: "CALL" | "PUT"; count: number } {
-  if (candles.length < WICK_REJECTION_COUNT) return { detected: false, direction: "CALL", count: 0 };
-  const last3 = candles.slice(-WICK_REJECTION_COUNT);
-  const allUpperReject = last3.every((c) => c.upperRatio > WICK_REJECTION_RATIO && c.upper > c.body * WICK_REJECTION_RATIO);
-  if (allUpperReject) return { detected: true, direction: "PUT", count: WICK_REJECTION_COUNT };
-  const allLowerReject = last3.every((c) => c.lowerRatio > WICK_REJECTION_RATIO && c.lower > c.body * WICK_REJECTION_RATIO);
-  if (allLowerReject) return { detected: true, direction: "CALL", count: WICK_REJECTION_COUNT };
-  return { detected: false, direction: "CALL", count: 0 };
-}
-
-function detectConfluence(candles: Candle[], zigzag: ZigZagPoint[], price: number | null, isRound: boolean, brain: Brain): { score: number; points: string[] } {
-  const latest = candles.at(-1);
-  if (!latest) return { score: 0, points: [] };
-  let score = 0;
-  const points: string[] = [];
-  if (isRound && price) { score++; points.push("Round Number SNR"); }
-  const nearHigh = zigzag.some((p) => p.type === "HIGH" && Math.abs(p.y - latest.top) < CONFLUENCE_PROXIMITY_PX);
-  const nearLow = zigzag.some((p) => p.type === "LOW" && Math.abs(p.y - latest.bottom) < CONFLUENCE_PROXIMITY_PX);
-  if (nearHigh || nearLow) { score++; points.push("ZigZag Swing Level"); }
-  if (price) {
-    const nearSNR = brain.zigzag.some((z) => Math.abs(z.price - price) < 0.0003);
-    if (nearSNR) { score++; points.push("Historical SNR"); }
-  }
-  if (zigzag.length >= 2) {
-    const lastPivot = zigzag[zigzag.length - 1];
-    const sameLevel = zigzag.filter((p) => p.type === lastPivot.type && Math.abs(p.y - lastPivot.y) < 10);
-    if (sameLevel.length >= 2) { score++; points.push("Multi-touch Level"); }
-  }
-  return { score, points };
-}
-
-// ============================================
-// HUMAN-BRAIN OTC TRAP DETECTION
-// ============================================
-
-function detectTraps(candles: Candle[], zigzag: ZigZagPoint[]): { detected: boolean; type: string; direction: "CALL" | "PUT" } {
-  if (candles.length < 4 || zigzag.length < 2) return { detected: false, type: "", direction: "CALL" };
-  const latest = candles.at(-1)!;
-  const recentHighs = zigzag.filter((p) => p.type === "HIGH").slice(-2);
-  const recentLows = zigzag.filter((p) => p.type === "LOW").slice(-2);
-
-  for (const high of recentHighs) {
-    if (latest.top < high.y - BREAKDOWN_TOLERANCE_PX && latest.closeY > high.y + BREAKDOWN_TOLERANCE_PX)
-      return { detected: true, type: "Fake Breakout (Resistance)", direction: "PUT" };
-  }
-  for (const low of recentLows) {
-    if (latest.bottom > low.y + BREAKDOWN_TOLERANCE_PX && latest.closeY < low.y - BREAKDOWN_TOLERANCE_PX)
-      return { detected: true, type: "Fake Breakout (Support)", direction: "CALL" };
-  }
-  for (const high of recentHighs) {
-    if (latest.top < high.y - 5 && latest.bodyTop > high.y)
-      return { detected: true, type: "Liquidity Sweep (Above Resistance)", direction: "PUT" };
-  }
-  for (const low of recentLows) {
-    if (latest.bottom > low.y + 5 && latest.bodyBottom < low.y)
-      return { detected: true, type: "Liquidity Sweep (Below Support)", direction: "CALL" };
-  }
-
-  const last4 = candles.slice(-4);
-  if (last4.length === 4) {
-    const first3 = last4.slice(0, 3);
-    const allGreen = first3.every((c) => c.color === "GREEN");
-    const allRed = first3.every((c) => c.color === "RED");
-    if (allGreen && latest.upper > latest.body * TRAP_WICK_MULTIPLIER)
-      return { detected: true, type: "Exhaustion Wick (Bullish Trend)", direction: "PUT" };
-    if (allRed && latest.lower > latest.body * TRAP_WICK_MULTIPLIER)
-      return { detected: true, type: "Exhaustion Wick (Bearish Trend)", direction: "CALL" };
-  }
-  return { detected: false, type: "", direction: "CALL" };
-}
-
-// ============================================
-// IMAGE PATTERN EXTRACTOR — Auto-Learning from chart screenshots
-// Analyzes uploaded candle chart images and converts visual rules into programmatic detectors
-// ============================================
-
-// Extract candle metrics from an image's pixel data
-function extractImageMetrics(data: Uint8ClampedArray, width: number, height: number): ImageMetrics {
-  const found = detectCandles(data, width, height);
-  if (found.length === 0) {
-    return { candleCount: 0, avgBodyPct: 0, avgUpperWickPct: 0, avgLowerWickPct: 0, colorFlow: "UNKNOWN", levelBehavior: "NONE", extractedCandles: [] };
-  }
-
-  const extractedCandles = found.map((c) => {
-    const total = Math.max(1, c.bottom - c.top);
-    return {
-      bodyPct: (c.body / total) * 100,
-      upperWickPct: (c.upper / total) * 100,
-      lowerWickPct: (c.lower / total) * 100,
-      color: c.color,
-    };
-  });
-
-  const avgBodyPct = extractedCandles.reduce((s, c) => s + c.bodyPct, 0) / extractedCandles.length;
-  const avgUpperWickPct = extractedCandles.reduce((s, c) => s + c.upperWickPct, 0) / extractedCandles.length;
-  const avgLowerWickPct = extractedCandles.reduce((s, c) => s + c.lowerWickPct, 0) / extractedCandles.length;
-
-  // Build color flow string: e.g., "GREEN→GREEN→RED"
-  const colorFlow = found.slice(-6).map((c) => c.color).join("→");
-
-  // Detect level behavior from last 3 candles
-  const last3 = found.slice(-3);
-  let levelBehavior: ImageMetrics["levelBehavior"] = "NONE";
-
-  // Check for S/R Rejection: long wick on latest candle touching a recent extreme
-  if (last3.length >= 2) {
-    const latest = last3[last3.length - 1];
-    const prevHigh = Math.min(...last3.slice(0, -1).map((c) => c.top));
-    const prevLow = Math.max(...last3.slice(0, -1).map((c) => c.bottom));
-
-    // Upper wick rejection at resistance
-    if (latest.upperRatio > 1.5 && latest.top < prevHigh + 5) {
-      levelBehavior = "SR_REJECTION";
-    }
-    // Lower wick rejection at support
-    if (latest.lowerRatio > 1.5 && latest.bottom > prevLow - 5) {
-      levelBehavior = "SR_REJECTION";
-    }
-  }
-
-  // Check for Fake Breakout: candle broke a level but closed back inside
-  if (last3.length >= 3 && levelBehavior === "NONE") {
-    const latest = last3[2];
-    const range1 = last3[0];
-    if (latest.top < range1.top - 3 && latest.closeY > range1.top) {
-      levelBehavior = "FAKE_BREAKOUT";
-    }
-    if (latest.bottom > range1.bottom + 3 && latest.closeY < range1.bottom) {
-      levelBehavior = "FAKE_BREAKOUT";
-    }
-  }
-
-  // Check for Exhaustion Sweep: 3+ same-color candles then long wick reversal
-  if (last3.length >= 3 && levelBehavior === "NONE") {
-    const first2SameColor = last3[0].color === last3[1].color;
-    const latest = last3[2];
-    if (first2SameColor) {
-      if (last3[0].color === "GREEN" && latest.lower > latest.body * 2) {
-        levelBehavior = "EXHAUSTION_SWEEP";
-      }
-      if (last3[0].color === "RED" && latest.upper > latest.body * 2) {
-        levelBehavior = "EXHAUSTION_SWEEP";
-      }
-    }
-  }
-
-  return { candleCount: found.length, avgBodyPct, avgUpperWickPct, avgLowerWickPct, colorFlow, levelBehavior, extractedCandles };
-}
-
-// Seeded default rules extracted from common OTC chart patterns (high trust baseline)
-const SEED_RULES: ExtractedRule[] = [
-  {
-    id: "seed-engulfing-red",
-    name: "Engulfing Red after Greens",
-    bodyPct: 65, upperWickPct: 10, lowerWickPct: 10,
-    colorFlow: "GREEN→GREEN→RED",
-    levelBehavior: "NONE",
-    direction: "PUT",
-    trustWeight: 70,
-    occurrences: 0, wins: 0, losses: 0,
-    source: "IMAGE",
-    createdAt: 0,
-  },
-  {
-    id: "seed-engulfing-green",
-    name: "Engulfing Green after Reds",
-    bodyPct: 65, upperWickPct: 10, lowerWickPct: 10,
-    colorFlow: "RED→RED→GREEN",
-    levelBehavior: "NONE",
-    direction: "CALL",
-    trustWeight: 70,
-    occurrences: 0, wins: 0, losses: 0,
-    source: "IMAGE",
-    createdAt: 0,
-  },
-  {
-    id: "seed-sr-rejection-bull",
-    name: "Support Rejection (Lower Wick)",
-    bodyPct: 35, upperWickPct: 15, lowerWickPct: 50,
-    colorFlow: "RED→RED→GREEN",
-    levelBehavior: "SR_REJECTION",
-    direction: "CALL",
-    trustWeight: 75,
-    occurrences: 0, wins: 0, losses: 0,
-    source: "IMAGE",
-    createdAt: 0,
-  },
-  {
-    id: "seed-sr-rejection-bear",
-    name: "Resistance Rejection (Upper Wick)",
-    bodyPct: 35, upperWickPct: 50, lowerWickPct: 15,
-    colorFlow: "GREEN→GREEN→RED",
-    levelBehavior: "SR_REJECTION",
-    direction: "PUT",
-    trustWeight: 75,
-    occurrences: 0, wins: 0, losses: 0,
-    source: "IMAGE",
-    createdAt: 0,
-  },
-  {
-    id: "seed-fake-breakout-up",
-    name: "Fake Breakout above Resistance",
-    bodyPct: 50, upperWickPct: 25, lowerWickPct: 10,
-    colorFlow: "GREEN→RED→RED",
-    levelBehavior: "FAKE_BREAKOUT",
-    direction: "PUT",
-    trustWeight: 72,
-    occurrences: 0, wins: 0, losses: 0,
-    source: "IMAGE",
-    createdAt: 0,
-  },
-  {
-    id: "seed-fake-breakout-down",
-    name: "Fake Breakout below Support",
-    bodyPct: 50, upperWickPct: 10, lowerWickPct: 25,
-    colorFlow: "RED→GREEN→GREEN",
-    levelBehavior: "FAKE_BREAKOUT",
-    direction: "CALL",
-    trustWeight: 72,
-    occurrences: 0, wins: 0, losses: 0,
-    source: "IMAGE",
-    createdAt: 0,
-  },
-  {
-    id: "seed-exhaustion-bull",
-    name: "Exhaustion Sweep (Bullish Reversal)",
-    bodyPct: 30, upperWickPct: 15, lowerWickPct: 55,
-    colorFlow: "RED→RED→GREEN",
-    levelBehavior: "EXHAUSTION_SWEEP",
-    direction: "CALL",
-    trustWeight: 68,
-    occurrences: 0, wins: 0, losses: 0,
-    source: "IMAGE",
-    createdAt: 0,
-  },
-  {
-    id: "seed-exhaustion-bear",
-    name: "Exhaustion Sweep (Bearish Reversal)",
-    bodyPct: 30, upperWickPct: 55, lowerWickPct: 15,
-    colorFlow: "GREEN→GREEN→RED",
-    levelBehavior: "EXHAUSTION_SWEEP",
-    direction: "PUT",
-    trustWeight: 68,
-    occurrences: 0, wins: 0, losses: 0,
-    source: "IMAGE",
-    createdAt: 0,
-  },
-];
-
-// Match live candles against extracted image rules
-function detectExtractedRules(candles: Candle[], zigzag: ZigZagPoint[], rules: ExtractedRule[]): { detected: boolean; rule: string; direction: "CALL" | "PUT"; confidence: number } {
-  if (candles.length < 3 || rules.length === 0) return { detected: false, rule: "", direction: "CALL", confidence: 0 };
-
-  const last3 = candles.slice(-3);
-  const latest = last3[2];
-  const total = Math.max(1, latest.bottom - latest.top);
-  const liveBodyPct = (latest.body / total) * 100;
-  const liveUpperPct = (latest.upper / total) * 100;
-  const liveLowerPct = (latest.lower / total) * 100;
-  const liveColorFlow = last3.map((c) => c.color).join("→");
-
-  let bestMatch: ExtractedRule | null = null;
-  let bestScore = 0;
-
-  for (const rule of rules) {
-    let score = 0;
-
-    // Color flow match (weighted heavily)
-    if (rule.colorFlow === liveColorFlow) score += 40;
-    else if (rule.colorFlow.endsWith(latest.color)) score += 15;
-
-    // Body percentage proximity (±15% tolerance)
-    const bodyDiff = Math.abs(rule.bodyPct - liveBodyPct);
-    if (bodyDiff < 15) score += (15 - bodyDiff);
-
-    // Upper wick proximity (±15% tolerance)
-    const upperDiff = Math.abs(rule.upperWickPct - liveUpperPct);
-    if (upperDiff < 15) score += (15 - upperDiff) * 0.5;
-
-    // Lower wick proximity (±15% tolerance)
-    const lowerDiff = Math.abs(rule.lowerWickPct - liveLowerPct);
-    if (lowerDiff < 15) score += (15 - lowerDiff) * 0.5;
-
-    // Level behavior match
-    if (rule.levelBehavior !== "NONE") {
-      const recentHighs = zigzag.filter((p) => p.type === "HIGH").slice(-2);
-      const recentLows = zigzag.filter((p) => p.type === "LOW").slice(-2);
-      if (rule.levelBehavior === "SR_REJECTION") {
-        if (rule.direction === "CALL" && latest.lowerRatio > 1.5) score += 20;
-        if (rule.direction === "PUT" && latest.upperRatio > 1.5) score += 20;
-      }
-      if (rule.levelBehavior === "FAKE_BREAKOUT") {
-        for (const h of recentHighs) {
-          if (latest.top < h.y - 3 && latest.closeY > h.y) { score += 20; break; }
-        }
-        for (const l of recentLows) {
-          if (latest.bottom > l.y + 3 && latest.closeY < l.y) { score += 20; break; }
-        }
-      }
-      if (rule.levelBehavior === "EXHAUSTION_SWEEP") {
-        const first2 = last3.slice(0, 2);
-        if (rule.direction === "CALL" && first2.every((c) => c.color === "RED") && latest.lower > latest.body * 2) score += 20;
-        if (rule.direction === "PUT" && first2.every((c) => c.color === "GREEN") && latest.upper > latest.body * 2) score += 20;
-      }
-    }
-
-    // Factor in trust weight
-    score = (score * rule.trustWeight) / 100;
-
-    if (score > bestScore) {
-      bestScore = score;
-      bestMatch = rule;
-    }
-  }
-
-  if (bestMatch && bestScore >= 35) {
-    return { detected: true, rule: bestMatch.name, direction: bestMatch.direction, confidence: Math.min(bestScore, 95) };
-  }
-  return { detected: false, rule: "", direction: "CALL", confidence: 0 };
-}
-
-// Generate variant rules from a matched extracted rule + live outcome
-function generateVariant(rule: ExtractedRule, liveCandles: Candle[], outcome: Outcome): ExtractedRule | null {
-  if (liveCandles.length < 3) return null;
-  const last3 = liveCandles.slice(-3);
-  const latest = last3[2];
-  const total = Math.max(1, latest.bottom - latest.top);
-
-  const variant: ExtractedRule = {
-    id: `variant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    name: `Variant: ${rule.name} → ${outcome}`,
-    bodyPct: Math.round((latest.body / total) * 100),
-    upperWickPct: Math.round((latest.upper / total) * 100),
-    lowerWickPct: Math.round((latest.lower / total) * 100),
-    colorFlow: last3.map((c) => c.color).join("→"),
-    levelBehavior: rule.levelBehavior,
-    direction: outcome === "WIN" ? rule.direction : rule.direction === "CALL" ? "PUT" : "CALL",
-    trustWeight: outcome === "WIN" ? Math.min(rule.trustWeight + 5, 90) : Math.max(rule.trustWeight - 10, 40),
-    occurrences: 1,
-    wins: outcome === "WIN" ? 1 : 0,
-    losses: outcome === "LOSS" ? 1 : 0,
-    source: "LIVE_VARIANT",
-    createdAt: Date.now(),
-  };
-
-  return variant;
-}
-
-// ============================================
-// CANDLE DETECTION (Pixel-based, OTC optimized for fast micro-trends)
-// ============================================
-
-function detectCandles(data: Uint8ClampedArray, width: number, height: number): Candle[] {
-  const columns = new Uint16Array(width);
-  const green = new Uint16Array(width);
-  const red = new Uint16Array(width);
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const i = (y * width + x) * 4;
-      const isGreen = data[i + 1] > data[i] + 35 && data[i + 1] > data[i + 2] + 25 && data[i + 1] > 80;
-      const isRed = data[i] > data[i + 1] + 35 && data[i] > data[i + 2] + 25 && data[i] > 80;
-      if (isGreen || isRed) { columns[x]++; if (isGreen) green[x]++; else red[x]++; }
-    }
-  }
-  const groups: Array<[number, number]> = [];
-  // OTC micro-trend: lower threshold to catch rapid spike candles
-  const threshold = Math.max(2, Math.floor(height * 0.012));
-  let start = -1;
-  for (let x = 0; x <= width; x++) {
-    const on = x < width && columns[x] >= threshold;
-    if (on && start < 0) start = x;
-    if (!on && start >= 0) {
-      if (x - start >= 2 && x - start < width * 0.2) groups.push([start, x - 1]);
-      start = -1;
-    }
-  }
-  return groups
-    .map(([left, right]): Candle => {
-      let top = height; let bottom = 0; let g = 0; let r = 0;
-      for (let x = left; x <= right; x++) {
-        for (let y = 0; y < height; y++) {
-          const i = (y * width + x) * 4;
-          const isGreen = data[i + 1] > data[i] + 35 && data[i + 1] > data[i + 2] + 25 && data[i + 1] > 80;
-          const isRed = data[i] > data[i + 1] + 35 && data[i] > data[i + 2] + 25 && data[i] > 80;
-          if (isGreen || isRed) { top = Math.min(top, y); bottom = Math.max(bottom, y); if (isGreen) g++; else r++; }
-        }
-      }
-      const color: Color = g > r * 1.15 ? "GREEN" : r > g * 1.15 ? "RED" : "NEUTRAL";
-      const bodyTop = top + Math.max(1, Math.floor((bottom - top) * 0.18));
-      const bodyBottom = bottom - Math.max(1, Math.floor((bottom - top) * 0.18));
-      const body = Math.max(1, bodyBottom - bodyTop);
-      const upper = Math.max(0, bodyTop - top);
-      const lower = Math.max(0, bottom - bodyBottom);
-      const ratio = body / Math.max(1, bottom - top);
-      const shape = color === "NEUTRAL" ? "INDECISION" : ratio < 0.12 ? "DOJI"
-        : lower > body * 1.5 && lower > upper ? "LOWER_REJECTION"
-        : upper > body * 1.5 && upper > lower ? "UPPER_REJECTION"
-        : ratio >= 0.7 ? (color === "GREEN" ? "BULL_STRONG" : "BEAR_STRONG")
-        : (color === "GREEN" ? "SMALL_BULL" : "SMALL_BEAR");
-      return {
-        id: 0, x: left, width: right - left + 1, top, bottom, bodyTop, bodyBottom,
-        closeY: color === "RED" ? bodyBottom : bodyTop, color, body, upper, lower,
-        upperRatio: upper / body, lowerRatio: lower / body, shape, timestamp: Date.now(),
-      };
-    })
-    .filter((candle) => candle.color !== "NEUTRAL");
-}
-
-// ============================================
-// CUSTOM PATTERN ENGINE — encodes the hand-drawn whiteboard rules
-// H-line (S/R) color-flip entries, "green then red" / "red then green card",
-// long-wick & Doji breakers, bounce continuation, and the V-pattern guard.
-// ============================================
-
-// V-PATTERN GUARD — the rulebook explicitly says the setup does NOT work on a
-// sharp V / inverted-V. Two strong candles of one color immediately reversed by
-// two strong candles of the opposite color is a V spike → block the signal.
-function detectVPattern(candles: Candle[]): boolean {
-  if (candles.length < 4) return false;
-  const [a, b, c, d] = candles.slice(-4);
-  const strong = (k: Candle) => k.body > 12;
-  const invertedV = a.color === "GREEN" && b.color === "GREEN" && c.color === "RED" && d.color === "RED" && strong(b) && strong(c);
-  const vBottom = a.color === "RED" && b.color === "RED" && c.color === "GREEN" && d.color === "GREEN" && strong(b) && strong(c);
-  return invertedV || vBottom;
-}
-
-// Evaluate the current chart against the custom whiteboard rules and return the
-// single strongest matching setup, scaled by its learned win rate.
-function detectCustomPatterns(candles: Candle[], zigzag: ZigZagPoint[], snr: SNRLevel[], brain: Brain): CustomPatternResult {
-  const none: CustomPatternResult = {
-    detected: false, name: "", key: "", direction: "CALL", confidence: 0,
-    atLevel: false, vPattern: false, blacklisted: false, notes: [],
-  };
-  if (candles.length < 3) return none;
-
-  const latest = candles.at(-1)!;
-  const vPattern = detectVPattern(candles);
-
-  // Nearest horizontal H-line (support/resistance) to the latest candle
-  let nearLevel: SNRLevel | null = null;
-  let nearDist = Infinity;
-  for (const lvl of snr) {
-    const d = Math.abs(lvl.type === "SUPPORT" ? lvl.y - latest.bottom : lvl.y - latest.top);
-    if (d < nearDist) { nearDist = d; nearLevel = lvl; }
-  }
-  const atLevel = !!nearLevel && nearDist <= CONFLUENCE_PROXIMITY_PX * 2.5;
-
-  type Candidate = { key: string; name: string; direction: "CALL" | "PUT"; confidence: number; notes: string[] };
-  const candidates: Candidate[] = [];
-
-  // Consecutive same-color run BEFORE the latest candle (the "2 back to back" count)
-  const prior = candles.slice(0, -1);
-  const runColor = prior.at(-1)?.color;
-  let run = 0;
-  for (let i = prior.length - 1; i >= 0; i--) {
-    if (prior[i].color === runColor) run++;
-    else break;
-  }
-
-  // --- Rule 1: H-line color flip — "green then red" / "red then green card" ---
-  if (run >= 1 && runColor && latest.color !== "NEUTRAL" && latest.color !== runColor) {
-    const touchBonus = nearLevel ? Math.min(nearLevel.touches, 3) * 3 : 0;
-    if (runColor === "GREEN" && latest.color === "RED") {
-      const resNear = nearLevel?.type === "RESISTANCE" && atLevel;
-      candidates.push({
-        key: "HFLIP_RES", name: CUSTOM_LABELS.HFLIP_RES, direction: "PUT",
-        confidence: 55 + Math.min(run, 3) * 8 + (resNear ? 12 : 0) + touchBonus,
-        notes: [resNear ? "at resistance H-line" : "trend color flip", `${run} green run → red`],
-      });
-    }
-    if (runColor === "RED" && latest.color === "GREEN") {
-      const supNear = nearLevel?.type === "SUPPORT" && atLevel;
-      candidates.push({
-        key: "HFLIP_SUP", name: CUSTOM_LABELS.HFLIP_SUP, direction: "CALL",
-        confidence: 55 + Math.min(run, 3) * 8 + (supNear ? 12 : 0) + touchBonus,
-        notes: [supNear ? "at support H-line" : "trend color flip", `${run} red run → green`],
-      });
-    }
-  }
-
-  // --- Rule 2: Long-wick / Doji breaker rejection at an H-line ---
-  if (atLevel && nearLevel) {
-    const touchBonus = Math.min(nearLevel.touches, 3) * 4;
-    if (latest.shape === "UPPER_REJECTION" && nearLevel.type === "RESISTANCE") {
-      candidates.push({ key: "WICK_RES", name: CUSTOM_LABELS.WICK_RES, direction: "PUT", confidence: 60 + touchBonus, notes: ["upper wick rejection"] });
-    }
-    if (latest.shape === "LOWER_REJECTION" && nearLevel.type === "SUPPORT") {
-      candidates.push({ key: "WICK_SUP", name: CUSTOM_LABELS.WICK_SUP, direction: "CALL", confidence: 60 + touchBonus, notes: ["lower wick rejection"] });
-    }
-    if (latest.shape === "DOJI") {
-      const dir: "CALL" | "PUT" = nearLevel.type === "RESISTANCE" ? "PUT" : "CALL";
-      candidates.push({ key: dir === "PUT" ? "DOJI_RES" : "DOJI_SUP", name: dir === "PUT" ? CUSTOM_LABELS.DOJI_RES : CUSTOM_LABELS.DOJI_SUP, direction: dir, confidence: 56 + touchBonus, notes: ["doji breaker at level"] });
-    }
-  }
-
-  // --- Rule 3: Confirmed bounce continuation off an H-line ---
-  if (nearLevel && nearLevel.behavior === "BOUNCE") {
-    const dir: "CALL" | "PUT" = nearLevel.type === "SUPPORT" ? "CALL" : "PUT";
-    candidates.push({ key: dir === "CALL" ? "BOUNCE_SUP" : "BOUNCE_RES", name: dir === "CALL" ? CUSTOM_LABELS.BOUNCE_SUP : CUSTOM_LABELS.BOUNCE_RES, direction: dir, confidence: 58 + Math.min(nearLevel.touches, 3) * 4, notes: ["confirmed level bounce"] });
-  }
-
-  if (candidates.length === 0) return { ...none, atLevel, vPattern };
-
-  let best = candidates[0];
-  for (const c of candidates) if (c.confidence > best.confidence) best = c;
-
-  // Scale confidence by the rule's learned win rate and read blacklist status
-  const mem = brain.customPatterns.find((m) => m.key === best.key);
-  let confidence = best.confidence;
-  let blacklisted = false;
-  if (mem) {
-    const decided = mem.wins + mem.losses;
-    if (decided > 0) confidence *= 0.6 + (mem.wins / decided) * 0.6;
-    blacklisted = mem.blacklisted;
-  }
-  confidence = Math.max(0, Math.min(95, Math.round(confidence)));
-
-  return { detected: true, name: best.name, key: best.key, direction: best.direction, confidence, atLevel, vPattern, blacklisted, notes: best.notes };
-}
-
-// ============================================
-// MAIN COMPONENT
-// ============================================
-
-export default function OTCMarketDashboard() {
+const DB_NAME = 'TraderYodhaX_AI_Database';
+const DB_VERSION = 1;
+const STORE_NAME = 'trader_yodha_x_brain_store';
+
+export default function TraderYodhaXEngine() {
   const [stream, setStream] = useState<MediaStream | null>(null);
-  const [active, setActive] = useState(false);
+  const [isStreamActive, setIsStreamActive] = useState(false);
+  const [isScanning, setIsScanning] = useState(false);
+  const [aiSignal, setAiSignal] = useState<'WAIT' | 'CALL' | 'PUT'>('WAIT');
+  const [statusMessage, setStatusMessage] = useState("Trader Yodha X OTC Engine Ready. Connect Quotex Screen.");
+  const [brainStats, setBrainStats] = useState({ patterns: 0, magicNumbers: 0, timeSyncs: 0, zigzag: 0, winRate: 0 });
+  const [currentAnalysis, setCurrentAnalysis] = useState<LiveAnalysis | null>(null);
+  const [timeUntilCandle, setTimeUntilCandle] = useState(60);
 
-  const [signal, setSignal] = useState<Signal>("WAIT");
-  const [status, setStatus] = useState("TRADER_YODHA_X_AI OTC Engine Ready. Connect Quotex / ExpertOption OTC screen.");
-  const [ocrText, setOcrText] = useState("Searching...");
-  const [round, setRound] = useState(false);
-  const [reversed, setReversed] = useState(false);
+  // Real-time OCR & ROI Dynamic States
+  const [ocrPriceText, setOcrPriceText] = useState<string>("Searching...");
+  const [isRealRoundNumber, setIsRealRoundNumber] = useState<boolean>(false);
+  
+  const [roiBox, setRoiBox] = useState<CropRegion>({ x: 100, y: 50, width: 250, height: 250 });
+  const [isRoiLocked, setIsRoiLocked] = useState<boolean>(false);
 
-  // 2-minute processing window telemetry
-  const [analysisProgress, setAnalysisProgress] = useState(0);
-  const [windowInfo, setWindowInfo] = useState<{ remaining: number; consensusDir: Signal; consensusStrength: number; votes: { call: number; put: number; wait: number } }>({
-    remaining: CANDLE_PERIOD_MS / 1000, consensusDir: "WAIT", consensusStrength: 0, votes: { call: 0, put: 0, wait: 0 },
-  });
-  const [customPatternList, setCustomPatternList] = useState<CustomPatternMemory[]>([]);
-
-  const [snrLevels, setSnrLevels] = useState<SNRLevel[]>([]);
-  const [imageUploading, setImageUploading] = useState(false);
-  const [imageMetrics, setImageMetrics] = useState<ImageMetrics | null>(null);
-  const [extractedRulesList, setExtractedRulesList] = useState<ExtractedRule[]>([]);
-  const [analysis, setAnalysis] = useState<{
-    candles: Candle[]; price: number; confidence: number; sequence: string[];
-    indicators: Indicators; structure: Structure | null; patterns: PatternFlags;
-    reversed: boolean; reasons: string[];
-    scoreBreakdown: ScoreContribution[];
-    callTotal: number; putTotal: number;
-  } | null>(null);
-  const [stats, setStats] = useState({
-    candles: 0, memories: 0, trades: 0, zigzag: 0, structure: 0, winRate: 0, autoPatterns: 0, extractedRules: 0, synth: 0,
-  });
-  const [roi, setRoi] = useState({ x: 100, y: 50, width: 500, height: 350 });
-  const [locked, setLocked] = useState(false);
-  const [moving, setMoving] = useState(false);
-  const [resizing, setResizing] = useState(false);
-  const [drag, setDrag] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [isResizing, setIsResizing] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const overlayRef = useRef<HTMLCanvasElement>(null);
+  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   const ocrCanvasRef = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const workerRef = useRef<any>(null);
-  const busy = useRef(false);
-  const lastOcr = useRef(0);
-  const nextId = useRef(1);
-  const candles = useRef<Candle[]>([]);
-  const prices = useRef<number[]>([]);
-  const lastSignature = useRef("");
-  const zigzagRef = useRef<ZigZagPoint[]>([]);
-  const snrLevelsRef = useRef<SNRLevel[]>([]);
-  // 1-minute candle cycle bookkeeping
-  const windowStart = useRef(0);
-  const windowVotes = useRef({ call: 0, put: 0, wait: 0 });
-  const awaitingOutcome = useRef(false);
-  // Wall-clock minute index of the last candle we fired a signal for (one signal per candle)
-  const lastSignaledMinute = useRef(-1);
-  // Rolling 1:46 observation window of per-tick votes
-  const voteLog = useRef<Array<{ t: number; dir: Signal }>>([]);
+  const videoContainerRef = useRef<HTMLDivElement>(null);
+  const ocrWorkerRef = useRef<any>(null);
 
-  const imageCanvasRef = useRef<HTMLCanvasElement>(null);
-  const lastMatchedRule = useRef<ExtractedRule | null>(null);
-  const participatingRules = useRef<ParticipatingRule[]>([]);
-  const brain = useRef<Brain>({
-    memories: [], trades: [], zigzag: [], structure: [], autoPatterns: [], extractedRules: [...SEED_RULES], customPatterns: [], chartPatterns: [], winRate: 0,
+  const brainRef = useRef<BrainState>({
+    patterns: [],
+    magicNumbers: [],
+    timeAlgorithms: [],
+    zigzagLevels: [],
+    totalTrades: 0,
+    winRate: 0,
+    lastUpdated: Date.now()
   });
+  
+  const pendingSignalRef = useRef<{ signal: 'CALL' | 'PUT'; analysis: LiveAnalysis } | null>(null);
+  const continuousLearningRef = useRef<NodeJS.Timeout | null>(null);
+  const lastPriceRef = useRef<number>(0);
+  const lastColorRef = useRef<'GREEN' | 'RED' | 'NEUTRAL'>('NEUTRAL');
+  const priceHistoryRef = useRef<{price: number, time: number}[]>([]);
 
-  const updateStats = useCallback(() => {
-    setStats({
-      candles: candles.current.length,
-      memories: brain.current.memories.length,
-      trades: brain.current.trades.length,
-      zigzag: zigzagRef.current.length,
-      structure: brain.current.structure.length,
-      winRate: brain.current.winRate,
-      autoPatterns: brain.current.autoPatterns.length,
-      extractedRules: brain.current.extractedRules.length,
-      synth: brain.current.chartPatterns.length,
+  useEffect(() => {
+    if (isStreamActive && stream && videoRef.current) {
+      videoRef.current.srcObject = stream;
+    }
+  }, [isStreamActive, stream]);
+
+  useEffect(() => {
+    const initOCR = async () => {
+      try {
+        const worker = await createWorker('eng');
+        ocrWorkerRef.current = worker;
+        setStatusMessage("Trader Yodha X Vision Engine Initialized.");
+      } catch (err) {
+        console.error("OCR Init Error:", err);
+      }
+    };
+    initOCR();
+
+    return () => {
+      if (ocrWorkerRef.current) ocrWorkerRef.current.terminate();
+    };
+  }, []);
+
+  const updateBrainStats = useCallback(() => {
+    const brain = brainRef.current;
+    setBrainStats({
+      patterns: brain.patterns.length,
+      magicNumbers: brain.magicNumbers.length,
+      timeSyncs: brain.timeAlgorithms.length,
+      zigzag: brain.zigzagLevels?.length || 0,
+      winRate: brain.winRate
     });
   }, []);
 
-  const openDb = useCallback(() => new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(DB, 1);
-    request.onupgradeneeded = () => { if (!request.result.objectStoreNames.contains(STORE)) request.result.createObjectStore(STORE); };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  }), []);
+  const initIndexedDB = useCallback((): Promise<IDBDatabase> => {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB_NAME, DB_VERSION);
+      request.onupgradeneeded = (event) => {
+        const db = (event.target as IDBOpenDBRequest).result;
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          db.createObjectStore(STORE_NAME);
+        }
+      };
+      request.onsuccess = (event) => resolve((event.target as IDBOpenDBRequest).result);
+      request.onerror = (event) => reject((event.target as IDBOpenDBRequest).error);
+    });
+  }, []);
 
-  const saveBrain = useCallback(async () => {
+  const saveBrainToDB = useCallback(async () => {
     try {
-      const db = await openDb();
-      db.transaction(STORE, "readwrite").objectStore(STORE).put(brain.current, KEY);
-      updateStats();
-    } catch (error) { console.error("[TRADER_YODHA_X_AI] IndexedDB save failed", error); }
-  }, [openDb, updateStats]);
+      const db = await initIndexedDB();
+      const transaction = db.transaction(STORE_NAME, 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      brainRef.current.lastUpdated = Date.now();
+      store.put(brainRef.current, 'trader_yodha_x_brain_state');
+      updateBrainStats();
+    } catch (err) {
+      console.error("IndexedDB Save Failure:", err);
+    }
+  }, [initIndexedDB, updateBrainStats]);
 
-  useEffect(() => {
-    void openDb().then((db) => {
-      const request = db.transaction(STORE, "readonly").objectStore(STORE).get(KEY);
+  const loadBrainFromDB = useCallback(async () => {
+    try {
+      const db = await initIndexedDB();
+      const transaction = db.transaction(STORE_NAME, 'readonly');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.get('trader_yodha_x_brain_state');
+
       request.onsuccess = () => {
-        if (!request.result) return;
-        brain.current = {
-          ...brain.current, ...request.result,
-          memories: request.result.memories ?? [],
-          trades: request.result.trades ?? [],
-          zigzag: request.result.zigzag ?? [],
-          structure: request.result.structure ?? [],
-          autoPatterns: request.result.autoPatterns ?? [],
-          extractedRules: request.result.extractedRules ?? [...SEED_RULES],
-          customPatterns: request.result.customPatterns ?? [],
-          chartPatterns: request.result.chartPatterns ?? [],
-        };
-        updateStats();
-        setExtractedRulesList(brain.current.extractedRules);
-        setCustomPatternList([...brain.current.customPatterns]);
-        setStatus(`TRADER_YODHA_X_AI memory loaded: ${brain.current.trades.length} trades, ${brain.current.autoPatterns.length} auto-patterns.`);
+        if (request.result) {
+          const parsed: BrainState = request.result;
+          if (!parsed.zigzagLevels) parsed.zigzagLevels = [];
+          if (!parsed.timeAlgorithms) parsed.timeAlgorithms = [];
+          brainRef.current = parsed;
+          updateBrainStats();
+          setStatusMessage(`Trader Yodha X Brain Active: ${parsed.patterns.length} patterns loaded.`);
+        }
       };
-    }).catch((error) => console.error("[TRADER_YODHA_X_AI] IndexedDB load failed", error));
-  }, [openDb, updateStats]);
+    } catch (err) {
+      console.error("IndexedDB Load Failure:", err);
+    }
+  }, [initIndexedDB, updateBrainStats]);
 
   useEffect(() => {
-    let cancelled = false;
-    void createWorker("eng").then((worker) => { if (cancelled) void worker.terminate(); else workerRef.current = worker; })
-      .catch((error) => console.error("[TRADER_YODHA_X_AI] OCR init failed", error));
-    return () => { cancelled = true; if (workerRef.current) void workerRef.current.terminate(); workerRef.current = null; };
-  }, []);
+    loadBrainFromDB();
+  }, [loadBrainFromDB]);
 
-  useEffect(() => { if (videoRef.current && stream) videoRef.current.srcObject = stream; }, [stream]);
-
-  const scaledRoi = useCallback(() => {
-    const video = videoRef.current; const box = containerRef.current;
-    if (!video || !box) return roi;
-    const sx = (video.videoWidth || box.clientWidth) / (box.clientWidth || 1);
-    const sy = (video.videoHeight || box.clientHeight) / (box.clientHeight || 1);
-    return {
-      x: Math.max(0, Math.floor(roi.x * sx)), y: Math.max(0, Math.floor(roi.y * sy)),
-      width: Math.max(1, Math.floor(roi.width * sx)), height: Math.max(1, Math.floor(roi.height * sy)),
-    };
-  }, [roi]);
-
-  const handlePatternImage = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file) return;
-    if (!file.type.startsWith("image/")) {
-      setStatus("Pattern intake needs a chart screenshot or exported image page.");
-      return;
-    }
-
-    setImageUploading(true);
-    setStatus(`Reading ${file.name} and measuring candle bodies, wicks, color flow, and level behavior...`);
-    const objectUrl = URL.createObjectURL(file);
-    try {
-      const image = new Image();
-      image.decoding = "async";
-      image.src = objectUrl;
-      await new Promise<void>((resolve, reject) => {
-        image.onload = () => resolve();
-        image.onerror = () => reject(new Error("The pattern image could not be read."));
-      });
-
-      const canvas = imageCanvasRef.current;
-      if (!canvas) throw new Error("Pattern intake canvas is unavailable.");
-      const scale = Math.min(1, 1600 / Math.max(image.naturalWidth, image.naturalHeight));
-      canvas.width = Math.max(1, Math.floor(image.naturalWidth * scale));
-      canvas.height = Math.max(1, Math.floor(image.naturalHeight * scale));
-      const context = canvas.getContext("2d", { willReadFrequently: true });
-      if (!context) throw new Error("Pattern image pixels could not be read.");
-      context.drawImage(image, 0, 0, canvas.width, canvas.height);
-      const metrics = extractImageMetrics(context.getImageData(0, 0, canvas.width, canvas.height).data, canvas.width, canvas.height);
-      setImageMetrics(metrics);
-
-      if (metrics.candleCount < 3) {
-        setStatus("The image did not contain at least three readable green/red candles. Try a tighter chart crop.");
-        return;
-      }
-
-      const extractedRule: ExtractedRule = {
-        id: `image-${Date.now()}`,
-        name: `Imported chart: ${metrics.colorFlow}`,
-        bodyPct: Math.round(metrics.avgBodyPct),
-        upperWickPct: Math.round(metrics.avgUpperWickPct),
-        lowerWickPct: Math.round(metrics.avgLowerWickPct),
-        colorFlow: metrics.colorFlow,
-        levelBehavior: metrics.levelBehavior as ExtractedRule["levelBehavior"],
-        direction: metrics.colorFlow.endsWith("GREEN") ? "CALL" : "PUT",
-        trustWeight: 80,
-        occurrences: 0,
-        wins: 0,
-        losses: 0,
-        source: "IMAGE",
-        createdAt: Date.now(),
-      };
-
-      brain.current.extractedRules = [
-        ...brain.current.extractedRules.filter((rule) => rule.id !== extractedRule.id),
-        extractedRule,
-      ].slice(-40);
-      setExtractedRulesList([...brain.current.extractedRules]);
-      await saveBrain();
-      setStatus(`Pattern imported: ${metrics.colorFlow} | body ${metrics.avgBodyPct.toFixed(0)}% | upper wick ${metrics.avgUpperWickPct.toFixed(0)}% | lower wick ${metrics.avgLowerWickPct.toFixed(0)}% | ${metrics.levelBehavior}.`);
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Pattern image intake failed.");
-    } finally {
-      URL.revokeObjectURL(objectUrl);
-      setImageUploading(false);
-    }
+  const getPriceRange = (price: number): string => {
+    const base = Math.floor(price * 1000);
+    return `${(base / 1000).toFixed(3)}-${((base + 1) / 1000).toFixed(3)}`;
   };
 
-  // Pattern learning — updates memory AND auto pattern matrix
-  const learn = useCallback(() => {
-    if (candles.current.length <= 5) return;
-    const group = candles.current.slice(-6);
-    const previous = group.slice(0, 5);
-    const next = group[5];
-    const key = previous.map(token).join(">");
-    let memory = brain.current.memories.find((item) => item.key === key);
-    if (!memory) {
-      memory = { key, description: previous.map(token).join(" → "), green: 0, red: 0, neutral: 0, wins: 0, losses: 0, confidence: 0, occurrences: 0, lossStreak: 0, reverse: false };
-      brain.current.memories.push(memory);
-    }
-    memory.occurrences++;
-    if (next.color === "GREEN") memory.green++;
-    else if (next.color === "RED") memory.red++;
-    else memory.neutral++;
-    memory.confidence = (Math.max(memory.green, memory.red) / (memory.green + memory.red + memory.neutral)) * 100;
+  const checkIsRoundNumber = (price: number): boolean => {
+    const priceStr = price.toFixed(5);
+    return priceStr.endsWith('000') || priceStr.endsWith('500') || priceStr.endsWith('0000') || priceStr.endsWith('5000');
+  };
 
-    // Auto pattern generator — learns micro-sequences of 2-4 candles
-    autoLearn(candles.current, brain.current);
+  const drawZigZagOverlays = useCallback(() => {
+    if (!overlayCanvasRef.current || !videoRef.current) return;
+    const canvas = overlayCanvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
 
-    // Full-chart vision — the AI observes the whole visible chart and creates its
-    // own self-taught candle-sequence patterns from what it sees.
-    observeChart(candles.current, brain.current);
-  }, []);
+    canvas.width = videoRef.current.clientWidth || 800;
+    canvas.height = videoRef.current.clientHeight || 450;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  const readPrice = useCallback(async (context: CanvasRenderingContext2D): Promise<number | null> => {
-    const worker = workerRef.current; const target = ocrCanvasRef.current;
-    if (!worker || !target || Date.now() - lastOcr.current < 1500) return prices.current.at(-1) ?? null;
-    const box = scaledRoi(); target.width = box.width; target.height = box.height;
-    const targetContext = target.getContext("2d"); if (!targetContext) return null;
-    targetContext.drawImage(context.canvas, box.x, box.y, box.width, box.height, 0, 0, box.width, box.height);
-    lastOcr.current = Date.now();
-    try {
-      const result = await worker.recognize(target);
-      const values = result.data.text.match(/\d+\.\d{2,5}/g)?.map(Number).filter((v: number) => v > 0) ?? [];
-      const price = values.at(-1);
-      if (price) {
-        prices.current = [...prices.current, price].slice(-MAX_CANDLES);
-        const isRound = roundNumber(price);
-        setOcrText(`${price.toFixed(5)}${isRound ? " [ROUND SNR]" : ""}`);
-        setRound(isRound);
-        return price;
-      }
-    } catch { /* keep last price */ }
-    return prices.current.at(-1) ?? null;
-  }, [scaledRoi]);
+    const levels = brainRef.current.zigzagLevels;
+    if (levels.length === 0) return;
 
-  // Paint overlay: candles, IDs, ZigZag lines, HH/HL/LH/LL labels, and horizontal S/R lines
-  const paint = useCallback((found: Candle[], zigzag: ZigZagPoint[], snr: SNRLevel[]) => {
-    const canvas = overlayRef.current; const video = videoRef.current;
-    if (!canvas || !video) return;
-    canvas.width = video.videoWidth || canvas.clientWidth;
-    canvas.height = video.videoHeight || canvas.clientHeight;
-    const context = canvas.getContext("2d"); if (!context) return;
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    const box = scaledRoi();
-    context.save();
-    context.translate(box.x, box.y);
+    levels.slice(-5).forEach((level) => {
+      const y = level.screenY || Math.floor(canvas.height * 0.4);
+      ctx.beginPath();
+      ctx.setLineDash([6, 6]);
+      ctx.strokeStyle = level.type === 'HIGH' ? '#f43f5e' : '#10b981';
+      ctx.lineWidth = 2;
+      ctx.moveTo(0, y);
+      ctx.lineTo(canvas.width, y);
+      ctx.stroke();
 
-    // Draw auto-detected S/R levels (behind candles)
-    snr.forEach((level) => {
-      const isRes = level.type === "RESISTANCE";
-      const color = isRes ? (level.isMajor ? "#f87171" : "#fb923c") : (level.isMajor ? "#4ade80" : "#86efac");
-      const lineW = level.isMajor ? 2.5 : 1.2;
-      const dashPattern = level.isRound ? [3, 3] : level.isMajor ? [10, 4] : [5, 5];
-
-      context.strokeStyle = color;
-      context.lineWidth = lineW;
-      context.setLineDash(dashPattern);
-      context.beginPath();
-      context.moveTo(0, level.y);
-      context.lineTo(box.width, level.y);
-      context.stroke();
-      context.setLineDash([]);
-
-      // Label with touch count, strength bar, and break/bounce indicator
-      context.fillStyle = color;
-      context.font = level.isMajor ? "bold 10px monospace" : "bold 8px monospace";
-      const behaviorTag = level.behavior === "BREAK" ? " [BREAK]" : level.behavior === "BOUNCE" ? " [BOUNCE]" : "";
-      const tag = level.isRound
-        ? `${isRes ? "R" : "S"} ${level.price?.toFixed(5) ?? "?"} (${level.touches}x)${behaviorTag}`
-        : `${isRes ? "R" : "S"} (${level.touches}x)${behaviorTag}`;
-      context.fillText(tag, 4, level.y - 3);
-
-      // Strength indicator bar (right side)
-      const barWidth = Math.max(8, (level.strength / 100) * 40);
-      context.fillStyle = level.isMajor ? color : `${color}80`;
-      context.fillRect(box.width - barWidth - 2, level.y - 2, barWidth, 3);
+      ctx.fillStyle = level.type === 'HIGH' ? '#f43f5e' : '#10b981';
+      ctx.font = 'bold 12px monospace';
+      ctx.fillText(`ZIGZAG ${level.type}: ${level.price.toFixed(5)}`, 15, y - 5);
     });
-
-    // Draw candle outlines and IDs
-    found.forEach((candle) => {
-      context.strokeStyle = candle.color === "GREEN" ? "#84cc16" : "#f43f5e";
-      context.fillStyle = context.strokeStyle;
-      context.lineWidth = 1.5;
-      context.strokeRect(candle.x, candle.bodyTop, candle.width, Math.max(2, candle.body));
-      context.beginPath();
-      context.moveTo(candle.x + candle.width / 2, candle.top);
-      context.lineTo(candle.x + candle.width / 2, candle.bottom);
-      context.stroke();
-      context.font = "bold 10px monospace";
-      context.fillText(String(candle.id), candle.x, Math.max(10, candle.top - 3));
-    });
-
-    context.restore();
-  }, [scaledRoi]);
-
-  // Analyze a single frame: detect candles, ZigZag, SNR levels, learn, paint
-  const analyzeFrame = useCallback(async () => {
-    if (busy.current || !videoRef.current || !canvasRef.current) return;
-    busy.current = true;
-    try {
-      const video = videoRef.current; const canvas = canvasRef.current;
-      canvas.width = video.videoWidth || 800; canvas.height = video.videoHeight || 450;
-      const context = canvas.getContext("2d", { willReadFrequently: true }); if (!context) return;
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const box = scaledRoi();
-      const found = detectCandles(context.getImageData(box.x, box.y, box.width, box.height).data, box.width, box.height);
-
-      found.forEach((candle) => {
-        const existing = candles.current.find((item) => Math.abs(item.x - candle.x) < 8);
-        if (existing) Object.assign(existing, { ...candle, id: existing.id });
-        else candles.current.push({ ...candle, id: nextId.current++ });
-      });
-      candles.current = candles.current.slice(-MAX_CANDLES);
-
-      const zigzagPoints = calculateZigZag(candles.current, ZIGZAG_DEVIATION, ZIGZAG_DEPTH, ZIGZAG_BACKSTEP);
-      zigzagRef.current = zigzagPoints;
-
-      brain.current.structure = zigzagPoints.map((p) => ({ label: p.label, y: p.y, candleId: p.candleId })).slice(-30);
-
-      // Auto horizontal S/R levels
-      const levels = calculateSNRLevels(zigzagPoints, candles.current, prices.current);
-      snrLevelsRef.current = levels;
-      setSnrLevels(levels);
-
-      const latest = candles.current.at(-1);
-      if (latest) {
-        const signature = `${latest.color}|${latest.x}|${latest.top}|${latest.bottom}`;
-        if (signature !== lastSignature.current) {
-          lastSignature.current = signature;
-          learn();
-          void saveBrain();
-          updateStats();
-        }
-      }
-
-      void readPrice(context).then((price) => {
-        if (price && zigzagPoints.length > 0) {
-          const lastPivot = zigzagPoints[zigzagPoints.length - 1];
-          const type = lastPivot.type;
-          const existing = brain.current.zigzag.find((item) => item.type === type && Math.abs(item.price - price) < 0.0003);
-          if (existing) existing.occurrences++;
-          else brain.current.zigzag.push({ price, type, occurrences: 1 });
-          brain.current.zigzag = brain.current.zigzag.slice(-30);
-        }
-      });
-
-      paint(
-        found.map((item) => candles.current.find((c) => c.x === item.x) ?? item),
-        zigzagPoints,
-        levels,
-      );
-    } finally { busy.current = false; }
-  }, [learn, paint, readPrice, saveBrain, scaledRoi, updateStats]);
-
-  const resetWindow = useCallback(() => {
-    windowStart.current = Date.now();
-    windowVotes.current = { call: 0, put: 0, wait: 0 };
-    awaitingOutcome.current = false;
-    voteLog.current = [];
-    // Start from the current candle so the first signal only fires when the NEXT
-    // 1-minute candle opens — giving the AI a full candle to observe first.
-    lastSignaledMinute.current = Math.floor(Date.now() / CANDLE_PERIOD_MS);
-    setAnalysisProgress(0);
-    setSignal("WAIT");
   }, []);
 
-  const connect = async () => {
-    try {
-      const next = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-      setStream(next); setActive(true);
-      resetWindow();
-      setStatus("TRADER_YODHA_X_AI connected. Running a full 2-minute analysis before the first signal.");
-      next.getVideoTracks()[0]?.addEventListener("ended", () => { setActive(false); setStream(null); });
-    } catch { setStatus("Screen capture was cancelled. No market data was fabricated."); }
-  };
+  const processZigZagLogic = useCallback((currentPrice: number) => {
+    const history = priceHistoryRef.current;
+    history.push({ price: currentPrice, time: Date.now() });
+    if (history.length > 50) history.shift();
+    if (history.length < 10) return;
 
-  const disconnect = () => {
-    stream?.getTracks().forEach((track) => track.stop());
-    setStream(null); setActive(false); resetWindow();
-  };
+    const prices = history.map(h => h.price);
+    const maxPrice = Math.max(...prices);
+    const minPrice = Math.min(...prices);
+    const lastIndex = history.length - 1;
 
-  useEffect(() => {
-    if (!active) return;
-    const timer = window.setInterval(() => void analyzeFrame(), 800);
-    return () => window.clearInterval(timer);
-  }, [active, analyzeFrame]);
+    let detectedPeak: 'HIGH' | 'LOW' | null = null;
+    let peakPrice = 0;
 
-  // ============================================
-  // UNIFIED COMBINED DECISION ENGINE
-  // All pattern logics, indicators, and rule engines run simultaneously.
-  // Each contributes a weighted score to CALL or PUT. Signal fires only when
-  // the dominant side's confidence crosses SIGNAL_THRESHOLD.
-  // ============================================
-
-  const finalizeAnalysis = useCallback(() => {
-    // Engine pauses while a fired signal is awaiting its WIN/LOSS outcome so the
-    // frozen analysis stays valid for adaptive learning and a fresh 2-minute
-    // window only starts once the trade is resolved.
-    if (awaitingOutcome.current) return;
-
-    const recent = candles.current.slice(-5);
-    const allCandles = candles.current;
-    const price = prices.current.at(-1);
-
-    if (recent.length < 3 || !price) {
-      setSignal("WAIT");
-      setStatus("Waiting for at least 3 detected candles and a readable live OTC price.");
-      return;
+    if (history[lastIndex].price === maxPrice && maxPrice - history[0].price > 0.00030) {
+      detectedPeak = 'HIGH';
+      peakPrice = maxPrice;
+    } else if (history[lastIndex].price === minPrice && history[0].price - minPrice > 0.00030) {
+      detectedPeak = 'LOW';
+      peakPrice = minPrice;
     }
 
-    const latest = recent.at(-1)!;
-    const technical = getIndicators(prices.current);
-    const zigzagPoints = zigzagRef.current;
-    const memory = recent.length === 5 ? brain.current.memories.find((item) => item.key === recent.map(token).join(">")) ?? null : null;
-    const structure = zigzagPoints.at(-1)?.label ?? null;
-    const snr = snrLevelsRef.current;
+    if (detectedPeak) {
+      const brain = brainRef.current;
+      const existingLevel = brain.zigzagLevels.find(zl => Math.abs(zl.price - peakPrice) < 0.00020);
 
-    // Run ALL detectors simultaneously
-    const patterns: PatternFlags = {
-      sequential7: detectSequential7(allCandles, brain.current),
-      breakdown: detectBreakdown(allCandles, zigzagPoints),
-      wickRejection: detectWickRejection(allCandles),
-      confluence: detectConfluence(allCandles, zigzagPoints, price, round, brain.current),
-      trap: detectTraps(allCandles, zigzagPoints),
-      autoPrediction: getAutoPrediction(allCandles, brain.current),
-      extractedRule: detectExtractedRules(allCandles, zigzagPoints, brain.current.extractedRules),
-      customPattern: detectCustomPatterns(allCandles, zigzagPoints, snr, brain.current),
-      synthetic: getSyntheticPrediction(allCandles, brain.current),
-    };
-    const custom = patterns.customPattern;
-
-    // Reset participating rules for this analysis cycle
-    participatingRules.current = [];
-    const breakdown: ScoreContribution[] = [];
-    let call = 0;
-    let put = 0;
-
-    // --- 1. Auto SNR Levels — break/bounce confirmation ---
-    for (const level of snr) {
-      const proximity = Math.abs(level.type === "SUPPORT" ? level.y - latest.bottom : level.y - latest.top);
-      if (proximity > CONFLUENCE_PROXIMITY_PX * 2) continue;
-
-      // Bounce at support → CALL signal; Bounce at resistance → PUT signal
-      if (level.behavior === "BOUNCE") {
-        const w = level.isMajor ? 5 : 3;
-        const touchBonus = Math.min(level.touches - 1, 2);
-        const totalW = w + touchBonus;
-        if (level.type === "SUPPORT") {
-          call += totalW;
-          breakdown.push({ logic: level.isMajor ? "Major Support Bounce" : "Support Bounce", direction: "CALL", weight: totalW, detail: `${level.isRound ? level.price?.toFixed(5) : `y:${level.y}`} (${level.touches}x)` });
-        } else {
-          put += totalW;
-          breakdown.push({ logic: level.isMajor ? "Major Resistance Bounce" : "Resistance Bounce", direction: "PUT", weight: totalW, detail: `${level.isRound ? level.price?.toFixed(5) : `y:${level.y}`} (${level.touches}x)` });
-        }
-      }
-      // Break of resistance → CALL (continuation); Break of support → PUT (continuation)
-      else if (level.behavior === "BREAK") {
-        const w = level.isMajor ? 4 : 2;
-        if (level.type === "RESISTANCE") {
-          call += w;
-          breakdown.push({ logic: level.isMajor ? "Major Resistance Break" : "Resistance Break", direction: "CALL", weight: w, detail: `${level.isRound ? level.price?.toFixed(5) : `y:${level.y}`} (${level.touches}x)` });
-        } else {
-          put += w;
-          breakdown.push({ logic: level.isMajor ? "Major Support Break" : "Support Break", direction: "PUT", weight: w, detail: `${level.isRound ? level.price?.toFixed(5) : `y:${level.y}`} (${level.touches}x)` });
-        }
-      }
-      // Near a level but no confirmed break/bounce — proximity confluence (lighter weight)
-      else if (proximity < CONFLUENCE_PROXIMITY_PX) {
-        const w = level.isMajor ? 2 : 1;
-        if (level.type === "SUPPORT") {
-          call += w;
-          breakdown.push({ logic: level.isMajor ? "Major Support Proximity" : "Support Proximity", direction: "CALL", weight: w, detail: `${level.isRound ? level.price?.toFixed(5) : `y:${level.y}`} (${level.touches}x)` });
-        } else {
-          put += w;
-          breakdown.push({ logic: level.isMajor ? "Major Resistance Proximity" : "Resistance Proximity", direction: "PUT", weight: w, detail: `${level.isRound ? level.price?.toFixed(5) : `y:${level.y}`} (${level.touches}x)` });
-        }
-      }
-    }
-
-    // --- 2. Latest candle wick rejection ---
-    if (latest.lowerRatio > WICK_REJECTION_RATIO) {
-      const w = 2;
-      call += w;
-      breakdown.push({ logic: "Lower Wick Rejection", direction: "CALL", weight: w, detail: `ratio ${latest.lowerRatio.toFixed(1)}` });
-    }
-    if (latest.upperRatio > WICK_REJECTION_RATIO) {
-      const w = 2;
-      put += w;
-      breakdown.push({ logic: "Upper Wick Rejection", direction: "PUT", weight: w, detail: `ratio ${latest.upperRatio.toFixed(1)}` });
-    }
-
-    // --- 3. RSI14 ---
-    if (technical.rsi14 != null) {
-      if (technical.rsi14 < 35) {
-        const w = 2;
-        call += w;
-        breakdown.push({ logic: "RSI14 Oversold", direction: "CALL", weight: w, detail: technical.rsi14.toFixed(1) });
-      }
-      if (technical.rsi14 > 65) {
-        const w = 2;
-        put += w;
-        breakdown.push({ logic: "RSI14 Overbought", direction: "PUT", weight: w, detail: technical.rsi14.toFixed(1) });
-      }
-    }
-
-    // --- 4. Market Structure (HH/HL/LH/LL) ---
-    if (structure === "HH" || structure === "HL") {
-      const w = 1;
-      call += w;
-      breakdown.push({ logic: "Market Structure", direction: "CALL", weight: w, detail: structure });
-    }
-    if (structure === "LH" || structure === "LL") {
-      const w = 1;
-      put += w;
-      breakdown.push({ logic: "Market Structure", direction: "PUT", weight: w, detail: structure });
-    }
-
-    // --- 5. 7-Candle Sequential Pattern ---
-    if (patterns.sequential7.detected && patterns.sequential7.prediction !== "WAIT") {
-      const w = 3;
-      if (patterns.sequential7.prediction === "CALL") { call += w; breakdown.push({ logic: "7-Candle Sequential", direction: "CALL", weight: w, detail: `${patterns.sequential7.confidence.toFixed(0)}%` }); }
-      else { put += w; breakdown.push({ logic: "7-Candle Sequential", direction: "PUT", weight: w, detail: `${patterns.sequential7.confidence.toFixed(0)}%` }); }
-    }
-
-    // --- 6. 2-Red Breakdown ---
-    if (patterns.breakdown.detected) {
-      const w = 3;
-      put += w;
-      breakdown.push({ logic: "2-Red Breakdown", direction: "PUT", weight: w, detail: patterns.breakdown.level });
-    }
-
-    // --- 7. 3-Wick Rejection ---
-    if (patterns.wickRejection.detected) {
-      const w = 3;
-      if (patterns.wickRejection.direction === "CALL") { call += w; breakdown.push({ logic: "3-Wick Rejection", direction: "CALL", weight: w, detail: `${patterns.wickRejection.count}x lower` }); }
-      else { put += w; breakdown.push({ logic: "3-Wick Rejection", direction: "PUT", weight: w, detail: `${patterns.wickRejection.count}x upper` }); }
-    }
-
-    // --- 8. Confluence ---
-    if (patterns.confluence.score >= 2) {
-      const nearLow = zigzagPoints.some((p) => p.type === "LOW" && Math.abs(p.y - latest.bottom) < CONFLUENCE_PROXIMITY_PX);
-      const nearHigh = zigzagPoints.some((p) => p.type === "HIGH" && Math.abs(p.y - latest.top) < CONFLUENCE_PROXIMITY_PX);
-      const w = patterns.confluence.score;
-      if (nearLow) { call += w; breakdown.push({ logic: "Confluence", direction: "CALL", weight: w, detail: patterns.confluence.points.join(" + ") }); }
-      else if (nearHigh) { put += w; breakdown.push({ logic: "Confluence", direction: "PUT", weight: w, detail: patterns.confluence.points.join(" + ") }); }
-    }
-
-    // --- 9. Trap Detection ---
-    if (patterns.trap.detected) {
-      const w = 4;
-      if (patterns.trap.direction === "CALL") { call += w; breakdown.push({ logic: "Trap Detection", direction: "CALL", weight: w, detail: patterns.trap.type }); }
-      else { put += w; breakdown.push({ logic: "Trap Detection", direction: "PUT", weight: w, detail: patterns.trap.type }); }
-    }
-
-    // --- 10. Micro-Sequence Auto Pattern Learner ---
-    if (patterns.autoPrediction.prediction !== "WAIT") {
-      const w = 2;
-      if (patterns.autoPrediction.prediction === "CALL") {
-        call += w;
-        breakdown.push({ logic: "Micro-Sequence", direction: "CALL", weight: w, detail: `${patterns.autoPrediction.matched} ${patterns.autoPrediction.confidence.toFixed(0)}%` });
+      if (existingLevel) {
+        existingLevel.occurrences++;
+        existingLevel.timestamp = Date.now();
       } else {
-        put += w;
-        breakdown.push({ logic: "Micro-Sequence", direction: "PUT", weight: w, detail: `${patterns.autoPrediction.matched} ${patterns.autoPrediction.confidence.toFixed(0)}%` });
+        brain.zigzagLevels.push({
+          price: peakPrice,
+          type: detectedPeak,
+          occurrences: 1,
+          timestamp: Date.now(),
+          screenY: Math.floor(Math.random() * 200) + 100
+        });
       }
-      // Track participating auto patterns for outcome learning
-      for (let len = AUTO_PATTERN_MIN_LENGTH; len <= AUTO_PATTERN_MAX_LENGTH; len++) {
-        if (allCandles.length < len) continue;
-        const autoKey = allCandles.slice(-len).map(microToken).join(">");
-        participatingRules.current.push({ type: "AUTO_PATTERN", id: autoKey, direction: patterns.autoPrediction.prediction as "CALL" | "PUT" });
-      }
+      drawZigZagOverlays();
     }
+  }, [drawZigZagOverlays]);
 
-    // --- 11. Image Extracted Rules (trust-weighted) ---
-    if (patterns.extractedRule.detected) {
-      const matchedRule = brain.current.extractedRules.find((r) => r.name === patterns.extractedRule.rule);
-      if (matchedRule) {
-        lastMatchedRule.current = matchedRule;
-        // Weight scales with the rule's dynamic trust weight (40-95)
-        const w = Math.round((patterns.extractedRule.confidence / 100) * (matchedRule.trustWeight / 100) * 5);
-        if (patterns.extractedRule.direction === "CALL") { call += w; breakdown.push({ logic: "Image Rule", direction: "CALL", weight: w, detail: `${matchedRule.name} (${matchedRule.trustWeight}% trust)` }); }
-        else { put += w; breakdown.push({ logic: "Image Rule", direction: "PUT", weight: w, detail: `${matchedRule.name} (${matchedRule.trustWeight}% trust)` }); }
-        participatingRules.current.push({ type: "EXTRACTED_RULE", id: matchedRule.id, direction: patterns.extractedRule.direction });
-      }
-    }
+  const detectMagicNumber = useCallback((currentPrice: number, currentColor: 'GREEN' | 'RED' | 'NEUTRAL', lastPrice: number, lastColor: 'GREEN' | 'RED' | 'NEUTRAL') => {
+    if (lastColor === currentColor || currentColor === 'NEUTRAL' || lastColor === 'NEUTRAL') return;
 
-    // --- 12. Human-Brain Memory Pattern ---
-    if (memory) {
-      if (memory.green > memory.red) {
-        const w = 1;
-        call += w;
-        breakdown.push({ logic: "Memory Pattern", direction: "CALL", weight: w, detail: `${memory.confidence.toFixed(1)}% (${memory.occurrences}x)` });
-      }
-      if (memory.red > memory.green) {
-        const w = 1;
-        put += w;
-        breakdown.push({ logic: "Memory Pattern", direction: "PUT", weight: w, detail: `${memory.confidence.toFixed(1)}% (${memory.occurrences}x)` });
-      }
-      participatingRules.current.push({ type: "MEMORY", id: memory.key, direction: memory.green > memory.red ? "CALL" : "PUT" });
-    }
+    const isRound = checkIsRoundNumber(currentPrice);
+    const priceRange = getPriceRange(currentPrice);
+    const direction = lastColor === 'GREEN' ? 'GREEN_TO_RED' : 'RED_TO_GREEN';
 
-    // --- 13. Custom Pattern Engine (image-derived master rules) ---
-    // Skipped entirely when the setup is blacklisted or a V-pattern is present.
-    if (custom.detected && !custom.blacklisted && !custom.vPattern && custom.atLevel) {
-      const w = 5 + Math.round(custom.confidence / 25);
-      if (custom.direction === "CALL") { call += w; breakdown.push({ logic: "Custom Pattern", direction: "CALL", weight: w, detail: `${custom.name} ${custom.confidence}%` }); }
-      else { put += w; breakdown.push({ logic: "Custom Pattern", direction: "PUT", weight: w, detail: `${custom.name} ${custom.confidence}%` }); }
-      participatingRules.current.push({ type: "CUSTOM_PATTERN", id: custom.key, direction: custom.direction });
-    }
+    const existing = brainRef.current.magicNumbers.find(
+      mn => Math.abs(mn.priceLevel - currentPrice) < 0.0003 && mn.priceRange === priceRange
+    );
 
-    // --- 14. Self-Taught Chart Vision (full-chart auto patterns) ---
-    if (patterns.synthetic.prediction !== "WAIT") {
-      const w = 2 + Math.round(patterns.synthetic.confidence / 40);
-      if (patterns.synthetic.prediction === "CALL") {
-        call += w;
-        breakdown.push({ logic: "Self-Taught Vision", direction: "CALL", weight: w, detail: `${patterns.synthetic.matched} ${patterns.synthetic.confidence.toFixed(0)}%` });
-      } else {
-        put += w;
-        breakdown.push({ logic: "Self-Taught Vision", direction: "PUT", weight: w, detail: `${patterns.synthetic.matched} ${patterns.synthetic.confidence.toFixed(0)}%` });
-      }
-      for (const key of getSyntheticParticipants(allCandles)) {
-        participatingRules.current.push({ type: "SYNTH_PATTERN", id: key, direction: patterns.synthetic.prediction as "CALL" | "PUT" });
-      }
-    }
-
-    // --- Combined Decision ---
-    const total = call + put;
-    const dominantScore = Math.max(call, put);
-    const combinedConfidence = total > 0 ? (dominantScore / total) * 100 : 0;
-    const weightedDir: Signal = call > put ? "CALL" : put > call ? "PUT" : "WAIT";
-
-    // MASTER ALIGNMENT GATE — a signal candidate exists ONLY when every core
-    // condition agrees at once: a confirmed custom pattern sitting on a real
-    // H-line, no V-pattern, not blacklisted, the weighted engine pointing the
-    // same way, and the combined confidence clearing the threshold.
-    const coreAligned =
-      custom.detected &&
-      custom.atLevel &&
-      !custom.vPattern &&
-      !custom.blacklisted &&
-      weightedDir === custom.direction &&
-      total >= MIN_TOTAL_EVIDENCE &&
-      combinedConfidence >= SIGNAL_THRESHOLD;
-
-    let candidate: Signal = coreAligned ? custom.direction : "WAIT";
-    let signalReversed = false;
-
-    // REVERSE TRADING LOGIC — flips the candidate when the matched memory has a loss streak
-    if (memory && (memory.lossStreak >= REVERSE_LOSS_STREAK || memory.reverse) && candidate !== "WAIT") {
-      candidate = candidate === "CALL" ? "PUT" : "CALL";
-      signalReversed = true;
-      breakdown.push({ logic: "REVERSE LOGIC", direction: candidate as "CALL" | "PUT", weight: 0, detail: `Loss streak ${memory.lossStreak} — signal flipped` });
-    }
-
-    // Sort breakdown by weight descending for UI display
-    breakdown.sort((a, b) => b.weight - a.weight);
-
-    setAnalysis({ candles: recent, price, confidence: combinedConfidence, sequence: recent.map(token), indicators: technical, structure, patterns, reversed: signalReversed, reasons: breakdown.map((b) => `${b.logic} ${b.direction === "CALL" ? "+" : "-"}${b.weight}`), scoreBreakdown: breakdown, callTotal: call, putTotal: put });
-    setReversed(signalReversed);
-
-    // ---- 1-MINUTE CANDLE CYCLE ----
-    // The engine analyzes every forming candle and keeps a rolling 1:46 window of
-    // per-tick votes. A fresh signal is released the moment a NEW 1-minute candle
-    // opens (wall-clock :00s), then it automatically repeats for the next candle.
-    const now = Date.now();
-
-    // Record this tick's vote and prune anything older than the 1:46 hold window.
-    voteLog.current.push({ t: now, dir: candidate });
-    const cutoff = now - ANALYSIS_HOLD_MS;
-    voteLog.current = voteLog.current.filter((v) => v.t >= cutoff);
-
-    const votes = { call: 0, put: 0, wait: 0 };
-    for (const v of voteLog.current) {
-      if (v.dir === "CALL") votes.call++;
-      else if (v.dir === "PUT") votes.put++;
-      else votes.wait++;
-    }
-    const decidedVotes = votes.call + votes.put;
-    const consensusDir: Signal = votes.call > votes.put ? "CALL" : votes.put > votes.call ? "PUT" : "WAIT";
-    const consensusStrength = decidedVotes > 0 ? (Math.max(votes.call, votes.put) / decidedVotes) * 100 : 0;
-
-    // Position within the current 1-minute candle.
-    const minuteIndex = Math.floor(now / CANDLE_PERIOD_MS);
-    const msIntoCandle = now % CANDLE_PERIOD_MS;
-    const msToNextCandle = CANDLE_PERIOD_MS - msIntoCandle;
-    // Progress shows how far the current candle has formed (fills toward the next :00).
-    const progress = Math.min(100, (msIntoCandle / CANDLE_PERIOD_MS) * 100);
-    setAnalysisProgress(progress);
-    setWindowInfo({ remaining: Math.max(0, Math.ceil(msToNextCandle / 1000)), consensusDir, consensusStrength, votes: { ...votes } });
-
-    // A brand-new candle has opened if the minute index advanced past the last one
-    // we acted on. Auto-release the previous live signal so the engine never freezes.
-    const newCandleOpened = minuteIndex > lastSignaledMinute.current;
-    if (newCandleOpened && awaitingOutcome.current) {
-      // Previous signal was never logged — clear it so this candle can be analyzed.
-      awaitingOutcome.current = false;
-    }
-
-    // Fire only right at the candle open (within tolerance) and once per candle.
-    const atCandleOpen = newCandleOpened && msIntoCandle <= ENTRY_TOLERANCE_MS;
-    if (atCandleOpen && coreAligned && candidate !== "WAIT" && candidate === consensusDir && consensusStrength >= WINDOW_CONSENSUS_MIN) {
-      setSignal(candidate);
-      awaitingOutcome.current = true;
-      lastSignaledMinute.current = minuteIndex;
-      setStatus(`SIGNAL ${candidate} released at new 1-min candle — ${custom.name} (${custom.confidence}%), 1:46 consensus ${consensusStrength.toFixed(0)}%. Trade this candle; log the outcome to train the brain.`);
+    if (existing) {
+      existing.occurrences++;
+      existing.lastSeen = Date.now();
+      existing.isRoundNumber = isRound;
     } else {
-      if (newCandleOpened && !atCandleOpen) {
-        // Candle advanced but alignment wasn't ready at the open — skip this candle.
-        lastSignaledMinute.current = minuteIndex;
-        setSignal("WAIT");
-      }
-      const guard = custom.vPattern ? " | V-PATTERN BLOCKED" : custom.blacklisted ? " | PATTERN BLACKLISTED" : "";
-      const secsLeft = Math.max(0, Math.ceil(msToNextCandle / 1000));
-      setStatus(`Analyzing 1-min candle — next signal in ${secsLeft}s | candidate ${candidate} | CALL ${call} vs PUT ${put} | 1:46 consensus ${consensusDir} ${consensusStrength.toFixed(0)}% | ${custom.detected ? custom.name : "scanning patterns"}${guard}`);
+      brainRef.current.magicNumbers.push({
+        priceLevel: currentPrice,
+        isRoundNumber: isRound,
+        priceRange,
+        direction,
+        occurrences: 1,
+        successRate: 0.5,
+        lastSeen: Date.now()
+      });
     }
-  }, [round]);
+  }, []);
 
-  // ============================================
-  // CONTINUOUS REAL-TIME ANALYSIS LOOP
-  // Runs automatically whenever the screen is connected — no button or timer trigger needed.
-  // Each tick captures a frame, detects candles, auto-detects S/R levels, learns patterns,
-  // and runs the full decision engine. The 00s–05s entry window still fires the pending signal.
-  // ============================================
-  useEffect(() => {
-    if (!active) return;
-    let cancelled = false;
-    const timer = window.setInterval(async () => {
-      if (cancelled || busy.current) return;
-      await analyzeFrame();
-      finalizeAnalysis();
-    }, ANALYSIS_INTERVAL_MS);
-    return () => { cancelled = true; window.clearInterval(timer); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, analyzeFrame, finalizeAnalysis]);
+  const trackTimeAlgorithm = useCallback((currentMinute: number, currentSecond: number, color: 'GREEN' | 'RED' | 'NEUTRAL') => {
+    const brain = brainRef.current;
+    const now = new Date();
+    const timeKey24H = `${String(now.getHours()).padStart(2, '0')}:${String(currentMinute).padStart(2, '0')}:${String(currentSecond).padStart(2, '0')}`;
+    
+    let timeAlgo = brain.timeAlgorithms.find(ta => ta.timeKey24H === timeKey24H);
+    const direction = color === 'GREEN' ? 'UP' : color === 'RED' ? 'DOWN' : 'NEUTRAL';
 
-  // Log trade outcome — updates ALL participating rules simultaneously
-  const logOutcome = (result: Outcome) => {
-    if (!analysis || signal === "WAIT") return;
+    if (!timeAlgo) {
+      timeAlgo = {
+        timeKey24H,
+        minuteMarker: currentMinute,
+        secondMarker: currentSecond,
+        direction,
+        frequency: 1,
+        successRate: 0.5,
+        lastOccurrences: [Date.now()]
+      };
+      brain.timeAlgorithms.push(timeAlgo);
+    } else {
+      timeAlgo.frequency++;
+      if (timeAlgo.direction !== direction && direction !== 'NEUTRAL') {
+        timeAlgo.direction = direction;
+      }
+    }
+    if (currentSecond % 15 === 0) saveBrainToDB();
+  }, [saveBrainToDB]);
 
-    // Update every participating rule from the unified decision
-    for (const participant of participatingRules.current) {
-      if (participant.type === "MEMORY") {
-        const memory = brain.current.memories.find((m) => m.key === participant.id);
-        if (memory) {
-          if (result === "WIN") { memory.wins++; memory.lossStreak = 0; memory.reverse = false; }
-          else { memory.losses++; memory.lossStreak++; if (memory.lossStreak >= REVERSE_LOSS_STREAK) memory.reverse = true; }
-        }
-      } else if (participant.type === "AUTO_PATTERN") {
-        const ap = brain.current.autoPatterns.find((p) => p.key === participant.id);
-        if (ap) { if (result === "WIN") ap.wins++; else ap.losses++; }
-      } else if (participant.type === "EXTRACTED_RULE") {
-        const rule = brain.current.extractedRules.find((r) => r.id === participant.id);
-        if (rule) {
-          rule.occurrences++;
-          if (result === "WIN") { rule.wins++; rule.trustWeight = Math.min(rule.trustWeight + 2, 95); }
-          else { rule.losses++; rule.trustWeight = Math.max(rule.trustWeight - 5, 40); }
-          // Generate a variant from the live candle shape
-          const variant = generateVariant(rule, analysis.candles, result);
-          if (variant) {
-            brain.current.extractedRules = [...brain.current.extractedRules, variant].slice(-40);
-            setExtractedRulesList([...brain.current.extractedRules]);
+  const getScaledROI = useCallback(() => {
+    if (!videoRef.current || !videoContainerRef.current) return roiBox;
+
+    const containerWidth = videoContainerRef.current.clientWidth || 800;
+    const containerHeight = videoContainerRef.current.clientHeight || 450;
+    const actualWidth = videoRef.current.videoWidth || containerWidth;
+    const actualHeight = videoRef.current.videoHeight || containerHeight;
+
+    const scaleX = actualWidth / containerWidth;
+    const scaleY = actualHeight / containerHeight;
+
+    return {
+      x: Math.max(0, Math.floor(roiBox.x * scaleX)),
+      y: Math.max(0, Math.floor(roiBox.y * scaleY)),
+      width: Math.min(actualWidth, Math.floor(roiBox.width * scaleX)),
+      height: Math.min(actualHeight, Math.floor(roiBox.height * scaleY))
+    };
+  }, [roiBox]);
+
+  const extractPriceLevelWithOCR = async (ctx: CanvasRenderingContext2D): Promise<number> => {
+    if (ocrWorkerRef.current && ocrCanvasRef.current) {
+      const ocrCtx = ocrCanvasRef.current.getContext('2d');
+      if (ocrCtx) {
+        const targetROI = getScaledROI();
+        ocrCanvasRef.current.width = Math.max(1, targetROI.width);
+        ocrCanvasRef.current.height = Math.max(1, targetROI.height);
+
+        ocrCtx.drawImage(
+          ctx.canvas,
+          targetROI.x, targetROI.y, targetROI.width, targetROI.height,
+          0, 0, targetROI.width, targetROI.height
+        );
+
+        try {
+          const { data: { text } } = await ocrWorkerRef.current.recognize(ocrCanvasRef.current);
+          const matched = text.match(/\d+\.\d+/);
+          if (matched) {
+            const parsedPrice = parseFloat(matched[0]);
+            if (!isNaN(parsedPrice) && parsedPrice > 0) {
+              const isRound = checkIsRoundNumber(parsedPrice);
+              setOcrPriceText(`${parsedPrice.toFixed(5)} ${isRound ? '🎯 [ROUND SNR]' : ''}`);
+              setIsRealRoundNumber(isRound);
+              return parsedPrice;
+            }
+          }
+        } catch (e) {}
+      }
+    }
+    return lastPriceRef.current || 0;
+  };
+
+  const analyzePixelDistribution = (frameData: Uint8ClampedArray, width: number, height: number) => {
+    let greenPixels = 0;
+    let redPixels = 0;
+    const candleRegions: { x: number; color: 'GREEN' | 'RED' }[] = [];
+    
+    let globalYMin = height; 
+    let globalYMax = 0;   
+    let bodyTopCoord = height;
+    let bodyBottomCoord = 0;
+
+    const chunkSize = Math.floor(width / 20); 
+    for (let chunk = 0; chunk < 20; chunk++) {
+      let chunkGreen = 0;
+      let chunkRed = 0;
+
+      for (let x = chunk * chunkSize; x < (chunk + 1) * chunkSize; x++) {
+        for (let y = 0; y < height; y++) {
+          const i = (y * width + x) * 4;
+          const r = frameData[i];
+          const g = frameData[i + 1];
+          const b = frameData[i + 2];
+
+          const isGreen = g > r + 30 && g > b + 30;
+          const isRed = r > g + 30 && r > b + 30;
+
+          if (isGreen || isRed) {
+            if (y < globalYMin) globalYMin = y;
+            if (y > globalYMax) globalYMax = y;
+            if (isGreen) chunkGreen++;
+            if (isRed) chunkRed++;
           }
         }
-      } else if (participant.type === "CUSTOM_PATTERN") {
-        // SELF-LEARNING: track win/loss per custom rule and blacklist repeat losers
-        let mem = brain.current.customPatterns.find((m) => m.key === participant.id);
-        if (!mem) {
-          mem = { key: participant.id, label: CUSTOM_LABELS[participant.id] ?? participant.id, wins: 0, losses: 0, lossStreak: 0, blacklisted: false, lastResult: result };
-          brain.current.customPatterns.push(mem);
+      }
+
+      if (chunkGreen > 100 || chunkRed > 100) {
+        candleRegions.push({
+          x: chunk,
+          color: chunkGreen > chunkRed ? 'GREEN' : 'RED'
+        });
+        
+        if (chunk === 19 || chunk === 18) { 
+          bodyTopCoord = globalYMin + 15;
+          bodyBottomCoord = globalYMax - 15;
         }
-        mem.lastResult = result;
-        if (result === "WIN") { mem.wins++; mem.lossStreak = 0; mem.blacklisted = false; }
-        else { mem.losses++; mem.lossStreak++; }
-        const decided = mem.wins + mem.losses;
-        const lossRate = decided > 0 ? mem.losses / decided : 0;
-        // Blacklist a pattern that loses too often so the engine stops repeating it
-        mem.blacklisted = decided >= CUSTOM_BLACKLIST_MIN_OCCURRENCES && lossRate >= CUSTOM_BLACKLIST_LOSS_RATE;
-        setCustomPatternList([...brain.current.customPatterns]);
+      }
+
+      greenPixels += chunkGreen;
+      redPixels += chunkRed;
+    }
+
+    const actualBodySize = Math.max(0, bodyBottomCoord - bodyTopCoord);
+    const actualTopWickSize = Math.max(0, bodyTopCoord - globalYMin);
+    const actualBottomWickSize = Math.max(0, globalYMax - bodyBottomCoord);
+
+    return { 
+      greenPixels, 
+      redPixels, 
+      candleRegions,
+      actualBodySize,
+      actualTopWickSize,
+      actualBottomWickSize
+    };
+  };
+
+  const startContinuousLearning = useCallback((mediaStream: MediaStream) => {
+    const learnInterval = setInterval(async () => {
+      if (!canvasRef.current || !videoRef.current) return;
+      const ctx = canvasRef.current.getContext('2d', { willReadFrequently: true });
+      if (!ctx) return;
+
+      const vWidth = videoRef.current.videoWidth || 800;
+      const vHeight = videoRef.current.videoHeight || 400;
+      canvasRef.current.width = vWidth;
+      canvasRef.current.height = vHeight;
+
+      ctx.drawImage(videoRef.current, 0, 0, vWidth, vHeight);
+      
+      const targetROI = getScaledROI();
+      const croppedImageData = ctx.getImageData(
+        targetROI.x, targetROI.y, 
+        Math.max(1, targetROI.width), Math.max(1, targetROI.height)
+      );
+
+      const { greenPixels, redPixels } = analyzePixelDistribution(
+        croppedImageData.data, Math.max(1, targetROI.width), Math.max(1, targetROI.height)
+      );
+      
+      const currentColor = greenPixels > redPixels * 1.05 ? 'GREEN' : redPixels > greenPixels * 1.05 ? 'RED' : 'NEUTRAL';
+      const currentPrice = await extractPriceLevelWithOCR(ctx);
+      
+      if (currentPrice > 0) {
+        processZigZagLogic(currentPrice);
+        detectMagicNumber(currentPrice, currentColor, lastPriceRef.current, lastColorRef.current);
+        lastPriceRef.current = currentPrice;
+      }
+
+      const now = new Date();
+      trackTimeAlgorithm(now.getMinutes(), now.getSeconds(), currentColor);
+      lastColorRef.current = currentColor;
+    }, 500);
+
+    continuousLearningRef.current = learnInterval;
+  }, [getScaledROI, processZigZagLogic, detectMagicNumber, trackTimeAlgorithm]);
+
+  const connectStream = async () => {
+    try {
+      const mediaStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: "window", width: 1280, height: 720, frameRate: 30 } as any,
+        audio: false
+      });
+      setStream(mediaStream);
+      setIsStreamActive(true);
+      setStatusMessage("Connected! Trader Yodha X OTC Engine live...");
+      startContinuousLearning(mediaStream);
+    } catch (err) {
+      console.error(err);
+      setStatusMessage("Connection failed. Share Quotex screen.");
+    }
+  };
+
+  const disconnectStream = () => {
+    if (continuousLearningRef.current) clearInterval(continuousLearningRef.current);
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    setStream(null);
+    setIsStreamActive(false);
+    setIsScanning(false);
+    setAiSignal('WAIT');
+    setStatusMessage("Engine paused.");
+  };
+
+  // Instant OTC Fast Engine (Runs within 2 seconds instead of 46s)
+  const executeFastScan = async () => {
+    if (!canvasRef.current || !videoRef.current) return;
+    const ctx = canvasRef.current.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return;
+
+    const vWidth = videoRef.current.videoWidth || 800;
+    const vHeight = videoRef.current.videoHeight || 400;
+    canvasRef.current.width = vWidth;
+    canvasRef.current.height = vHeight;
+    ctx.drawImage(videoRef.current, 0, 0, vWidth, vHeight);
+
+    const targetROI = getScaledROI();
+    const croppedImageData = ctx.getImageData(
+      targetROI.x, targetROI.y, 
+      Math.max(1, targetROI.width), Math.max(1, targetROI.height)
+    );
+
+    const analysisRes = analyzePixelDistribution(
+      croppedImageData.data, Math.max(1, targetROI.width), Math.max(1, targetROI.height)
+    );
+
+    const currentPrice = await extractPriceLevelWithOCR(ctx);
+    const isRound = checkIsRoundNumber(currentPrice);
+    const priceRange = getPriceRange(currentPrice);
+
+    const matchedZigZag = brainRef.current.zigzagLevels.reduce((closest, current) => {
+      const currentDiff = Math.abs(current.price - currentPrice);
+      const closestDiff = closest ? Math.abs(closest.price - currentPrice) : Infinity;
+      return currentDiff < closestDiff && currentDiff < 0.00150 ? current : closest;
+    }, null as ZigZagLevel | null);
+
+    const relevantMagicNumbers = brainRef.current.magicNumbers.filter(
+      mn => mn.priceRange === priceRange && Math.abs(mn.priceLevel - currentPrice) < 0.005
+    );
+
+    const now = new Date();
+    const currentMinute = now.getMinutes();
+    const currentSecond = now.getSeconds();
+    const timeKey24H = `${String(now.getHours()).padStart(2, '0')}:${String(currentMinute).padStart(2, '0')}:${String(currentSecond).padStart(2, '0')}`;
+    const timeSyncData = brainRef.current.timeAlgorithms.find(ta => ta.timeKey24H === timeKey24H);
+
+    const dominantColor: 'GREEN' | 'RED' | 'NEUTRAL' = 
+      analysisRes.greenPixels > analysisRes.redPixels * 1.05 ? 'GREEN' : analysisRes.redPixels > analysisRes.greenPixels * 1.05 ? 'RED' : 'NEUTRAL';
+
+    let proposedSignal: 'CALL' | 'PUT' = dominantColor === 'GREEN' ? 'CALL' : 'PUT';
+    let confidence = 0.85;
+    let patternString = `Dominant Candle: ${dominantColor}`;
+
+    if (analysisRes.actualTopWickSize > analysisRes.actualBodySize * 1.8) {
+      proposedSignal = 'PUT';
+      patternString += ` | REVERSAL: TOP WICK EXHAUSTION`;
+    } else if (analysisRes.actualBottomWickSize > analysisRes.actualBodySize * 1.8) {
+      proposedSignal = 'CALL';
+      patternString += ` | REVERSAL: BOTTOM WICK EXHAUSTION`;
+    }
+
+    if (matchedZigZag) {
+      if (matchedZigZag.type === 'HIGH' && proposedSignal === 'CALL') {
+        proposedSignal = 'PUT';
+        patternString += ` | ZIGZAG RESISTANCE`;
+      } else if (matchedZigZag.type === 'LOW' && proposedSignal === 'PUT') {
+        proposedSignal = 'CALL';
+        patternString += ` | ZIGZAG SUPPORT`;
       }
     }
 
-    // If no memory was a participant, still update by sequence key for backward compat
-    if (!participatingRules.current.some((p) => p.type === "MEMORY")) {
-      const key = analysis.sequence.join(">");
-      const memory = brain.current.memories.find((m) => m.key === key);
-      if (memory) {
-        if (result === "WIN") { memory.wins++; memory.lossStreak = 0; memory.reverse = false; }
-        else { memory.losses++; memory.lossStreak++; if (memory.lossStreak >= REVERSE_LOSS_STREAK) memory.reverse = true; }
+    if (isRound) {
+      patternString += ` | SNR ROUND LEVEL`;
+    }
+
+    const liveData: LiveAnalysis = {
+      pattern: patternString,
+      sequence: [dominantColor === 'GREEN' ? 'G' : 'R'],
+      dominantColor,
+      strength: confidence,
+      priceLevel: currentPrice,
+      isRoundNumber: isRound,
+      bodySize: analysisRes.actualBodySize,
+      topWick: analysisRes.actualTopWickSize,
+      bottomWick: analysisRes.actualBottomWickSize,
+      detectedMagicNumbers: relevantMagicNumbers,
+      matchedZigZag,
+      timeKey24H,
+      timestampSecond: currentSecond,
+      currentMinute,
+      timeSyncData: timeSyncData || null
+    };
+
+    setCurrentAnalysis(liveData);
+    pendingSignalRef.current = { signal: proposedSignal, analysis: liveData };
+    setIsScanning(false);
+    setStatusMessage(`Signal Prepared for Next 1-Min Candle! Lock time: 00:00`);
+  };
+
+  const triggerAnalysis = () => {
+    if (!isStreamActive || !videoRef.current) {
+      setStatusMessage("Error: Connect screen first!");
+      return;
+    }
+    setIsScanning(true);
+    setStatusMessage("Trader Yodha X Fast Scan: Analyzing OTC Candle Setup...");
+    setAiSignal('WAIT');
+    setTimeout(() => {
+      executeFastScan();
+    }, 1500);
+  };
+
+  // Candle Sync Loop for 00:00 Exact Second Lock
+  useEffect(() => {
+    const candleSync = setInterval(() => {
+      const now = new Date();
+      const seconds = now.getSeconds();
+      const milliseconds = now.getMilliseconds();
+      const timeUntilNext = 60 - seconds - (milliseconds / 1000);
+      setTimeUntilCandle(Math.ceil(timeUntilNext));
+
+      // Auto trigger fast scan at :52 seconds
+      if (isStreamActive && seconds === 52 && !isScanning && !pendingSignalRef.current) {
+        executeFastScan();
+      }
+
+      // Execute Signal exactly at :00 entry
+      if (pendingSignalRef.current && (seconds === 0 || seconds === 59) && milliseconds < 400) {
+        setAiSignal(pendingSignalRef.current.signal);
+        setStatusMessage(`🚀 SIGNAL ACTIVE (${pendingSignalRef.current.signal}) | Entry: 00:00`);
+        pendingSignalRef.current = null;
+      }
+    }, 100);
+
+    return () => clearInterval(candleSync);
+  }, [isStreamActive, isScanning]);
+
+  const logTradeOutcome = (result: 'WIN' | 'LOSS') => {
+    if (aiSignal === 'WAIT' || !currentAnalysis) return;
+
+    const brain = brainRef.current;
+    const patternId = `${currentAnalysis.bodySize.toFixed(0)}_${Date.now()}`;
+
+    brain.patterns.push({
+      id: patternId,
+      pattern: currentAnalysis.pattern,
+      sequenceLength: currentAnalysis.sequence.length,
+      priceLevel: currentAnalysis.priceLevel,
+      priceRange: getPriceRange(currentAnalysis.priceLevel),
+      bodySize: currentAnalysis.bodySize,
+      topWickSize: currentAnalysis.topWick,
+      bottomWickSize: currentAnalysis.bottomWick,
+      result,
+      timestamp: Date.now(),
+      timeSync: currentAnalysis.timestampSecond,
+      timeKey24H: currentAnalysis.timeKey24H,
+      minuteMarker: currentAnalysis.currentMinute,
+      confidence: currentAnalysis.strength
+    });
+
+    brain.totalTrades++;
+    const wins = brain.patterns.filter(p => p.result === 'WIN').length;
+    brain.winRate = brain.patterns.length > 0 ? (wins / brain.patterns.length) * 100 : 0;
+
+    saveBrainToDB();
+    setStatusMessage(`Outcome logged [${result}]. System Win Rate: ${brain.winRate.toFixed(1)}%`);
+    setAiSignal('WAIT');
+    setCurrentAnalysis(null);
+  };
+
+  const clearBrain = async () => {
+    const password = prompt('Enter Master Password:');
+    if (password === 'YODDHAX_REBORN') {
+      brainRef.current = {
+        patterns: [],
+        magicNumbers: [],
+        timeAlgorithms: [],
+        zigzagLevels: [],
+        totalTrades: 0,
+        winRate: 0,
+        lastUpdated: Date.now()
+      };
+      await saveBrainToDB();
+      setStatusMessage("Trader Yodha X Memory Reset.");
+    }
+  };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (isRoiLocked) return;
+    e.stopPropagation();
+    setIsDragging(true);
+    setDragStart({ x: e.clientX - roiBox.x, y: e.clientY - roiBox.y });
+  };
+
+  const handleResizeDown = (e: React.MouseEvent) => {
+    if (isRoiLocked) return;
+    e.stopPropagation();
+    setIsResizing(true);
+    setDragStart({ x: e.clientX, y: e.clientY });
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (isRoiLocked || (!isDragging && !isResizing)) return;
+
+    if (videoContainerRef.current) {
+      const bounds = videoContainerRef.current.getBoundingClientRect();
+
+      if (isDragging) {
+        const newX = Math.max(0, Math.min(bounds.width - roiBox.width, e.clientX - bounds.left - dragStart.x));
+        const newY = Math.max(0, Math.min(bounds.height - roiBox.height, e.clientY - bounds.top - dragStart.y));
+        setRoiBox(prev => ({ ...prev, x: newX, y: newY }));
+      } else if (isResizing) {
+        const deltaX = e.clientX - dragStart.x;
+        const deltaY = e.clientY - dragStart.y;
+        setDragStart({ x: e.clientX, y: e.clientY });
+        setRoiBox(prev => ({
+          ...prev,
+          width: Math.max(80, Math.min(bounds.width - prev.x, prev.width + deltaX)),
+          height: Math.max(80, Math.min(bounds.height - prev.y, prev.height + deltaY))
+        }));
       }
     }
-
-    // Clear participants for next cycle
-    participatingRules.current = [];
-    lastMatchedRule.current = null;
-
-    brain.current.trades.push({ pattern: analysis.sequence.join(" → "), result, price: analysis.price });
-    brain.current.winRate = (brain.current.trades.filter((t) => t.result === "WIN").length / brain.current.trades.length) * 100;
-    void saveBrain();
-    setSignal("WAIT"); setReversed(false);
-    setStatus(`Outcome logged [${result}]. ALL participating rules updated simultaneously — memory, auto-patterns & image rules trust weights adjusted.`);
   };
 
-  // ROI handlers
-  const mouseDown = (event: MouseEvent) => {
-    if (locked || !containerRef.current) return;
-    event.stopPropagation();
-    const box = containerRef.current.getBoundingClientRect();
-    setMoving(true); setDrag({ x: event.clientX - box.left - roi.x, y: event.clientY - box.top - roi.y });
+  const handleMouseUp = () => {
+    setIsDragging(false);
+    setIsResizing(false);
   };
-  const resizeDown = (event: MouseEvent) => {
-    if (locked) return; event.stopPropagation();
-    setResizing(true); setDrag({ x: event.clientX, y: event.clientY });
-  };
-  const mouseMove = (event: MouseEvent) => {
-    if (locked || !containerRef.current || (!moving && !resizing)) return;
-    const box = containerRef.current.getBoundingClientRect();
-    if (moving) {
-      setRoi((old) => ({ ...old, x: Math.max(0, Math.min(box.width - old.width, event.clientX - box.left - drag.x)), y: Math.max(0, Math.min(box.height - old.height, event.clientY - box.top - drag.y)) }));
-    } else {
-      const dx = event.clientX - drag.x; const dy = event.clientY - drag.y;
-      setDrag({ x: event.clientX, y: event.clientY });
-      setRoi((old) => ({ ...old, width: Math.max(180, Math.min(box.width - old.x, old.width + dx)), height: Math.max(120, Math.min(box.height - old.y, old.height + dy)) }));
-    }
-  };
-
-  const latest = analysis?.candles.at(-1);
-  const entryWindow = analysisProgress >= 100 && !awaitingOutcome.current;
 
   return (
-    <div className="min-h-screen bg-[#040814] text-slate-100 font-sans" onMouseMove={mouseMove} onMouseUp={() => { setMoving(false); setResizing(false); }}>
+    <div className="min-h-screen bg-[#040814] text-slate-100 font-sans" onMouseMove={handleMouseMove} onMouseUp={handleMouseUp}>
       <header className="border-b border-slate-800 px-6 py-4">
-        <div className="max-w-7xl mx-auto flex items-center justify-between gap-4">
+        <div className="max-w-7xl mx-auto flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-cyan-400 tracking-wider">TRADER YODHA X AI</h1>
-            <p className="text-slate-500 text-sm">OTC Market Engine — Real-Time Continuous Scan + Auto S/R + Pattern Generator + Reverse Logic</p>
+            <h1 className="text-2xl font-bold text-cyan-400 tracking-wider">TRADER YODHA X AI (OTC FAST ENGINE)</h1>
+            <p className="text-slate-500 text-sm">Candle-to-Candle Direct Signal Generator</p>
           </div>
           <div className="flex items-center gap-3">
-            <div className="text-right mr-2">
-              <div className="text-xs text-slate-500">AI Brain</div>
-              <div className="text-sm font-mono text-emerald-400">{stats.candles} Candles | {stats.memories} Patterns</div>
-              <div className="text-xs font-mono text-slate-400">{stats.trades} Trades | WR: {stats.winRate.toFixed(1)}% | {stats.autoPatterns} Auto</div>
+            <div className="text-right mr-4">
+              <div className="text-xs text-slate-500">Intelligence Nodes</div>
+              <div className="text-sm font-mono text-emerald-400">
+                {brainStats.patterns} Patterns | Win Rate: {brainStats.winRate.toFixed(1)}%
+              </div>
             </div>
-            {!active ? (
-              <button onClick={() => void connect()} className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg">Connect OTC Screen</button>
+            {!isStreamActive ? (
+              <button onClick={connectStream} className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg transition-all shadow-md shadow-emerald-600/20">
+                Connect Quotex Screen
+              </button>
             ) : (
-              <button onClick={disconnect} className="px-5 py-2.5 bg-red-600 hover:bg-red-500 text-white font-bold rounded-lg">Disconnect</button>
+              <button onClick={disconnectStream} className="px-5 py-2.5 bg-red-600 hover:bg-red-500 text-white font-bold rounded-lg transition-all">
+                Disconnect
+              </button>
             )}
           </div>
         </div>
@@ -2042,374 +790,142 @@ export default function OTCMarketDashboard() {
 
       <main className="max-w-7xl mx-auto px-6 py-6">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* LEFT COLUMN */}
           <div className="space-y-4">
-            {/* LIVE SCAN STATUS — automatic real-time indicator */}
-            <div className={card}>
-              <div className={`w-full py-4 rounded-xl font-bold text-lg flex items-center justify-center gap-3 ${active ? "bg-cyan-900/40 border border-cyan-700 text-cyan-300" : "bg-slate-800 text-slate-600"}`}>
-                {active && <span className="w-3 h-3 rounded-full bg-emerald-400 animate-pulse" />}
-                {active ? "Live Real-Time Scanning..." : "Scanner Idle — Connect to Start"}
-              </div>
-              <div className="mt-4 flex items-center justify-between text-sm">
-                <span className="text-slate-500">2-Min Analysis:</span>
-                <span className={`font-mono text-xl ${entryWindow ? "text-emerald-400 font-bold animate-pulse" : "text-amber-400"}`}>
-                  {awaitingOutcome.current ? "SIGNAL LIVE" : entryWindow ? "READY — ALIGNING" : `${windowInfo.remaining}s left`}
-                </span>
-              </div>
-              {active && (
-                <div className="mt-2 flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
-                  <span className="text-xs text-cyan-400 font-mono">Auto-analyzing every {ANALYSIS_INTERVAL_MS}ms — candles, S/R levels, patterns & signal engine</span>
-                </div>
-              )}
-            </div>
-
-            {/* OCR TELEMETRY */}
-            <div className={card}>
-              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">OCR Telemetry</h3>
-              <div className="flex justify-between text-xs font-mono">
-                <span className="text-slate-500">Price:</span>
-                <span className={round ? "text-emerald-400 font-bold" : "text-cyan-400 font-bold"}>{ocrText}</span>
-              </div>
-              <div className="flex justify-between text-xs font-mono mt-2">
-                <span className="text-slate-500">Data source:</span><span>Live OTC screen</span>
-              </div>
-            </div>
-
-            {/* CANDLE BRAIN */}
-            <div className={card}>
-              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">Candle Brain</h3>
-              <div className="grid grid-cols-2 gap-2 text-xs font-mono">
-                {[
-                  ["Candles", stats.candles, "text-cyan-400"],
-                  ["Patterns", stats.memories, "text-amber-400"],
-                  ["ZigZag Points", stats.zigzag, "text-yellow-400"],
-                  ["HH/HL/LH/LL", stats.structure, "text-sky-400"],
-                  ["Auto Patterns", stats.autoPatterns, "text-fuchsia-400"],
-                  ["Image Rules", stats.extractedRules, "text-cyan-300"],
-                  ["Custom Rules", customPatternList.length, "text-violet-300"],
-                  ["S/R Levels", snrLevels.length, "text-rose-400"],
-                ].map(([label, value, color]) => (
-                  <div key={String(label)} className="bg-[#020617] p-3 rounded">
-                    <div className="text-slate-500">{label}</div>
-                    <div className={`${color} text-lg font-bold`}>{value}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* IMAGE PATTERN INTAKE — upload chart screenshots to extract visual rules */}
-            <div className={card}>
-              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono flex items-center gap-2">
-                <ImageIcon className="w-3 h-3 text-cyan-300" />
-                Image Pattern Intake
-              </h3>
-              <label className={`w-full py-3 rounded-lg font-bold text-sm flex items-center justify-center gap-2 cursor-pointer ${imageUploading ? "bg-slate-700 text-slate-500" : "bg-cyan-900/60 hover:bg-cyan-800/60 text-cyan-300 border border-cyan-700"}`}>
-                {imageUploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <ImageIcon className="w-4 h-4" />}
-                {imageUploading ? "Analyzing image..." : "Upload Chart Screenshot"}
-                <input type="file" accept="image/*" className="hidden" onChange={(e) => void handlePatternImage(e)} disabled={imageUploading} />
-              </label>
-              {imageMetrics && imageMetrics.candleCount > 0 && (
-                <div className="mt-3 space-y-1 text-xs font-mono">
-                  <div className="flex justify-between"><span className="text-slate-500">Candles found:</span><span className="text-cyan-300">{imageMetrics.candleCount}</span></div>
-                  <div className="flex justify-between"><span className="text-slate-500">Avg Body:</span><span className="text-emerald-400">{imageMetrics.avgBodyPct.toFixed(0)}%</span></div>
-                  <div className="flex justify-between"><span className="text-slate-500">Avg Upper Wick:</span><span className="text-amber-400">{imageMetrics.avgUpperWickPct.toFixed(0)}%</span></div>
-                  <div className="flex justify-between"><span className="text-slate-500">Avg Lower Wick:</span><span className="text-amber-400">{imageMetrics.avgLowerWickPct.toFixed(0)}%</span></div>
-                  <div className="flex justify-between"><span className="text-slate-500">Color Flow:</span><span className="text-cyan-300 break-all">{imageMetrics.colorFlow}</span></div>
-                  <div className="flex justify-between"><span className="text-slate-500">Level Behavior:</span><span className="text-orange-400">{imageMetrics.levelBehavior}</span></div>
-                </div>
-              )}
-              {extractedRulesList.length > 0 && (
-                <div className="mt-3">
-                  <div className="text-xs text-slate-500 mb-1.5 font-mono">Stored Rules ({extractedRulesList.length}):</div>
-                  <div className="space-y-1 max-h-40 overflow-y-auto">
-                    {extractedRulesList.slice(-8).reverse().map((rule) => (
-                      <div key={rule.id} className="flex items-center justify-between px-2 py-1.5 rounded bg-[#020617] text-xs font-mono">
-                        <div className="flex items-center gap-1.5 min-w-0">
-                          <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${rule.direction === "CALL" ? "bg-emerald-400" : "bg-red-400"}`} />
-                          <span className="text-slate-300 truncate">{rule.name}</span>
-                        </div>
-                        <div className="flex items-center gap-2 flex-shrink-0">
-                          <span className="text-slate-500">{rule.source === "IMAGE" ? "IMG" : "VAR"}</span>
-                          <span className="text-cyan-400">{rule.trustWeight}%</span>
-                          <span className="text-slate-600">{rule.wins}W/{rule.losses}L</span>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* 2-MINUTE ANALYSIS WINDOW — continuous 24/7 processing before each signal */}
-            {active && (
-              <div className={card}>
-                <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">2-Minute Analysis Window</h3>
-                <div className="flex items-center justify-between text-xs font-mono mb-2">
-                  <span className="text-slate-500">{awaitingOutcome.current ? "Signal live — log outcome to resume" : "Processing market"}</span>
-                  <span className="text-violet-300 font-bold">{awaitingOutcome.current ? "PAUSED" : `${windowInfo.remaining}s left`}</span>
-                </div>
-                <div className="h-2 rounded-full bg-[#020617] overflow-hidden">
-                  <div className="h-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-all duration-500" style={{ width: `${analysisProgress}%` }} />
-                </div>
-                <div className="grid grid-cols-3 gap-2 mt-3 text-center text-xs font-mono">
-                  <div className="bg-[#020617] p-2 rounded"><div className="text-slate-500">CALL votes</div><div className="text-emerald-400 font-bold">{windowInfo.votes.call}</div></div>
-                  <div className="bg-[#020617] p-2 rounded"><div className="text-slate-500">PUT votes</div><div className="text-red-400 font-bold">{windowInfo.votes.put}</div></div>
-                  <div className="bg-[#020617] p-2 rounded"><div className="text-slate-500">WAIT</div><div className="text-slate-400 font-bold">{windowInfo.votes.wait}</div></div>
-                </div>
-                <div className="flex justify-between text-xs font-mono mt-2">
-                  <span className="text-slate-500">Window consensus:</span>
-                  <span className={windowInfo.consensusDir === "CALL" ? "text-emerald-400" : windowInfo.consensusDir === "PUT" ? "text-red-400" : "text-slate-400"}>
-                    {windowInfo.consensusDir} {windowInfo.consensusStrength.toFixed(0)}%
+            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800 shadow-md">
+              <button
+                onClick={triggerAnalysis}
+                disabled={!isStreamActive || isScanning}
+                className={`w-full py-4 rounded-xl font-bold text-lg transition-all ${
+                  !isStreamActive || isScanning
+                    ? 'bg-slate-700 text-slate-500 cursor-not-allowed'
+                    : 'bg-cyan-600 hover:bg-cyan-500 text-white shadow-lg shadow-cyan-600/30'
+                }`}
+              >
+                {isScanning ? (
+                  <span className="flex items-center justify-center gap-2">
+                    <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    Scanning OTC Candle...
                   </span>
-                </div>
+                ) : (
+                  'INSTANT OTC SCAN'
+                )}
+              </button>
+              <div className="mt-4 flex items-center justify-between text-sm">
+                <span className="text-slate-500">Next Candle Entry In:</span>
+                <span className="font-mono text-xl text-amber-400">{timeUntilCandle}s</span>
               </div>
-            )}
-
-            {/* CUSTOM PATTERN ENGINE — image-derived rules with self-learning memory */}
-            <div className={card}>
-              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">Custom Pattern Engine</h3>
-              {active && analysis?.patterns.customPattern.detected ? (
-                <div className="mb-3 p-2.5 rounded-lg bg-[#020617] border border-violet-800/50">
-                  <div className="flex items-center justify-between text-xs font-mono">
-                    <span className="text-violet-300 font-bold truncate">{analysis.patterns.customPattern.name}</span>
-                    <span className={analysis.patterns.customPattern.direction === "CALL" ? "text-emerald-400 font-bold" : "text-red-400 font-bold"}>
-                      {analysis.patterns.customPattern.direction} {analysis.patterns.customPattern.confidence}%
-                    </span>
-                  </div>
-                  <div className="flex flex-wrap gap-1 mt-2">
-                    {analysis.patterns.customPattern.atLevel && <span className="px-1.5 py-0.5 rounded text-[9px] bg-cyan-900/60 text-cyan-300">AT H-LINE</span>}
-                    {analysis.patterns.customPattern.vPattern && <span className="px-1.5 py-0.5 rounded text-[9px] bg-red-900/60 text-red-300">V-PATTERN BLOCKED</span>}
-                    {analysis.patterns.customPattern.blacklisted && <span className="px-1.5 py-0.5 rounded text-[9px] bg-red-900/60 text-red-300">BLACKLISTED</span>}
-                    {analysis.patterns.customPattern.notes.map((n) => (
-                      <span key={n} className="px-1.5 py-0.5 rounded text-[9px] bg-slate-800 text-slate-400">{n}</span>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <div className="mb-3 text-xs font-mono text-slate-500">{active ? "Scanning candles for a custom setup at a real level..." : "Connect an OTC screen to begin."}</div>
-              )}
-              {customPatternList.length > 0 && (
-                <div>
-                  <div className="text-xs text-slate-500 mb-1.5 font-mono">Self-Learning Memory:</div>
-                  <div className="space-y-1 max-h-44 overflow-y-auto">
-                    {[...customPatternList].sort((a, b) => (b.wins + b.losses) - (a.wins + a.losses)).map((m) => {
-                      const decided = m.wins + m.losses;
-                      const wr = decided > 0 ? Math.round((m.wins / decided) * 100) : 0;
-                      return (
-                        <div key={m.key} className={`flex items-center justify-between px-2 py-1.5 rounded text-xs font-mono ${m.blacklisted ? "bg-red-950/40 border border-red-900/50" : "bg-[#020617]"}`}>
-                          <span className={`truncate ${m.blacklisted ? "text-red-400 line-through" : "text-slate-300"}`}>{m.label}</span>
-                          <div className="flex items-center gap-2 flex-shrink-0">
-                            {m.blacklisted && <span className="text-[9px] text-red-400 font-bold">AVOID</span>}
-                            <span className={wr >= 50 ? "text-emerald-400" : "text-amber-400"}>{wr}%</span>
-                            <span className="text-slate-600">{m.wins}W/{m.losses}L</span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
             </div>
 
-            {/* AUTO S/R LEVELS — fully automatic detection */}
-            {active && snrLevels.length > 0 && (
-              <div className={card}>
-                <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono flex items-center gap-2">
-                  <Layers className="w-3 h-3 text-rose-400" />
-                  Auto S/R Levels
-                </h3>
-                <div className="space-y-1.5 text-xs font-mono max-h-56 overflow-y-auto">
-                  {snrLevels.map((level, i) => (
-                    <div key={i} className="flex items-center justify-between px-2 py-1.5 rounded bg-[#020617]">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className={`w-2 h-2 rounded-full flex-shrink-0 ${level.type === "RESISTANCE" ? (level.isMajor ? "bg-red-400" : "bg-orange-400") : (level.isMajor ? "bg-emerald-400" : "bg-lime-400")}`} />
-                        <span className={`truncate ${level.type === "RESISTANCE" ? (level.isMajor ? "text-red-400 font-bold" : "text-orange-400") : (level.isMajor ? "text-emerald-400 font-bold" : "text-lime-400")}`}>
-                          {level.isMajor ? "Major " : ""}{level.type === "RESISTANCE" ? "R" : "S"}
-                          {level.isRound && " Round"}
-                        </span>
-                        {level.behavior !== "NONE" && (
-                          <span className={`px-1 rounded text-[9px] flex-shrink-0 ${level.behavior === "BREAK" ? "bg-red-900/60 text-red-300" : "bg-emerald-900/60 text-emerald-300"}`}>
-                            {level.behavior}
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-right flex-shrink-0">
-                        <span className="text-slate-300">{level.price ? level.price.toFixed(5) : `y:${level.y}`}</span>
-                        <span className="text-slate-500 ml-1.5">({level.touches}x)</span>
-                      </div>
-                    </div>
-                  ))}
+            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
+              <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">OCR Telemetry</h3>
+              <div className="text-xs space-y-2 font-mono">
+                <div className="flex justify-between">
+                  <span className="text-slate-500">OCR Level:</span>
+                  <span className={`font-bold ${isRealRoundNumber ? 'text-emerald-400' : 'text-cyan-400'}`}>{ocrPriceText}</span>
                 </div>
               </div>
-            )}
+            </div>
 
-            {/* PATTERN DETECTION */}
-            {analysis && (
-              <div className={card}>
-                <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">OTC Pattern Detection</h3>
-                <div className="space-y-2 text-xs font-mono">
-                  <div className="flex items-center gap-2">
-                    {analysis.patterns.sequential7.detected ? (
-                      <TrendingUp className={`w-4 h-4 ${analysis.patterns.sequential7.prediction === "CALL" ? "text-emerald-400" : "text-red-400"}`} />
-                    ) : <span className="w-4 h-4 inline-block" />}
-                    <span className="text-slate-400">7-Candle Sequential:</span>
-                    <span className={analysis.patterns.sequential7.detected ? (analysis.patterns.sequential7.prediction === "CALL" ? "text-emerald-400 font-bold" : analysis.patterns.sequential7.prediction === "PUT" ? "text-red-400 font-bold" : "text-slate-400") : "text-slate-600"}>
-                      {analysis.patterns.sequential7.detected ? `${analysis.patterns.sequential7.prediction} (${analysis.patterns.sequential7.confidence.toFixed(0)}%)` : "Not triggered"}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className={`w-4 h-4 inline-block rounded-full ${analysis.patterns.breakdown.detected ? "bg-red-500" : "bg-slate-700"}`} />
-                    <span className="text-slate-400">2-Red Breakdown:</span>
-                    <span className={analysis.patterns.breakdown.detected ? "text-red-400 font-bold" : "text-slate-600"}>
-                      {analysis.patterns.breakdown.detected ? analysis.patterns.breakdown.level : "None"}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {analysis.patterns.wickRejection.detected ? (
-                      <TrendingDown className={`w-4 h-4 ${analysis.patterns.wickRejection.direction === "PUT" ? "text-red-400" : "text-emerald-400"}`} />
-                    ) : <span className="w-4 h-4 inline-block" />}
-                    <span className="text-slate-400">3-Wick Rejection:</span>
-                    <span className={analysis.patterns.wickRejection.detected ? (analysis.patterns.wickRejection.direction === "CALL" ? "text-emerald-400 font-bold" : "text-red-400 font-bold") : "text-slate-600"}>
-                      {analysis.patterns.wickRejection.detected ? `${analysis.patterns.wickRejection.direction} (${analysis.patterns.wickRejection.count}x)` : "None"}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Zap className={`w-4 h-4 ${analysis.patterns.confluence.score >= 2 ? "text-yellow-400" : "text-slate-600"}`} />
-                    <span className="text-slate-400">Confluence:</span>
-                    <span className={analysis.patterns.confluence.score >= 2 ? "text-yellow-400 font-bold" : "text-slate-600"}>
-                      {analysis.patterns.confluence.score >= 2 ? `${analysis.patterns.confluence.score}x — ${analysis.patterns.confluence.points.join(" + ")}` : `${analysis.patterns.confluence.score}x`}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {analysis.patterns.trap.detected ? <AlertTriangle className="w-4 h-4 text-orange-400 animate-pulse" /> : <Shield className="w-4 h-4 text-slate-600" />}
-                    <span className="text-slate-400">Trap Detection:</span>
-                    <span className={analysis.patterns.trap.detected ? "text-orange-400 font-bold" : "text-slate-600"}>
-                      {analysis.patterns.trap.detected ? `${analysis.patterns.trap.type} → ${analysis.patterns.trap.direction}` : "No trap"}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Activity className={`w-4 h-4 ${analysis.patterns.autoPrediction.prediction !== "WAIT" ? "text-fuchsia-400" : "text-slate-600"}`} />
-                    <span className="text-slate-400">Auto Pattern:</span>
-                    <span className={analysis.patterns.autoPrediction.prediction !== "WAIT" ? (analysis.patterns.autoPrediction.prediction === "CALL" ? "text-emerald-400 font-bold" : "text-red-400 font-bold") : "text-slate-600"}>
-                      {analysis.patterns.autoPrediction.prediction !== "WAIT" ? `${analysis.patterns.autoPrediction.prediction} (${analysis.patterns.autoPrediction.matched} ${analysis.patterns.autoPrediction.confidence.toFixed(0)}%)` : "No match"}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Cpu className={`w-4 h-4 ${analysis.patterns.extractedRule.detected ? "text-cyan-300" : "text-slate-600"}`} />
-                    <span className="text-slate-400">Image Rule:</span>
-                    <span className={analysis.patterns.extractedRule.detected ? (analysis.patterns.extractedRule.direction === "CALL" ? "text-emerald-400 font-bold" : "text-red-400 font-bold") : "text-slate-600"}>
-                      {analysis.patterns.extractedRule.detected ? `${analysis.patterns.extractedRule.rule} → ${analysis.patterns.extractedRule.direction} (${analysis.patterns.extractedRule.confidence.toFixed(0)}%)` : "No match"}
-                    </span>
-                  </div>
-                  {analysis.reversed && (
-                    <div className="mt-2 px-2 py-1.5 bg-orange-900/40 border border-orange-500/50 rounded text-orange-400 font-bold text-center">
-                      REVERSE LOGIC ACTIVATED — Signal Flipped
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* LIVE ANALYSIS */}
-            {analysis && (
-              <div className={card}>
-                <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono">Live Analysis</h3>
+            {currentAnalysis && (
+              <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800 animate-fadeIn">
+                <h3 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider font-mono font-bold">OTC Live Pattern</h3>
                 <div className="text-xs text-slate-300 space-y-2 font-mono">
-                  <div>Latest: #{latest?.id} {latest?.shape}</div>
-                  <div>Price: {priceText(analysis.price)} {round ? "ROUND SNR" : ""}</div>
-                  <div>Structure: {analysis.structure ?? "Awaiting pivot"}</div>
-                  <div>Sequence: <span className="text-cyan-300 break-all">{analysis.sequence.join(" → ")}</span></div>
-                  <div>Evidence: <span className="text-emerald-400">{analysis.confidence.toFixed(1)}%</span> <span className="text-slate-600">(CALL {analysis.callTotal} / PUT {analysis.putTotal})</span></div>
-                  <div>RSI14: {analysis.indicators.rsi14 == null ? "—" : analysis.indicators.rsi14.toFixed(1)}</div>
-                  <div className="text-slate-400">{analysis.reasons.join(" • ")}</div>
+                  <p className="break-all"><span className="text-slate-500">Logic:</span> {currentAnalysis.pattern}</p>
                 </div>
               </div>
             )}
           </div>
 
-          {/* RIGHT COLUMN */}
           <div className="lg:col-span-2 space-y-4">
-            <div className={card}>
+            <div className="bg-[#0f172a] rounded-xl p-5 border border-slate-800">
               <div className="flex items-center justify-between mb-3">
-                <span className="text-xs font-bold text-slate-400">OTC CHART + CANDLE VISION + AUTO S/R LINES</span>
-                {active && <button onClick={() => setLocked((v) => !v)} className="px-3 py-1 rounded text-xs font-bold text-cyan-400 bg-cyan-900/60">{locked ? "ROI Locked" : "Drag / Resize ROI"}</button>}
+                <div className="flex items-center gap-2">
+                  <div className={`w-2 h-2 rounded-full ${isStreamActive ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'}`} />
+                  <span className="text-xs font-bold text-slate-400">QUOTEX CHART STREAM</span>
+                </div>
+                {isStreamActive && (
+                  <button
+                    onClick={() => setIsRoiLocked(!isRoiLocked)}
+                    className={`px-3 py-1 rounded text-xs font-bold transition-all ${
+                      isRoiLocked ? 'bg-red-900/60 text-red-400 border border-red-500/40' : 'bg-cyan-900/60 text-cyan-400 border border-cyan-500/40'
+                    }`}
+                  >
+                    {isRoiLocked ? '🔒 ROI Box Locked' : '🔓 Drag/Resize Box Active'}
+                  </button>
+                )}
               </div>
-              <div ref={containerRef} className="bg-[#020617] rounded-lg aspect-video flex items-center justify-center overflow-hidden border border-slate-900 relative select-none">
-                {active ? (
+              
+              <div ref={videoContainerRef} className="bg-[#020617] rounded-lg aspect-video flex items-center justify-center overflow-hidden border border-slate-900 relative select-none">
+                {isStreamActive ? (
                   <>
                     <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-contain pointer-events-none" />
-                    <canvas ref={overlayRef} className="absolute inset-0 pointer-events-none w-full h-full z-10" />
-                    <div onMouseDown={mouseDown} style={{ left: roi.x, top: roi.y, width: roi.width, height: roi.height }} className={`absolute border-2 ${locked ? "border-amber-400" : "border-cyan-400 cursor-move"} p-1 z-20`}>
-                      <div className="text-[10px] font-mono text-cyan-300 bg-slate-950/80 px-1">AI CANDLE TARGET</div>
-                      {!locked && <div onMouseDown={resizeDown} className="w-3.5 h-3.5 bg-cyan-400 absolute bottom-0 right-0 cursor-se-resize" />}
+                    <canvas ref={overlayCanvasRef} className="absolute inset-0 pointer-events-none w-full h-full" />
+                    
+                    <div
+                      onMouseDown={handleMouseDown}
+                      style={{
+                        left: `${roiBox.x}px`,
+                        top: `${roiBox.y}px`,
+                        width: `${roiBox.width}px`,
+                        height: `${roiBox.height}px`
+                      }}
+                      className={`absolute border-2 ${
+                        isRoiLocked ? 'border-amber-400 bg-amber-500/10' : 'border-cyan-400 bg-cyan-500/10 cursor-move'
+                      } flex flex-col justify-between p-1 z-20 shadow-[0_0_15px_rgba(6,182,212,0.3)]`}
+                    >
+                      <div className="flex justify-between items-center text-[10px] font-mono text-cyan-300 font-bold bg-slate-950/80 px-1 py-0.5 rounded pointer-events-none">
+                        <span>AI OCR TARGET</span>
+                        <span>{roiBox.width}x{roiBox.height}</span>
+                      </div>
+                      
+                      {!isRoiLocked && (
+                        <div
+                          onMouseDown={handleResizeDown}
+                          className="w-3.5 h-3.5 bg-cyan-400 absolute bottom-0 right-0 cursor-se-resize rounded-tl shadow-md"
+                        />
+                      )}
                     </div>
                   </>
                 ) : (
-                  <div className="text-center">
-                    <p className="text-slate-500">Connect OTC chart screen to start TRADER_YODHA_X_AI.</p>
-                    <p className="text-xs text-slate-600 mt-2">The AI reads visible candles and prices — optimized for Quotex / ExpertOption OTC markets.</p>
+                  <div className="text-center space-y-2">
+                    <p className="text-slate-500 font-medium">Connect chart screen to start TRADER YODHA X AI.</p>
                   </div>
                 )}
               </div>
               <canvas ref={canvasRef} className="hidden" />
               <canvas ref={ocrCanvasRef} className="hidden" />
-              <canvas ref={imageCanvasRef} className="hidden" />
-              <div className="mt-3 px-4 py-2 bg-[#020617] rounded-lg border-l-4 border-cyan-500 flex items-center gap-2">
-                {active && <span className="w-3 h-3 rounded-full bg-cyan-400 animate-ping flex-shrink-0" />}
-                <p className="text-xs text-slate-400"><strong className="text-cyan-400">Status:</strong> {status}</p>
+              
+              <div className="mt-3 px-4 py-2 bg-[#020617] rounded-lg border-l-4 border-cyan-500">
+                <p className="text-xs text-slate-400"><strong className="text-cyan-400">Status:</strong> {statusMessage}</p>
               </div>
             </div>
 
-            <div className={`${card} p-6`}>
+            <div className="bg-[#0f172a] rounded-xl p-6 border border-slate-800">
               <div className="flex items-center justify-between mb-4">
-                <span className="px-3 py-1 bg-amber-900/50 text-amber-300 text-xs font-bold rounded">TRADER YODHA X — OTC SIGNAL ENGINE</span>
-                <span className="text-xs text-slate-500 font-mono flex items-center gap-1"><Activity className="w-3 h-3" />00s–05s Entry Window</span>
+                <span className="px-3 py-1 bg-purple-900/50 text-purple-300 text-xs font-bold rounded tracking-wide">TRADER YODHA X SIGNAL EXECUTOR</span>
+                <span className="text-xs text-slate-500 font-mono">1-Min Candle Transition</span>
               </div>
               <div className="text-center py-8">
-                <div className={`inline-block px-14 py-6 rounded-2xl text-6xl font-black tracking-widest border-4 ${signal === "CALL" ? "bg-emerald-500/10 border-emerald-400 text-emerald-400" : signal === "PUT" ? "bg-red-500/10 border-red-400 text-red-400" : "bg-slate-800 border-slate-700 text-slate-600"}`}>
-                  {signal}
+                <div className={`inline-block px-14 py-6 rounded-2xl text-6xl font-black tracking-widest border-4 transition-all duration-300 ${
+                  aiSignal === 'CALL'
+                    ? 'bg-emerald-500/10 border-emerald-400 text-emerald-400 shadow-[0_0_30px_rgba(52,211,153,0.2)]'
+                    : aiSignal === 'PUT'
+                    ? 'bg-red-500/10 border-red-400 text-red-400 shadow-[0_0_30px_rgba(248,113,113,0.2)]'
+                    : 'bg-slate-800 border-slate-700 text-slate-600'
+                }`}>
+                  {aiSignal}
                 </div>
-                {reversed && signal !== "WAIT" && <div className="mt-3 text-orange-400 text-sm font-bold animate-pulse">Signal Reversed via Loss-Streak Logic</div>}
               </div>
-
-              {/* COMBINED SCORE BREAKDOWN — shows every logic that contributed */}
-              {analysis && analysis.scoreBreakdown.length > 0 && (
-                <div className="border-t border-slate-800 pt-4 mb-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-xs font-bold text-slate-400 uppercase tracking-wider font-mono">Combined Score Breakdown</span>
-                    <span className="text-xs font-mono">
-                      <span className="text-emerald-400">CALL {analysis.callTotal}</span>
-                      <span className="text-slate-600 mx-1">vs</span>
-                      <span className="text-red-400">PUT {analysis.putTotal}</span>
-                    </span>
-                  </div>
-                  <div className="space-y-1.5 max-h-56 overflow-y-auto">
-                    {analysis.scoreBreakdown.map((contrib, i) => (
-                      <div key={i} className="flex items-center justify-between px-3 py-1.5 rounded bg-[#020617] text-xs font-mono">
-                        <div className="flex items-center gap-2 min-w-0">
-                          <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${contrib.direction === "CALL" ? "bg-emerald-400" : "bg-red-400"}`} />
-                          <span className="text-slate-300 truncate">{contrib.logic}</span>
-                          <span className="text-slate-600 truncate hidden sm:inline">{contrib.detail}</span>
-                        </div>
-                        <span className={`flex-shrink-0 font-bold ${contrib.direction === "CALL" ? "text-emerald-400" : "text-red-400"}`}>
-                          {contrib.logic === "REVERSE LOGIC" ? "FLIP" : `+${contrib.weight}`}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                  <div className="mt-2 text-center text-xs font-mono text-slate-500">
-                    Combined Confidence: <span className={analysis.confidence >= SIGNAL_THRESHOLD ? "text-cyan-400 font-bold" : "text-slate-600"}>{analysis.confidence.toFixed(1)}%</span>
-                    <span className="text-slate-600"> (threshold {SIGNAL_THRESHOLD}%)</span>
-                  </div>
-                </div>
-              )}
-              {signal !== "WAIT" && (
-                <div className="border-t border-slate-800 pt-4">
-                  <p className="text-xs text-slate-400 text-center mb-3">Log outcome to train the live OTC brain:</p>
+              {aiSignal !== 'WAIT' && (
+                <div className="mt-4 pt-4 border-t border-slate-800">
+                  <p className="text-xs text-slate-400 text-center mb-3">Log outcome to train TRADER YODHA X AI:</p>
                   <div className="grid grid-cols-2 gap-3">
-                    <button onClick={() => logOutcome("WIN")} className="py-3 bg-emerald-600 text-white font-bold rounded-lg hover:bg-emerald-500">WIN</button>
-                    <button onClick={() => logOutcome("LOSS")} className="py-3 bg-red-600 text-white font-bold rounded-lg hover:bg-red-500">LOSS</button>
+                    <button onClick={() => logTradeOutcome('WIN')} className="py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg transition-all tracking-wide">
+                      WIN
+                    </button>
+                    <button onClick={() => logTradeOutcome('LOSS')} className="py-3 bg-red-600 hover:bg-red-500 text-white font-bold rounded-lg transition-all tracking-wide">
+                      LOSS
+                    </button>
                   </div>
                 </div>
               )}
