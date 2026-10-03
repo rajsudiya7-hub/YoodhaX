@@ -1,4 +1,4 @@
-Import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 
 // Brain Memory Types - Fully Upgraded with IndexedDB Core & Real Coordinate Scanner
 interface PatternMemory {
