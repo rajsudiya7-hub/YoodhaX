@@ -1,0 +1,13 @@
+{
+  "projectId": "67198936",
+  "functions": {
+    "yoddhax": {
+      "hasChanged": false,
+      "hash": "66ff55284ff075f4f719512b7e9487c3feae5d41af39f15693dad5fe34e64157"
+    },
+    "market-api": {
+      "hasChanged": false,
+      "hash": "2c8bc0925f075eddbbe6eb47f7befdaba97d6c0e775ce01e3fa19fce9548e27d"
+    }
+  }
+}
